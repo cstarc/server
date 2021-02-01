@@ -642,8 +642,6 @@ public:
   hash_table_t prdt_hash;
   /** page locks for SPATIAL INDEX */
   hash_table_t prdt_page_hash;
-  /** number of deadlocks detected; protected by mutex */
-  ulint deadlocks;
 
   /** mutex covering lock waits; @see trx_lock_t::wait_lock */
   MY_ALIGNED(CACHE_LINE_SIZE) mysql_mutex_t wait_mutex;
@@ -657,6 +655,8 @@ private:
   /** Longest wait time; protected by wait_mutex */
   ulint wait_time_max;
 public:
+  /** number of deadlocks detected; protected by wait_mutex */
+  ulint deadlocks;
   /**
     Constructor.
 
@@ -786,8 +786,8 @@ UNIV_INLINE
 lock_t*
 lock_rec_create(
 /*============*/
-#ifdef WITH_WSREP
 	lock_t*			c_lock,	/*!< conflicting lock */
+#ifdef WITH_WSREP
 	que_thr_t*		thr,	/*!< thread owning trx */
 #endif
 	unsigned		type_mode,/*!< in: lock mode and wait flag */
@@ -811,6 +811,7 @@ lock_rec_discard(
 
 /** Create a new record lock and inserts it to the lock queue,
 without checking for deadlocks or conflicts.
+@param[in]	c_lock		conflicting lock, or NULL
 @param[in]	type_mode	lock mode and wait flag
 @param[in]	page_id		index page number
 @param[in]	page		R-tree index page, or NULL
@@ -821,8 +822,8 @@ without checking for deadlocks or conflicts.
 @return created lock */
 lock_t*
 lock_rec_create_low(
+	lock_t*		c_lock,
 #ifdef WITH_WSREP
-	lock_t*		c_lock,	/*!< conflicting lock */
 	que_thr_t*	thr,	/*!< thread owning trx */
 #endif
 	unsigned	type_mode,
@@ -834,6 +835,7 @@ lock_rec_create_low(
 	bool		holds_trx_mutex);
 /** Enqueue a waiting request for a lock which cannot be granted immediately.
 Check for deadlocks.
+@param[in]	c_lock		conflicting lock
 @param[in]	type_mode	the requested lock mode (LOCK_S or LOCK_X)
 				possibly ORed with LOCK_GAP or
 				LOCK_REC_NOT_GAP, ORed with
@@ -850,9 +852,7 @@ Check for deadlocks.
 @retval	DB_DEADLOCK		if this transaction was chosen as the victim */
 dberr_t
 lock_rec_enqueue_waiting(
-#ifdef WITH_WSREP
-	lock_t*			c_lock,	/*!< conflicting lock */
-#endif
+	lock_t*			c_lock,
 	unsigned		type_mode,
 	const buf_block_t*	block,
 	ulint			heap_no,

@@ -19,3 +19,8 @@ rpl_semi_sync_after_sync  : fails after MDEV-16172
 rpl_auto_increment_update_failure  : disabled for now
 rpl_current_user          : waits for MDEV-22374 fix
 rpl_parallel2             : waits for MDEV-23089
+
+rpl_parallel_optimistic_xa_lsu_off : MDEV-24738 FIXME: sync with master
+rpl_parallel_optimistic_xa : MDEV-24738 FIXME: sync with master
+rpl_parallel_optimistic : MDEV-24738 FIXME: sync with master [mix]
+rpl_parallel_conflicts : MDEV-24738 FIXME: sync with master

@@ -45,7 +45,10 @@ Created 5/7/1996 Heikki Tuuri
 #include "pars0pars.h"
 #include "srv0mon.h"
 
-#include <set>
+#include <unordered_set>
+#ifdef UNIV_DEBUG
+# include <set>
+#endif
 
 #ifdef WITH_WSREP
 #include <mysql/service_wsrep.h>
@@ -71,196 +74,45 @@ static void lock_table_print(FILE* file, const lock_t* lock);
 @param[in,out]	mtr	mini-transaction for accessing the record */
 static void lock_rec_print(FILE* file, const lock_t* lock, mtr_t& mtr);
 
-/** Deadlock checker. */
-class DeadlockChecker {
-public:
-	/** Check if a joining lock request results in a deadlock.
-	If a deadlock is found, we will resolve the deadlock by
-	choosing a victim transaction to be rolled it back.
-	We will attempt to resolve all deadlocks.
+namespace Deadlock
+{
+  MY_ATTRIBUTE((nonnull, warn_unused_result))
+  /** Check if a lock request results in a deadlock.
+  Resolve a deadlock by choosing a transaction that will be rolled back.
+  @param trx    transaction requesting a lock
+  @return whether trx must report DB_DEADLOCK */
+  static bool check_and_resolve(trx_t *trx);
 
-	@param[in,out]	trx	transaction requesting a lock
-
-	@return whether the transaction was chosen as victim */
-	static bool check_and_resolve(trx_t *trx);
-
-private:
-	/** Do a shallow copy. Default destructor OK.
-	@param trx the start transaction (start node)
-	@param wait_lock lock that a transaction wants
-	@param mark_start visited node counter
-	@param report_waiters whether to call thd_rpl_deadlock_check() */
-	DeadlockChecker(
-		trx_t*	trx,
-		const lock_t*	wait_lock,
-		ib_uint64_t	mark_start,
-		bool report_waiters)
-		:
-#ifdef HAVE_REPLICATION
-		m_report_waiters(report_waiters),
-#endif
-		m_start(trx),
-		m_wait_lock(wait_lock),
-		m_mark_start(mark_start)
-	{
-	}
-
-	/** Check if the search is too deep. */
-	bool is_too_deep() const {
-		return m_n_elems > 200 || m_cost > 1000000;
-	}
-
-	/** Save current state.
-	@param lock lock to push on the stack.
-	@param heap_no the heap number to push on the stack.
-	@return false if stack is full. */
-	bool push(const lock_t*	lock, ulint heap_no)
-	{
-		ut_ad(lock->is_table() == (heap_no == ULINT_UNDEFINED));
-
-		/* Ensure that the stack is bounded. */
-		if (m_n_elems >= UT_ARR_SIZE(s_states)) {
-			return(false);
-		}
-
-		state_t&	state = s_states[m_n_elems++];
-
-		state.m_lock = lock;
-		state.m_wait_lock = m_wait_lock;
-		state.m_heap_no =heap_no;
-
-		return(true);
-	}
-
-	/** Restore state.
-	@param[out] lock current lock
-	@param[out] heap_no current heap_no */
-	void pop(const lock_t*& lock, ulint& heap_no)
-	{
-		ut_a(m_n_elems > 0);
-
-		const state_t&	state = s_states[--m_n_elems];
-
-		lock = state.m_lock;
-		heap_no = state.m_heap_no;
-		m_wait_lock = state.m_wait_lock;
-	}
-
-	/** Check whether the node has been visited.
-	@param lock lock to check
-	@return true if the node has been visited */
-	bool is_visited(const lock_t* lock) const
-	{
-		return(lock->trx->lock.deadlock_mark > m_mark_start);
-	}
-
-	/** Get the next lock in the queue that is owned by a transaction
-	whose sub-tree has not already been searched.
-	Note: "next" here means PREV for table locks.
-	@param lock Lock in queue
-	@param heap_no heap_no if lock is a record lock else ULINT_UNDEFINED
-	@return next lock or NULL if at end of queue */
-	const lock_t* get_next_lock(const lock_t* lock, ulint heap_no) const;
-
-	/** Get the first lock to search. The search starts from the current
-	wait_lock. What we are really interested in is an edge from the
-	current wait_lock's owning transaction to another transaction that has
-	a lock ahead in the queue. We skip locks where the owning transaction's
-	sub-tree has already been searched.
-
-	Note: The record locks are traversed from the oldest lock to the
-	latest. For table locks we go from latest to oldest.
-
-	For record locks, we first position the iterator on first lock on
-	the page and then reposition on the actual heap_no. This is required
-	due to the way the record lock has is implemented.
-
-	@param[out] heap_no if rec lock, else ULINT_UNDEFINED.
-
-	@return first lock or NULL */
-	const lock_t* get_first_lock(ulint* heap_no) const;
-
-	/** Notify that a deadlock has been detected and print the conflicting
-	transaction info.
-	@param lock lock causing deadlock */
-	void notify(const lock_t* lock) const;
-
-	/** @return the victim transaction that should be rolled back */
-	trx_t *select_victim() const;
-
-	/** Looks iteratively for a deadlock. Note: the joining transaction
-	may have been granted its lock by the deadlock checks.
-	@return the victim transaction
-	@return nullptr if no deadlock */
-	inline trx_t *search();
-
-	/** Print transaction data to the deadlock file and possibly to stderr.
-	@param trx transaction
-	@param max_query_len max query length to print */
-	static void print(const trx_t* trx, ulint max_query_len);
-
-	/** rewind(3) the file used for storing the latest detected deadlock
-	and print a heading message to stderr if printing of all deadlocks to
-	stderr is enabled. */
-	static void start_print();
-
-	/** Print lock data to the deadlock file and possibly to stderr.
-	@param lock record or table type lock */
-	static void print(const lock_t* lock);
-
-	/** Print a message to the deadlock file and possibly to stderr.
-	@param msg message to print */
-	static void print(const char* msg);
-
-	/** Print info about transaction that was rolled back.
-	@param trx transaction rolled back
-	@param lock lock trx wants */
-	static void rollback_print(const trx_t* trx, const lock_t* lock);
-
-private:
-	/** DFS state information, used during deadlock checking. */
-	struct state_t {
-		const lock_t*	m_lock;		/*!< Current lock */
-		const lock_t*	m_wait_lock;	/*!< Waiting for lock */
-		ulint		m_heap_no;	/*!< heap number if rec lock */
-	};
-
-	/** Used in deadlock tracking. Protected by lock_sys.mutex. */
-	static ib_uint64_t	s_lock_mark_counter;
-
-	/** Calculation steps thus far. It is the count of the nodes visited. */
-	ulint			m_cost= 0;
-
-#ifdef HAVE_REPLICATION
-	/** Set if thd_rpl_deadlock_check() should be called for waits. */
-	const bool m_report_waiters;
-#endif
-
-	/** Joining transaction that is requesting a lock in an
-	incompatible mode */
-	trx_t* const		m_start;
-
-	/** TRUE if search was too deep and was aborted */
-	bool			m_too_deep= false;
-
-	/** Lock that trx wants */
-	const lock_t*		m_wait_lock;
-
-	/**  Value of lock_mark_count at the start of the deadlock check. */
-	const ib_uint64_t	m_mark_start;
-
-	/** Number of states pushed onto the stack */
-	size_t			m_n_elems= 0;
-
-	/** This is to avoid malloc/free calls. */
-	static state_t		s_states[4096];
+  /** Quickly detect a deadlock using Brent's cycle detection algorithm.
+  @param trx     transaction that is waiting for another transaction
+  @return a transaction that is part of a cycle, and the length of the cycle
+  @retval nullptr if no cycle was found */
+  inline std::pair<trx_t *,unsigned> find_cycle(trx_t *trx)
+  {
+    trx_t *tortoise= trx, *hare= trx;
+    for (unsigned power= 1, l= 1; (hare= hare->lock.wait_trx) != nullptr; l++)
+    {
+      if (tortoise == hare)
+      {
+        lock_sys.deadlocks++;
+        return {hare, l};
+      }
+      if (l == power)
+      {
+        if (UNIV_UNLIKELY(l == 128))
+          /* Cut off after 1+2+4+8+...+128=255 iterations. */
+          return {trx, 0};
+	/* The maximum concurrent number of TRX_STATE_ACTIVE transactions
+	is TRX_RSEG_N_SLOTS * 128, or innodb_page_size / 16 * 128
+	(default: 131,072, maximum: 524,288). */
+        power<<= 1;
+        l= 0;
+        tortoise= hare;
+      }
+    }
+    return {nullptr, 0};
+  }
 };
-
-/** Counter to mark visited nodes during deadlock search. */
-ib_uint64_t	DeadlockChecker::s_lock_mark_counter = 0;
-
-/** The stack used for deadlock searches. */
-DeadlockChecker::state_t	DeadlockChecker::s_states[4096];
 
 #ifdef UNIV_DEBUG
 /*********************************************************************//**
@@ -282,8 +134,8 @@ static bool lock_rec_validate_page(const buf_block_t *block, bool latched)
 /* The lock system */
 lock_sys_t lock_sys;
 
-/** Only created if !srv_read_only_mode */
-static FILE*		lock_latest_err_file;
+/** Only created if !srv_read_only_mode. Protected by lock_sys.mutex. */
+static FILE *lock_latest_err_file;
 
 /*********************************************************************//**
 Reports that a transaction id is insensible, i.e., in the future. */
@@ -1086,23 +938,36 @@ wsrep_print_wait_locks(
 static void lock_reset_lock_and_trx_wait(lock_t *lock)
 {
   lock_sys.mutex_assert_locked();
+  mysql_mutex_assert_owner(&lock_sys.wait_mutex);
+  trx_t *trx= lock->trx;
   ut_ad(lock->is_waiting());
-  ut_ad(!lock->trx->lock.wait_lock || lock->trx->lock.wait_lock == lock);
-  lock->trx->lock.wait_lock= nullptr;
+  ut_ad(!trx->lock.wait_lock || trx->lock.wait_lock == lock);
+  trx->lock.wait_lock= nullptr;
+  trx->lock.wait_trx= nullptr;
   lock->type_mode&= ~LOCK_WAIT;
 }
 
 #ifdef WITH_WSREP
 /** Set the wait status of a lock.
 @param[in,out]	lock	lock that will be waited for
-@param[in,out]	trx	transaction that will wait for the lock */
-static void lock_set_lock_and_trx_wait(lock_t *lock, trx_t *trx)
+@param[in,out]	trx	transaction that will wait for the lock
+@param[in]      ctrx	holder of the conflicting lock */
+static void lock_set_lock_and_trx_wait(lock_t *lock, trx_t *trx, trx_t *ctrx)
 {
   ut_ad(lock);
   ut_ad(lock->trx == trx);
-  ut_ad(!trx->lock.wait_lock || trx->lock.wait_lock != lock);
-  ut_ad(!trx->lock.wait_lock || (*trx->lock.wait_lock).trx == trx);
   lock_sys.mutex_assert_locked();
+  if (trx->lock.wait_trx)
+  {
+    ut_ad(trx->lock.wait_trx == ctrx);
+    ut_ad(trx->lock.wait_lock != lock);
+    ut_ad((*trx->lock.wait_lock).trx == trx);
+  }
+  else
+  {
+    trx->lock.wait_trx= ctrx;
+    ut_ad(!trx->lock.wait_lock);
+  }
 
   trx->lock.wait_lock= lock;
   lock->type_mode|= LOCK_WAIT;
@@ -1111,6 +976,7 @@ static void lock_set_lock_and_trx_wait(lock_t *lock, trx_t *trx)
 
 /** Create a new record lock and inserts it to the lock queue,
 without checking for deadlocks or conflicts.
+@param[in]	c_lock		conflicting lock
 @param[in]	type_mode	lock mode and wait flag
 @param[in]	page_id		index page number
 @param[in]	page		R-tree index page, or NULL
@@ -1121,8 +987,8 @@ without checking for deadlocks or conflicts.
 @return created lock */
 lock_t*
 lock_rec_create_low(
+	lock_t*		c_lock,
 #ifdef WITH_WSREP
-	lock_t*		c_lock,	/*!< conflicting lock */
 	que_thr_t*	thr,	/*!< thread owning trx */
 #endif
 	unsigned	type_mode,
@@ -1234,16 +1100,16 @@ lock_rec_create_low(
 		if (holds_trx_mutex) {
 			trx->mutex.wr_lock();
 		}
-		c_lock->trx->mutex.wr_lock();
-		if (c_lock->trx->lock.wait_thr) {
-
-			c_lock->trx->lock.was_chosen_as_deadlock_victim = TRUE;
+		trx_t *ctrx = c_lock->trx;
+		ctrx->mutex.wr_lock();
+		if (ctrx->lock.wait_thr) {
+			ctrx->lock.was_chosen_as_deadlock_victim = true;
 
 			if (UNIV_UNLIKELY(wsrep_debug)) {
 				wsrep_print_wait_locks(c_lock);
 			}
 
-			lock_set_lock_and_trx_wait(lock, trx);
+			lock_set_lock_and_trx_wait(lock, trx, ctrx);
 			UT_LIST_ADD_LAST(trx->lock.trx_locks, lock);
 
 			trx->lock.wait_thr = thr;
@@ -1256,20 +1122,20 @@ lock_rec_create_low(
 				trx->mutex.wr_unlock();
 			}
 			lock_cancel_waiting_and_release(
-				c_lock->trx->lock.wait_lock);
+				ctrx->lock.wait_lock);
 
 			if (holds_trx_mutex) {
 				trx->mutex.wr_lock();
 			}
 
-			c_lock->trx->mutex.wr_unlock();
+			ctrx->mutex.wr_unlock();
 
 			/* have to bail out here to avoid lock_set_lock... */
 			mysql_mutex_unlock(&lock_sys.wait_mutex);
 			return(lock);
 		}
 		mysql_mutex_unlock(&lock_sys.wait_mutex);
-		c_lock->trx->mutex.wr_unlock();
+		ctrx->mutex.wr_unlock();
 	} else
 #endif /* WITH_WSREP */
 		HASH_INSERT(lock_t, hash, lock_hash_get(type_mode),
@@ -1279,8 +1145,15 @@ lock_rec_create_low(
 		trx->mutex.wr_lock();
 	}
 	if (type_mode & LOCK_WAIT) {
-		ut_ad(!trx->lock.wait_lock
-		      || (*trx->lock.wait_lock).trx == trx);
+		if (trx->lock.wait_trx) {
+			ut_ad(!c_lock || trx->lock.wait_trx == c_lock->trx);
+			ut_ad(trx->lock.wait_lock);
+			ut_ad((*trx->lock.wait_lock).trx == trx);
+		} else {
+			ut_ad(c_lock);
+			trx->lock.wait_trx = c_lock->trx;
+			ut_ad(!trx->lock.wait_lock);
+		}
 		trx->lock.wait_lock = lock;
 	}
 	UT_LIST_ADD_LAST(trx->lock.trx_locks, lock);
@@ -1295,6 +1168,7 @@ lock_rec_create_low(
 
 /** Enqueue a waiting request for a lock which cannot be granted immediately.
 Check for deadlocks.
+@param[in]	c_lock		conflicting lock
 @param[in]	type_mode	the requested lock mode (LOCK_S or LOCK_X)
 				possibly ORed with LOCK_GAP or
 				LOCK_REC_NOT_GAP, ORed with
@@ -1311,9 +1185,7 @@ Check for deadlocks.
 @retval	DB_DEADLOCK		if this transaction was chosen as the victim */
 dberr_t
 lock_rec_enqueue_waiting(
-#ifdef WITH_WSREP
-	lock_t*			c_lock,	/*!< conflicting lock */
-#endif
+	lock_t*			c_lock,
 	unsigned		type_mode,
 	const buf_block_t*	block,
 	ulint			heap_no,
@@ -1349,8 +1221,9 @@ lock_rec_enqueue_waiting(
 	/* Enqueue the lock request that will wait to be granted, note that
 	we already own the trx mutex. */
 	lock_t* lock = lock_rec_create(
+		c_lock,
 #ifdef WITH_WSREP
-		c_lock, thr,
+		thr,
 #endif
 		type_mode | LOCK_WAIT, block, heap_no, index, trx, TRUE);
 
@@ -1510,8 +1383,9 @@ lock_rec_add_to_queue(
 
 create:
 	lock_rec_create(
+		NULL,
 #ifdef WITH_WSREP
-		NULL, NULL,
+		NULL,
 #endif
 		type_mode, block, heap_no, index, trx, caller_owns_trx_mutex);
 }
@@ -1569,23 +1443,16 @@ lock_rec_lock(
       /* Do nothing if the trx already has a strong enough lock on rec */
       if (!lock_rec_has_expl(mode, block, heap_no, trx))
       {
-        if (
-#ifdef WITH_WSREP
-	    lock_t *c_lock=
-#endif
-	    lock_rec_other_has_conflicting(mode, block, heap_no, trx))
-        {
+        if (lock_t *c_lock= lock_rec_other_has_conflicting(mode, block,
+                                                           heap_no, trx))
           /*
             If another transaction has a non-gap conflicting
             request in the queue, as this transaction does not
             have a lock strong enough already granted on the
-	    record, we have to wait. */
-	    err = lock_rec_enqueue_waiting(
-#ifdef WITH_WSREP
-			c_lock,
-#endif /* WITH_WSREP */
-			mode, block, heap_no, index, thr, NULL);
-        }
+            record, we have to wait.
+          */
+          err= lock_rec_enqueue_waiting(c_lock, mode, block, heap_no,
+                                        index, thr, nullptr);
         else if (!impl)
         {
           /* Set the requested lock on the record. */
@@ -1615,11 +1482,11 @@ lock_rec_lock(
       Note that we don't own the trx mutex.
     */
     if (!impl)
-      lock_rec_create(
+      lock_rec_create(nullptr,
 #ifdef WITH_WSREP
-         NULL, NULL,
+                      nullptr,
 #endif
-        mode, block, heap_no, index, trx, false);
+                      mode, block, heap_no, index, trx, false);
 
     err= DB_SUCCESS_LOCKED_REC;
   }
@@ -1762,14 +1629,11 @@ dberr_t lock_wait(que_thr_t *thr)
     abstime.MY_tv_sec+= innodb_lock_wait_timeout;
     thd_wait_begin(trx->mysql_thd, wait_for);
 
-    const bool deadlock= DeadlockChecker::check_and_resolve(trx);
-    if (deadlock)
+    if (Deadlock::check_and_resolve(trx))
+    {
       trx->error_state= DB_DEADLOCK;
-
-    mysql_mutex_lock(&lock_sys.wait_mutex);
-
-    if (deadlock)
       goto end_wait;
+    }
 
     while (trx->lock.wait_lock)
     {
@@ -1858,8 +1722,6 @@ static void lock_wait_end(trx_t *trx)
 /** Grant a waiting lock request and release the waiting transaction. */
 static void lock_grant(lock_t *lock)
 {
-  lock_sys.mutex_assert_locked();
-  mysql_mutex_assert_owner(&lock_sys.wait_mutex);
   lock_reset_lock_and_trx_wait(lock);
   trx_t *trx= lock->trx;
   trx->mutex.wr_lock();
@@ -3127,11 +2989,8 @@ lock_table_create(
 				in dictionary cache */
 	unsigned	type_mode,/*!< in: lock mode possibly ORed with
 				LOCK_WAIT */
-	trx_t*		trx	/*!< in: trx */
-#ifdef WITH_WSREP
-	, lock_t*	c_lock = NULL	/*!< in: conflicting lock */
-#endif
-	)
+	trx_t*		trx,	/*!< in: trx */
+	lock_t*		c_lock)	/*!< in: conflicting lock */
 {
 	lock_t*		lock;
 
@@ -3218,8 +3077,15 @@ allocated:
 	ut_list_append(table->locks, lock, TableLockGetNode());
 
 	if (type_mode & LOCK_WAIT) {
-		ut_ad(!trx->lock.wait_lock
-		      || (*trx->lock.wait_lock).trx == trx);
+		if (trx->lock.wait_trx) {
+			ut_ad(!c_lock || trx->lock.wait_trx == c_lock->trx);
+			ut_ad(trx->lock.wait_lock);
+			ut_ad((*trx->lock.wait_lock).trx == trx);
+		} else {
+			ut_ad(c_lock);
+			trx->lock.wait_trx = c_lock->trx;
+			ut_ad(!trx->lock.wait_lock);
+		}
 		trx->lock.wait_lock = lock;
 	}
 
@@ -3374,11 +3240,8 @@ lock_table_enqueue_waiting(
 	unsigned	mode,	/*!< in: lock mode this transaction is
 				requesting */
 	dict_table_t*	table,	/*!< in/out: table */
-	que_thr_t*	thr	/*!< in: query thread */
-#ifdef WITH_WSREP
-	, lock_t*	c_lock	/*!< in: conflicting lock or NULL */
-#endif
-)
+	que_thr_t*	thr,	/*!< in: query thread */
+	lock_t*		c_lock)	/*!< in: conflicting lock or NULL */
 {
 	trx_t*		trx;
 
@@ -3405,11 +3268,7 @@ lock_table_enqueue_waiting(
 #endif /* WITH_WSREP */
 
 	/* Enqueue the lock request that will wait to be granted */
-	lock_table_create(table, mode | LOCK_WAIT, trx
-#ifdef WITH_WSREP
-			  , c_lock
-#endif
-			  );
+	lock_table_create(table, mode | LOCK_WAIT, trx, c_lock);
 
 	trx->lock.wait_thr = thr;
 	trx->lock.was_chosen_as_deadlock_victim = false;
@@ -3540,13 +3399,9 @@ lock_table(
 	trx->mutex.wr_lock();
 
 	if (wait_for) {
-		err = lock_table_enqueue_waiting(mode, table, thr
-#ifdef WITH_WSREP
-						 , wait_for
-#endif
-						 );
+		err = lock_table_enqueue_waiting(mode, table, thr, wait_for);
 	} else {
-		lock_table_create(table, mode, trx);
+		lock_table_create(table, mode, trx, wait_for);
 	}
 
 	lock_sys.mutex_unlock();
@@ -3581,7 +3436,7 @@ lock_table_ix_resurrect(
 		      trx, LOCK_WAIT, table, LOCK_IX));
 
 	mutex->wr_lock();
-	lock_table_create(table, LOCK_IX, trx);
+	lock_table_create(table, LOCK_IX, trx, nullptr);
 	lock_sys.mutex_unlock();
 	mutex->wr_unlock();
 }
@@ -3602,7 +3457,7 @@ void lock_table_x_resurrect(dict_table_t *table, trx_t *trx)
   ut_ad(!lock_table_other_has_incompatible(trx, LOCK_WAIT, table, LOCK_X));
 
   mutex->wr_lock();
-  lock_table_create(table, LOCK_X, trx);
+  lock_table_create(table, LOCK_X, trx, nullptr);
   lock_sys.mutex_unlock();
   mutex->wr_unlock();
 }
@@ -4863,19 +4718,13 @@ lock_rec_insert_check_and_lock(
 
 	const unsigned	type_mode = LOCK_X | LOCK_GAP | LOCK_INSERT_INTENTION;
 
-	if (
-#ifdef WITH_WSREP
-	    lock_t* c_lock =
-#endif /* WITH_WSREP */
+	if (lock_t* c_lock =
 	    lock_rec_other_has_conflicting(type_mode, block, heap_no, trx)) {
 		/* Note that we may get DB_SUCCESS also here! */
 		trx->mutex.wr_lock();
 
 		err = lock_rec_enqueue_waiting(
-#ifdef WITH_WSREP
-			c_lock,
-#endif /* WITH_WSREP */
-			type_mode, block, heap_no, index, thr, NULL);
+			c_lock, type_mode, block, heap_no, index, thr, NULL);
 
 		trx->mutex.wr_unlock();
 	} else {
@@ -5863,472 +5712,231 @@ lock_trx_has_expl_x_lock(
 }
 #endif /* UNIV_DEBUG */
 
-/** rewind(3) the file used for storing the latest detected deadlock and
-print a heading message to stderr if printing of all deadlocks to stderr
-is enabled. */
-void
-DeadlockChecker::start_print()
+namespace Deadlock
 {
-	lock_sys.mutex_assert_locked();
-
-	rewind(lock_latest_err_file);
-	ut_print_timestamp(lock_latest_err_file);
-
-	if (srv_print_all_deadlocks) {
-		ib::info() << "Transactions deadlock detected, dumping"
-			" detailed information.";
-	}
-}
-
-/** Print a message to the deadlock file and possibly to stderr.
-@param msg message to print */
-void
-DeadlockChecker::print(const char* msg)
-{
-	fputs(msg, lock_latest_err_file);
-
-	if (srv_print_all_deadlocks) {
-		ib::info() << msg;
-	}
-}
-
-/** Print transaction data to the deadlock file and possibly to stderr.
-@param trx transaction
-@param max_query_len max query length to print */
-void
-DeadlockChecker::print(const trx_t* trx, ulint max_query_len)
-{
-	lock_sys.mutex_assert_locked();
-
-	ulint	n_rec_locks = trx->lock.n_rec_locks;
-	ulint	n_trx_locks = UT_LIST_GET_LEN(trx->lock.trx_locks);
-	ulint	heap_size = mem_heap_get_size(trx->lock.lock_heap);
-
-	trx_print_low(lock_latest_err_file, trx, max_query_len,
-		      n_rec_locks, n_trx_locks, heap_size);
-
-	if (srv_print_all_deadlocks) {
-		trx_print_low(stderr, trx, max_query_len,
-			      n_rec_locks, n_trx_locks, heap_size);
-	}
-}
-
-/** Print lock data to the deadlock file and possibly to stderr.
-@param lock record or table type lock */
-void
-DeadlockChecker::print(const lock_t* lock)
-{
-	lock_sys.mutex_assert_locked();
-
-	if (!lock->is_table()) {
-		mtr_t mtr;
-		lock_rec_print(lock_latest_err_file, lock, mtr);
-
-		if (srv_print_all_deadlocks) {
-			lock_rec_print(stderr, lock, mtr);
-		}
-	} else {
-		lock_table_print(lock_latest_err_file, lock);
-
-		if (srv_print_all_deadlocks) {
-			lock_table_print(stderr, lock);
-		}
-	}
-}
-
-/** Get the next lock in the queue that is owned by a transaction whose
-sub-tree has not already been searched.
-Note: "next" here means PREV for table locks.
-
-@param lock Lock in queue
-@param heap_no heap_no if lock is a record lock else ULINT_UNDEFINED
-
-@return next lock or NULL if at end of queue */
-const lock_t*
-DeadlockChecker::get_next_lock(const lock_t* lock, ulint heap_no) const
-{
-	lock_sys.mutex_assert_locked();
-
-	do {
-		if (!lock->is_table()) {
-			ut_ad(heap_no != ULINT_UNDEFINED);
-			lock = lock_rec_get_next_const(heap_no, lock);
-		} else {
-			ut_ad(heap_no == ULINT_UNDEFINED);
-
-			lock = UT_LIST_GET_NEXT(
-				un_member.tab_lock.locks, lock);
-		}
-
-	} while (lock != NULL && is_visited(lock));
-
-	ut_ad(!lock || lock->is_table() == m_wait_lock->is_table());
-
-	return(lock);
-}
-
-/** Get the first lock to search. The search starts from the current
-wait_lock. What we are really interested in is an edge from the
-current wait_lock's owning transaction to another transaction that has
-a lock ahead in the queue. We skip locks where the owning transaction's
-sub-tree has already been searched.
-
-Note: The record locks are traversed from the oldest lock to the
-latest. For table locks we go from latest to oldest.
-
-For record locks, we first position the "iterator" on the first lock on
-the page and then reposition on the actual heap_no. This is required
-due to the way the record lock has is implemented.
-
-@param[out] heap_no if rec lock, else ULINT_UNDEFINED.
-@return first lock or NULL */
-const lock_t*
-DeadlockChecker::get_first_lock(ulint* heap_no) const
-{
-	lock_sys.mutex_assert_locked();
-
-	const lock_t*	lock = m_wait_lock;
-
-	if (!lock->is_table()) {
-		/* We are only interested in records that match the heap_no. */
-		*heap_no = lock_rec_find_set_bit(lock);
-
-		ut_ad(*heap_no <= 0xffff);
-		ut_ad(*heap_no != ULINT_UNDEFINED);
-
-		/* Find the locks on the page. */
-		lock = lock_sys.get_first(
-			lock->type_mode & LOCK_PREDICATE
-			? lock_sys.prdt_hash
-			: lock_sys.rec_hash,
-			lock->un_member.rec_lock.page_id);
-
-		/* Position on the first lock on the physical record.*/
-		if (!lock_rec_get_nth_bit(lock, *heap_no)) {
-			lock = lock_rec_get_next_const(*heap_no, lock);
-		}
-
-		ut_a(!lock->is_waiting());
-	} else {
-		/* Table locks don't care about the heap_no. */
-		*heap_no = ULINT_UNDEFINED;
-		dict_table_t*	table = lock->un_member.tab_lock.table;
-		lock = UT_LIST_GET_FIRST(table->locks);
-	}
-
-	/* Must find at least two locks, otherwise there cannot be a
-	waiting lock, secondly the first lock cannot be the wait_lock. */
-	ut_a(lock != NULL);
-	ut_a(lock != m_wait_lock);
-
-	/* Check that the lock type doesn't change. */
-	ut_ad(lock->is_table() == m_wait_lock->is_table());
-
-	return(lock);
-}
-
-/** Notify that a deadlock has been detected and print the conflicting
-transaction info.
-@param lock lock causing deadlock */
-void
-DeadlockChecker::notify(const lock_t* lock) const
-{
-	lock_sys.mutex_assert_locked();
-
-	start_print();
-
-	print("\n*** (1) TRANSACTION:\n");
-
-	print(m_wait_lock->trx, 3000);
-
-	print("*** (1) WAITING FOR THIS LOCK TO BE GRANTED:\n");
-
-	print(m_wait_lock);
-
-	print("*** (2) TRANSACTION:\n");
-
-	print(lock->trx, 3000);
-
-	print("*** (2) HOLDS THE LOCK(S):\n");
-
-	print(lock);
-
-	/* It is possible that the joining transaction was granted its
-	lock when we rolled back some other waiting transaction. */
-
-	if (auto wait_lock= m_start->lock.wait_lock) {
-		print("*** (2) WAITING FOR THIS LOCK TO BE GRANTED:\n");
-
-		print(wait_lock);
-	}
-
-	DBUG_PRINT("ib_lock", ("deadlock detected"));
-}
-
-/** Compare the "weight" (or size) of two transactions. Transactions that
-have edited non-transactional tables are considered heavier than ones
-that have not.
-@return whether a is heavier than b */
-inline bool trx_weight_ge(const trx_t *a, const trx_t *b)
-{
-  bool a_notrans= a->mysql_thd && thd_has_edited_nontrans_tables(a->mysql_thd);
-  bool b_notrans= b->mysql_thd && thd_has_edited_nontrans_tables(b->mysql_thd);
-  return a_notrans != b_notrans ? a_notrans : TRX_WEIGHT(a) >= TRX_WEIGHT(b);
-}
-
-/** @return the victim transaction that should be rolled back */
-trx_t *DeadlockChecker::select_victim() const
-{
-  lock_sys.mutex_assert_locked();
-  trx_t *lock_trx= m_wait_lock->trx;
-  ut_ad(m_start->lock.wait_lock);
-  ut_ad(lock_trx != m_start);
-
-  if (trx_weight_ge(lock_trx, m_start))
+  /** rewind(3) the file used for storing the latest detected deadlock and
+  print a heading message to stderr if printing of all deadlocks to stderr
+  is enabled. */
+  static void start_print()
   {
-#ifdef WITH_WSREP
-    if (m_start->is_wsrep() && wsrep_thd_is_BF(m_start->mysql_thd, FALSE))
-      return lock_trx;
-#endif /* WITH_WSREP */
-    /* The joining transaction is 'smaller', choose it as the victim */
-    return m_start;
+    lock_sys.mutex_assert_locked();
+
+    rewind(lock_latest_err_file);
+    ut_print_timestamp(lock_latest_err_file);
+
+    if (srv_print_all_deadlocks)
+      ib::info() << "Transactions deadlock detected,"
+                    " dumping detailed information.";
   }
 
+  /** Print a message to the deadlock file and possibly to stderr.
+  @param msg message to print */
+  static void print(const char *msg)
+  {
+    fputs(msg, lock_latest_err_file);
+    if (srv_print_all_deadlocks)
+      ib::info() << msg;
+  }
+
+  /** Print transaction data to the deadlock file and possibly to stderr.
+  @param trx transaction */
+  static void print(const trx_t &trx)
+  {
+    lock_sys.mutex_assert_locked();
+
+    ulint n_rec_locks= trx.lock.n_rec_locks;
+    ulint n_trx_locks= UT_LIST_GET_LEN(trx.lock.trx_locks);
+    ulint heap_size= mem_heap_get_size(trx.lock.lock_heap);
+
+    trx_print_low(lock_latest_err_file, &trx, 3000,
+                  n_rec_locks, n_trx_locks, heap_size);
+
+    if (srv_print_all_deadlocks)
+      trx_print_low(stderr, &trx, 3000, n_rec_locks, n_trx_locks, heap_size);
+  }
+
+  /** Print lock data to the deadlock file and possibly to stderr.
+  @param lock record or table type lock */
+  static void print(const lock_t &lock)
+  {
+    lock_sys.mutex_assert_locked();
+
+    if (!lock.is_table())
+    {
+      mtr_t mtr;
+      lock_rec_print(lock_latest_err_file, &lock, mtr);
+
+      if (srv_print_all_deadlocks)
+        lock_rec_print(stderr, &lock, mtr);
+    }
+    else
+    {
+      lock_table_print(lock_latest_err_file, &lock);
+
+      if (srv_print_all_deadlocks)
+        lock_table_print(stderr, &lock);
+    }
+  }
+
+  /** Print info about transaction on too deep search.
+  @param trx   current transaction to roll back
+  @param lock  the requested lock */
+  ATTRIBUTE_COLD static void deep_print(const trx_t &trx)
+  {
+    mysql_mutex_unlock(&lock_sys.wait_mutex);
+    {
+      LockMutexGuard g;
+      if (const lock_t *wait_lock= trx.lock.wait_lock)
+      {
+        start_print();
+        print("TOO DEEP OR LONG SEARCH IN THE LOCK TABLE"
+              " WAITS-FOR GRAPH, WE WILL ROLL BACK"
+              " FOLLOWING TRANSACTION \n\n"
+              "*** TRANSACTION:\n");
+        print(trx);
+        print("*** WAITING FOR THIS LOCK TO BE GRANTED:\n");
+        print(*wait_lock);
+      }
+    }
+    mysql_mutex_lock(&lock_sys.wait_mutex);
+  }
+
+  ATTRIBUTE_COLD
+  /** Report a deadlock (cycle in the waits-for graph).
+  @param trx    newest transaction waiting for a lock
+  @param cycle  transaction within a deadlock cycle
+  @param length length of the deadlock cycle
+  @return the transaction to be rolled back (unless one was committed already)
+  @return nullptr if no deadlock */
+  static trx_t *report(trx_t *const trx, trx_t *cycle, unsigned length)
+  {
+    mysql_mutex_unlock(&lock_sys.wait_mutex);
+
+    static const char rollback_msg[]= "*** WE ROLL BACK TRANSACTION (%u)\n";
+    char buf[9 + sizeof rollback_msg];
+
+    /* trx is owned by this thread; we can safely call these without
+    holding any mutex */
+    const bool trx_nontrans= trx->mysql_thd &&
+      thd_has_edited_nontrans_tables(trx->mysql_thd);
+    const ulint trx_weight= TRX_WEIGHT(trx);
+    trx_t *victim= nullptr;
+    bool victim_nontrans= true;
+    ulint victim_weight= ULINT_UNDEFINED;
+    unsigned victim_pos= 0, trx_pos= 0;
+    {
+      unsigned l= 0;
+      LockMutexGuard g;
+      mysql_mutex_lock(&lock_sys.wait_mutex);
+      for (trx_t *next= cycle;;)
+      {
+        next= next->lock.wait_trx;
+        if (!next || ++l > length)
+          return nullptr; /* The original cycle must have been resolved. */
+        const bool next_nontrans= next->mysql_thd &&
+          thd_has_edited_nontrans_tables(next->mysql_thd);
+	const ulint next_weight= TRX_WEIGHT(next);
+        if ((!next_nontrans && victim_nontrans) ||
+            (next_nontrans == victim_nontrans && next_weight < victim_weight))
+        {
+          victim_nontrans= next_nontrans;
+          victim_weight= next_weight;
+          victim= next;
+          victim_pos= l;
+        }
+	if (next == victim)
+          trx_pos= l;
+        if (next == cycle)
+          break;
+      }
+      if (l != length)
+        return nullptr; /* The original cycle must have been resolved. */
+
+      if (trx_pos && trx_weight == victim_weight &&
+          trx_nontrans == victim_nontrans)
+      {
+        victim= trx;
+	victim_pos= trx_pos;
+      }
+
+      /* Finally, display the deadlock */
+      start_print();
+      l= 0;
+
+      for (trx_t *next= cycle;;)
+      {
+        next= next->lock.wait_trx;
+        ut_ad(next);
+        ut_ad(next->state == TRX_STATE_ACTIVE);
+        ut_ad(next->lock.wait_lock);
+        snprintf(buf, sizeof buf, "\n*** (%u) TRANSACTION:\n", ++l);
+        print(buf);
+        ut_ad(l <= length);
+        print(*next);
+        print("*** WAITING FOR THIS LOCK TO BE GRANTED:\n");
+        print(*next->lock.wait_lock);
+        if (next == cycle)
+          break;
+      }
+      snprintf(buf, sizeof buf, rollback_msg, victim_pos);
+      print(buf);
+
+      ut_ad(victim->state == TRX_STATE_ACTIVE);
+
+      if (victim != trx)
+      {
+        victim->mutex.wr_lock();
+        victim->lock.was_chosen_as_deadlock_victim= true;
+        lock_cancel_waiting_and_release(victim->lock.wait_lock);
+        victim->mutex.wr_unlock();
+      }
 #ifdef WITH_WSREP
-  if (lock_trx->is_wsrep() && wsrep_thd_is_BF(lock_trx->mysql_thd, FALSE))
-    return m_start;
-#endif /* WITH_WSREP */
+      if (victim->is_wsrep() && wsrep_thd_is_SR(victim->mysql_thd))
+        wsrep_handle_SR_rollback(trx->mysql_thd, victim->mysql_thd);
+#endif
+    }
 
-  return lock_trx;
+    return victim;
+  }
 }
 
-/** Looks iteratively for a deadlock. Note: the joining transaction may
-have been granted its lock by the deadlock checks.
-@return the victim transaction
-@return nullptr if no deadlock */
-inline trx_t* DeadlockChecker::search()
-{
-	lock_sys.mutex_assert_locked();
-
-	ut_ad(m_start != NULL);
-	ut_ad(m_wait_lock != NULL);
-	check_trx_state(m_wait_lock->trx);
-	ut_ad(m_mark_start <= s_lock_mark_counter);
-
-	/* Look at the locks ahead of wait_lock in the lock queue. */
-	ulint		heap_no;
-	const lock_t*	lock = get_first_lock(&heap_no);
-
-	for (;;) {
-		/* We should never visit the same sub-tree more than once. */
-		ut_ad(lock == NULL || !is_visited(lock));
-
-		while (m_n_elems > 0 && lock == NULL) {
-
-			/* Restore previous search state. */
-
-			pop(lock, heap_no);
-
-			lock = get_next_lock(lock, heap_no);
-		}
-
-		if (lock == NULL) {
-			break;
-		}
-
-		if (lock == m_wait_lock) {
-
-			/* We can mark this subtree as searched */
-			ut_ad(lock->trx->lock.deadlock_mark <= m_mark_start);
-
-			lock->trx->lock.deadlock_mark = ++s_lock_mark_counter;
-
-			/* We are not prepared for an overflow. This 64-bit
-			counter should never wrap around. At 10^9 increments
-			per second, it would take 10^3 years of uptime. */
-
-			ut_ad(s_lock_mark_counter > 0);
-
-			/* Backtrack */
-			lock = NULL;
-			continue;
-		}
-
-		if (!lock_has_to_wait(m_wait_lock, lock)) {
-			/* No conflict, next lock */
-			lock = get_next_lock(lock, heap_no);
-			continue;
-		}
-
-		trx_t *trx = lock->trx;
-
-		if (trx == m_start) {
-			/* Found a cycle. */
-			notify(lock);
-			return select_victim();
-		}
-
-		if (is_too_deep()) {
-			/* Search too deep to continue. */
-			m_too_deep = true;
-			return m_start;
-		}
-
-#ifdef HAVE_REPLICATION
-		/* We do not need to report autoinc locks to the upper
-		layer. These locks are released before commit, so they
-		can not cause deadlocks with binlog-fixed commit
-		order. */
-		if (m_report_waiters) {
-			ut_ad(!(lock->type_mode & LOCK_AUTO_INC));
-			thd_rpl_deadlock_check(m_start->mysql_thd,
-					       trx->mysql_thd);
-		}
-#endif /* HAVE_REPLICATION */
-
-		if (!trx->lock.wait_thr) {
-		} else if (lock_t* wait_lock = trx->lock.wait_lock) {
-			/* Note: Because we are not holding
-			lock_sys.wait_mutex here, trx->lock.wait_lock
-			could be reset soon after we read it. */
-
-			/* Another trx ahead has requested a lock in an
-			incompatible mode, and is itself waiting for a lock. */
-
-			++m_cost;
-
-			if (!push(lock, heap_no)) {
-				m_too_deep = true;
-				return m_start;
-			}
-
-			m_wait_lock = wait_lock;
-
-			lock = get_first_lock(&heap_no);
-
-			if (!is_visited(lock)) {
-				continue;
-			}
-		}
-
-		lock = get_next_lock(lock, heap_no);
-	}
-
-	ut_a(lock == NULL && m_n_elems == 0);
-
-	/* No deadlock found. */
-	return(0);
-}
-
-/** Print info about transaction that was rolled back.
-@param trx transaction rolled back
-@param lock lock trx wants */
-void
-DeadlockChecker::rollback_print(const trx_t* trx, const lock_t* lock)
-{
-	lock_sys.mutex_assert_locked();
-
-	/* If the lock search exceeds the max step
-	or the max depth, the current trx will be
-	the victim. Print its information. */
-	start_print();
-
-	print("TOO DEEP OR LONG SEARCH IN THE LOCK TABLE"
-	      " WAITS-FOR GRAPH, WE WILL ROLL BACK"
-	      " FOLLOWING TRANSACTION \n\n"
-	      "*** TRANSACTION:\n");
-
-	print(trx, 3000);
-
-	print("*** WAITING FOR THIS LOCK TO BE GRANTED:\n");
-
-	print(lock);
-}
-
-/** Check if a joining lock request results in a deadlock.
-If a deadlock is found, we will resolve the deadlock by
-choosing a victim transaction to be rolled it back.
-We will attempt to resolve all deadlocks.
-
-@param[in,out]	trx	transaction requesting a lock
-
-@return whether the transaction was chosen as victim */
-inline bool DeadlockChecker::check_and_resolve(trx_t *trx)
+/** Check if a lock request results in a deadlock.
+Resolve a deadlock by choosing a transaction that will be rolled back.
+@param trx    transaction requesting a lock
+@return whether trx must report DB_DEADLOCK */
+static bool Deadlock::check_and_resolve(trx_t *trx)
 {
   ut_ad(trx->state == TRX_STATE_ACTIVE);
   ut_ad(!srv_read_only_mode);
 
-  if (!innobase_deadlock_detect || !trx->lock.wait_lock)
-    return false;
+#ifdef HAVE_REPLICATION
+  const bool rpl= trx->mysql_thd && thd_need_wait_reports(trx->mysql_thd);
+#endif
+
+  mysql_mutex_lock(&lock_sys.wait_mutex);
 
 #ifdef HAVE_REPLICATION
-  const bool report_waiters= thd_need_wait_reports(trx->mysql_thd);
-#else
-  const bool report_waiters= false;
+  if (rpl && trx->lock.wait_trx && trx->lock.wait_trx->mysql_thd)
+    thd_rpl_deadlock_check(trx->mysql_thd, trx->lock.wait_trx->mysql_thd);
 #endif
 
-  trx_t *victim_trx;
+  if (!innobase_deadlock_detect)
+    return false;
 
-  for (;;)
+  auto cycle= find_cycle(trx);
+
+  if (UNIV_LIKELY(!cycle.first))
+    return trx->lock.was_chosen_as_deadlock_victim;
+
+  if (UNIV_UNLIKELY(!cycle.second))
   {
-    LockMutexGuard g; // FIXME: only lock_sys.wait_mutex?
-    lock_t *lock= trx->lock.wait_lock;
-
-    if (!lock)
-      return false;
-
-    if (trx->lock.was_chosen_as_deadlock_victim)
-      return true;
-
-    DeadlockChecker checker(trx, lock, s_lock_mark_counter, report_waiters &&
-                            !(lock->type_mode & LOCK_AUTO_INC));
-    victim_trx= checker.search();
-
-    /* Search too deep, we rollback the joining transaction only if it
-    is possible to rollback. Otherwise we rollback the transaction
-    that is holding the lock that the joining transaction wants. */
-    if (checker.is_too_deep())
-    {
-      ut_ad(trx == checker.m_start);
-      ut_ad(trx == victim_trx);
-      rollback_print(trx, lock);
-self_victim:
-      print("*** WE ROLL BACK TRANSACTION (2)\n");
-    }
-    else if (victim_trx == trx)
-      goto self_victim;
-    else if (!victim_trx)
-      return false;
-    else
-    {
-      mysql_mutex_lock(&lock_sys.wait_mutex);
-      victim_trx->mutex.wr_lock();
-      const auto state= victim_trx->state;
-      if (state != TRX_STATE_ACTIVE)
-      {
-        ut_ad(state == TRX_STATE_COMMITTED_IN_MEMORY);
-        mysql_mutex_unlock(&lock_sys.wait_mutex);
-        victim_trx->mutex.wr_unlock();
-        return false;
-      }
-      print("*** WE ROLL BACK TRANSACTION (1)\n");
-      victim_trx->lock.was_chosen_as_deadlock_victim= true;
-      lock_cancel_waiting_and_release(victim_trx->lock.wait_lock);
-      mysql_mutex_unlock(&lock_sys.wait_mutex);
-      victim_trx->mutex.wr_unlock();
-    }
-    lock_sys.deadlocks++;
-    break;
+    ut_ad(cycle.first == trx);
+    deep_print(*trx);
+    return true;
   }
 
-  ut_ad(trx->state == TRX_STATE_ACTIVE);
-
-#ifdef WITH_WSREP
-  if (victim_trx->is_wsrep() && wsrep_thd_is_SR(victim_trx->mysql_thd))
-      wsrep_handle_SR_rollback(trx->mysql_thd, victim_trx->mysql_thd);
-#endif
-
-  return victim_trx == trx;
+  trx_t *victim_trx= report(trx, cycle.first, cycle.second);
+  return victim_trx == trx || trx->lock.was_chosen_as_deadlock_victim;
 }
 
 /*************************************************************//**
