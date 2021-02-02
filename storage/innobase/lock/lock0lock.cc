@@ -5829,7 +5829,7 @@ namespace Deadlock
         next= next->lock.wait_trx;
         if (!next || ++l > length)
           return nullptr; /* The original cycle must have been resolved. */
-	const undo_no_t next_weight= TRX_WEIGHT(next) |
+        const undo_no_t next_weight= TRX_WEIGHT(next) |
           (next->mysql_thd && thd_has_edited_nontrans_tables(next->mysql_thd)
            ? 1ULL << 63 : 0);
         if (next_weight < victim_weight)
@@ -5838,7 +5838,7 @@ namespace Deadlock
           victim= next;
           victim_pos= l;
         }
-	if (next == victim)
+        if (next == victim)
           trx_pos= l;
         if (next == cycle)
           break;
@@ -5849,7 +5849,7 @@ namespace Deadlock
       if (trx_pos && trx_weight == victim_weight)
       {
         victim= trx;
-	victim_pos= trx_pos;
+        victim_pos= trx_pos;
       }
 
       /* Finally, display the deadlock */
@@ -5861,13 +5861,42 @@ namespace Deadlock
         next= next->lock.wait_trx;
         ut_ad(next);
         ut_ad(next->state == TRX_STATE_ACTIVE);
-        ut_ad(next->lock.wait_lock);
+        const lock_t *wait_lock= next->lock.wait_lock;
+        ut_ad(wait_lock);
         snprintf(buf, sizeof buf, "\n*** (%u) TRANSACTION:\n", ++l);
         print(buf);
         ut_ad(l <= length);
         print(*next);
         print("*** WAITING FOR THIS LOCK TO BE GRANTED:\n");
-        print(*next->lock.wait_lock);
+        print(*wait_lock);
+        if (wait_lock->is_table())
+        {
+          if (const lock_t *lock=
+              UT_LIST_GET_FIRST(wait_lock->un_member.tab_lock.table->locks))
+          {
+            ut_ad(!lock->is_waiting());
+            print("*** CONFLICTING WITH:\n");
+            print(*lock);
+          }
+          else
+            ut_ad("conflicting table lock not found" == 0);
+
+        }
+        else if (const lock_t *lock=
+                 lock_sys.get_first(wait_lock->type_mode & LOCK_PREDICATE
+                                    ? lock_sys.prdt_hash : lock_sys.rec_hash,
+                                    wait_lock->un_member.rec_lock.page_id))
+        {
+          const ulint heap_no= lock_rec_find_set_bit(wait_lock);
+          if (!lock_rec_get_nth_bit(lock, heap_no))
+            lock= lock_rec_get_next_const(heap_no, lock);
+          ut_ad(!lock->is_waiting());
+          print("*** CONFLICTING WITH:\n");
+          print(*lock);
+        }
+        else
+          ut_ad("conflicting record lock not found" == 0);
+
         if (next == cycle)
           break;
       }
