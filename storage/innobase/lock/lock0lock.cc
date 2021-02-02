@@ -5817,12 +5817,11 @@ namespace Deadlock
 
     /* trx is owned by this thread; we can safely call these without
     holding any mutex */
-    const bool trx_nontrans= trx->mysql_thd &&
-      thd_has_edited_nontrans_tables(trx->mysql_thd);
-    const ulint trx_weight= TRX_WEIGHT(trx);
+    const undo_no_t trx_weight= TRX_WEIGHT(trx) |
+      (trx->mysql_thd && thd_has_edited_nontrans_tables(trx->mysql_thd)
+       ? 1ULL << 63 : 0);
     trx_t *victim= nullptr;
-    bool victim_nontrans= true;
-    ulint victim_weight= ULINT_UNDEFINED;
+    undo_no_t victim_weight= ~0ULL;
     unsigned victim_pos= 0, trx_pos= 0;
     {
       unsigned l= 0;
@@ -5833,13 +5832,11 @@ namespace Deadlock
         next= next->lock.wait_trx;
         if (!next || ++l > length)
           return nullptr; /* The original cycle must have been resolved. */
-        const bool next_nontrans= next->mysql_thd &&
-          thd_has_edited_nontrans_tables(next->mysql_thd);
-	const ulint next_weight= TRX_WEIGHT(next);
-        if ((!next_nontrans && victim_nontrans) ||
-            (next_nontrans == victim_nontrans && next_weight < victim_weight))
+	const undo_no_t next_weight= TRX_WEIGHT(next) |
+          (next->mysql_thd && thd_has_edited_nontrans_tables(next->mysql_thd)
+           ? 1ULL << 63 : 0);
+        if (next_weight < victim_weight)
         {
-          victim_nontrans= next_nontrans;
           victim_weight= next_weight;
           victim= next;
           victim_pos= l;
@@ -5852,8 +5849,7 @@ namespace Deadlock
       if (l != length)
         return nullptr; /* The original cycle must have been resolved. */
 
-      if (trx_pos && trx_weight == victim_weight &&
-          trx_nontrans == victim_nontrans)
+      if (trx_pos && trx_weight == victim_weight)
       {
         victim= trx;
 	victim_pos= trx_pos;
