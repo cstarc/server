@@ -1348,47 +1348,43 @@ lock_rec_add_to_queue(
 		type_mode &= ~(LOCK_GAP | LOCK_REC_NOT_GAP);
 	}
 
-	lock_t*		lock;
-	lock_t*		first_lock;
-
-	/* Look for a waiting lock request on the same record or on a gap */
-
-	for (first_lock = lock = lock_sys.get_first(*lock_hash_get(type_mode),
-						    block->page.id());
-	     lock != NULL;
-	     lock = lock_rec_get_next_on_page(lock)) {
-
-		if (lock->is_waiting()
-		    && lock_rec_get_nth_bit(lock, heap_no)) {
-
-			goto create;
+	if (type_mode & LOCK_WAIT) {
+		goto create;
+	} else if (lock_t *first_lock =
+		   lock_sys.get_first(*lock_hash_get(type_mode),
+				      block->page.id())) {
+		for (lock_t* lock = first_lock;;) {
+			if (lock->is_waiting()
+			    && lock_rec_get_nth_bit(lock, heap_no)) {
+				goto create;
+			}
+			if (!(lock = lock_rec_get_next_on_page(lock))) {
+				break;
+			}
 		}
-	}
-
-	if (first_lock && !(type_mode & LOCK_WAIT)) {
 
 		/* Look for a similar record lock on the same page:
 		if one is found and there are no waiting lock requests,
 		we can just set the bit */
 
-		lock = lock_rec_find_similar_on_page(
-			type_mode, heap_no, first_lock, trx);
-
-		if (lock != NULL) {
-
+		if (lock_t *lock = lock_rec_find_similar_on_page(
+			    type_mode, heap_no, first_lock, trx)) {
 			lock_rec_set_nth_bit(lock, heap_no);
-
 			return;
 		}
 	}
 
 create:
-	lock_rec_create(
-		NULL,
+	/* Note: We will not pass any conflicting lock to lock_rec_create(),
+	because we should be moving an existing waiting lock request. */
+	ut_ad(!(type_mode & LOCK_WAIT) || trx->lock.wait_trx);
+
+	lock_rec_create(nullptr,
 #ifdef WITH_WSREP
-		NULL,
+			nullptr,
 #endif
-		type_mode, block, heap_no, index, trx, caller_owns_trx_mutex);
+			type_mode, block, heap_no, index, trx,
+			caller_owns_trx_mutex);
 }
 
 /*********************************************************************//**

@@ -474,13 +474,16 @@ lock_prdt_add_to_queue(
 	}
 
 create:
-	lock_t* lock = lock_rec_create(
-		NULL, /* FIXME: conflicting lock! */
+	/* Note: We will not pass any conflicting lock to lock_rec_create(),
+	because we should be moving an existing waiting lock request. */
+	ut_ad(!(type_mode & LOCK_WAIT) || trx->lock.wait_trx);
+
+	lock_t* lock = lock_rec_create(nullptr,
 #ifdef WITH_WSREP
-		NULL, /* FIXME: replicate SPATIAL INDEX locks */
+				       nullptr,
 #endif
-		type_mode, block, PRDT_HEAPNO, index, trx,
-		caller_owns_trx_mutex);
+				       type_mode, block, PRDT_HEAPNO, index,
+				       trx, caller_owns_trx_mutex);
 
 	if (lock->type_mode & LOCK_PREDICATE) {
 		lock_prdt_set_prdt(lock, prdt);
