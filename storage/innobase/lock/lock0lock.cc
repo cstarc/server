@@ -94,6 +94,7 @@ namespace Deadlock
     {
       if (tortoise == hare)
       {
+        ut_ad(l > 1);
         lock_sys.deadlocks++;
         return {hare, l};
       }
@@ -102,9 +103,9 @@ namespace Deadlock
         if (UNIV_UNLIKELY(l == 128))
           /* Cut off after 1+2+4+8+...+128=255 iterations. */
           return {trx, 0};
-	/* The maximum concurrent number of TRX_STATE_ACTIVE transactions
-	is TRX_RSEG_N_SLOTS * 128, or innodb_page_size / 16 * 128
-	(default: 131,072, maximum: 524,288). */
+        /* The maximum concurrent number of TRX_STATE_ACTIVE transactions
+        is TRX_RSEG_N_SLOTS * 128, or innodb_page_size / 16 * 128
+        (default: 131,072, maximum: 524,288). */
         power<<= 1;
         l= 0;
         tortoise= hare;
@@ -5911,13 +5912,14 @@ static bool Deadlock::check_and_resolve(trx_t *trx)
 
   mysql_mutex_lock(&lock_sys.wait_mutex);
 
-#ifdef HAVE_REPLICATION
-  if (rpl && trx->lock.wait_trx && trx->lock.wait_trx->mysql_thd)
-    thd_rpl_deadlock_check(trx->mysql_thd, trx->lock.wait_trx->mysql_thd);
-#endif
-
   if (!innobase_deadlock_detect)
     return false;
+
+#ifdef HAVE_REPLICATION
+  if (rpl && trx->lock.wait_trx && trx->lock.wait_trx->mysql_thd &&
+      !((*trx->lock.wait_lock).type_mode & LOCK_AUTO_INC))
+    thd_rpl_deadlock_check(trx->mysql_thd, trx->lock.wait_trx->mysql_thd);
+#endif
 
   auto cycle= find_cycle(trx);
 
