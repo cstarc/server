@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (C) 2012, 2014 Facebook, Inc. All Rights Reserved.
-Copyright (C) 2014, 2020, MariaDB Corporation.
+Copyright (C) 2014, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -56,11 +56,11 @@ struct btr_defragment_item_t
   /** persistent cursor where btr_defragment_n_pages should start */
   btr_pcur_t * const pcur;
   /** completion signal */
-  mysql_cond_t *cond;
+  pthread_cond_t *cond;
   /** timestamp of last time this index is processed by defragment thread */
   ulonglong last_processed= 0;
 
-  btr_defragment_item_t(btr_pcur_t *pcur, mysql_cond_t *cond)
+  btr_defragment_item_t(btr_pcur_t *pcur, pthread_cond_t *cond)
     : pcur(pcur), cond(cond) {}
 };
 
@@ -126,7 +126,7 @@ btr_defragment_shutdown()
 		btr_defragment_item_t* item = *iter;
 		iter = btr_defragment_wq.erase(iter);
 		if (item->cond) {
-			mysql_cond_signal(item->cond);
+			pthread_cond_signal(item->cond);
 		}
 	}
 	mysql_mutex_unlock(&btr_defragment_mutex);
@@ -169,8 +169,8 @@ btr_defragment_find_index(
 bool btr_defragment_add_index(btr_pcur_t *pcur, THD *thd)
 {
   dict_stats_empty_defrag_summary(pcur->btr_cur.index);
-  mysql_cond_t cond;
-  mysql_cond_init(0, &cond, nullptr);
+  pthread_cond_t cond;
+  pthread_cond_init(&cond, nullptr);
   btr_defragment_item_t item(pcur, &cond);
   mysql_mutex_lock(&btr_defragment_mutex);
   btr_defragment_wq.push_back(&item);
@@ -182,7 +182,7 @@ bool btr_defragment_add_index(btr_pcur_t *pcur, THD *thd)
   {
     timespec abstime;
     set_timespec(abstime, 1);
-    if (!mysql_cond_timedwait(&cond, &btr_defragment_mutex, &abstime))
+    if (!my_cond_timedwait(&cond, &btr_defragment_mutex.m_mutex, &abstime))
       break;
     if (thd_killed(thd))
     {
@@ -192,7 +192,7 @@ bool btr_defragment_add_index(btr_pcur_t *pcur, THD *thd)
     }
   }
 
-  mysql_cond_destroy(&cond);
+  pthread_cond_destroy(&cond);
   mysql_mutex_unlock(&btr_defragment_mutex);
   return interrupted;
 }
@@ -210,7 +210,7 @@ btr_defragment_remove_table(
   {
     if (item->cond && table == item->pcur->btr_cur.index->table)
     {
-      mysql_cond_signal(item->cond);
+      pthread_cond_signal(item->cond);
       item->cond= nullptr;
     }
   }
@@ -220,10 +220,7 @@ btr_defragment_remove_table(
 /*********************************************************************//**
 Check whether we should save defragmentation statistics to persistent storage.
 Currently we save the stats to persistent storage every 100 updates. */
-UNIV_INTERN
-void
-btr_defragment_save_defrag_stats_if_needed(
-	dict_index_t*	index)	/*!< in: index */
+void btr_defragment_save_defrag_stats_if_needed(dict_index_t *index)
 {
 	if (srv_defragment_stats_accuracy != 0 // stats tracking disabled
 	    && index->table->space_id != 0 // do not track system tables
@@ -240,7 +237,7 @@ Main defragment functionalities used by defragment thread.*/
 Calculate number of records from beginning of block that can
 fit into size_limit
 @return number of records */
-UNIV_INTERN
+static
 ulint
 btr_defragment_calc_n_recs_for_size(
 	buf_block_t* block,	/*!< in: B-tree page */
@@ -258,12 +255,12 @@ btr_defragment_calc_n_recs_for_size(
 	ulint size = 0;
 	page_cur_t cur;
 
+	const ulint n_core = page_is_leaf(page) ? index->n_core_fields : 0;
 	page_cur_set_before_first(block, &cur);
 	page_cur_move_to_next(&cur);
 	while (page_cur_get_rec(&cur) != page_get_supremum_rec(page)) {
 		rec_t* cur_rec = page_cur_get_rec(&cur);
-		offsets = rec_get_offsets(cur_rec, index, offsets,
-					  page_is_leaf(page),
+		offsets = rec_get_offsets(cur_rec, index, offsets, n_core,
 					  ULINT_UNDEFINED, &heap);
 		ulint rec_size = rec_offs_size(offsets);
 		size += rec_size;
@@ -275,6 +272,9 @@ btr_defragment_calc_n_recs_for_size(
 		page_cur_move_to_next(&cur);
 	}
 	*n_recs_size = size;
+	if (UNIV_LIKELY_NULL(heap)) {
+		mem_heap_free(heap);
+	}
 	return n_recs;
 }
 
@@ -397,8 +397,8 @@ btr_defragment_merge_pages(
 	if (n_recs_to_move == n_recs) {
 		/* The whole page is merged with the previous page,
 		free it. */
-		lock_update_merge_left(to_block, orig_pred,
-				       from_block);
+		const page_id_t from{from_block->page.id()};
+		lock_update_merge_left(*to_block, orig_pred, from);
 		btr_search_drop_page_hash_index(from_block);
 		btr_level_list_remove(*from_block, *index, mtr);
 		btr_page_get_father(index, from_block, mtr, &parent);
@@ -704,7 +704,7 @@ processed:
 
 			mysql_mutex_lock(&btr_defragment_mutex);
 			if (item->cond) {
-				mysql_cond_signal(item->cond);
+				pthread_cond_signal(item->cond);
 			}
 			goto processed;
 		}

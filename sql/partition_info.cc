@@ -126,7 +126,7 @@ partition_info *partition_info::get_clone(THD *thd)
 /**
   Mark named [sub]partition to be used/locked.
 
-  @param part_name  Partition name to match.
+  @param part_name  Partition name to match.  Must be \0 terminated!
   @param length     Partition name length.
 
   @return Success if partition found
@@ -140,7 +140,10 @@ bool partition_info::add_named_partition(const char *part_name, size_t length)
   PART_NAME_DEF *part_def;
   Partition_share *part_share;
   DBUG_ENTER("partition_info::add_named_partition");
-  DBUG_ASSERT(table && table->s && table->s->ha_share);
+  DBUG_ASSERT(part_name[length] == 0);
+  DBUG_ASSERT(table);
+  DBUG_ASSERT(table->s);
+  DBUG_ASSERT(table->s->ha_share);
   part_share= static_cast<Partition_share*>((table->s->ha_share));
   DBUG_ASSERT(part_share->partition_name_hash_initialized);
   part_name_hash= &part_share->partition_name_hash;
@@ -172,9 +175,9 @@ bool partition_info::add_named_partition(const char *part_name, size_t length)
     else
       bitmap_set_bit(&read_partitions, part_def->part_id);
   }
-  DBUG_PRINT("info", ("Found partition %u is_subpart %d for name %s",
+  DBUG_PRINT("info", ("Found partition %u is_subpart %d for name %.*s",
                       part_def->part_id, part_def->is_subpart,
-                      part_name));
+                      length, part_name));
   DBUG_RETURN(false);
 }
 
@@ -1389,13 +1392,13 @@ void partition_info::print_no_partition_found(TABLE *table_arg, myf errflag)
       buf_ptr= (char*)"from column_list";
     else
     {
-      my_bitmap_map *old_map= dbug_tmp_use_all_columns(table_arg, table_arg->read_set);
+      MY_BITMAP *old_map= dbug_tmp_use_all_columns(table_arg, &table_arg->read_set);
       if (part_expr->null_value)
         buf_ptr= (char*)"NULL";
       else
         longlong10_to_str(err_value, buf,
                      part_expr->unsigned_flag ? 10 : -10);
-      dbug_tmp_restore_column_map(table_arg->read_set, old_map);
+      dbug_tmp_restore_column_map(&table_arg->read_set, old_map);
     }
     my_error(ER_NO_PARTITION_FOR_GIVEN_VALUE, errflag, buf_ptr);
   }

@@ -1,5 +1,5 @@
 /* Copyright (c) 2002, 2014, Oracle and/or its affiliates.
-   Copyright (c) 2008, 2020, MariaDB
+   Copyright (c) 2008, 2021, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -7177,7 +7177,7 @@ static void test_embedded_start_stop()
   if (mysql_server_init(embedded_server_arg_count,
                         embedded_server_args,
                         (char**) embedded_server_groups))
-    DIE("Can't initialize MySQL server");
+    DIE("Can't initialize MariaDB server");
 
   /* connect to server with no flags, default protocol, auto reconnect true */
   mysql= client_connect(0, MYSQL_PROTOCOL_DEFAULT, 1);
@@ -14328,8 +14328,8 @@ static void test_client_character_set()
   DIE_UNLESS(rc == 0);
 
   mysql_get_character_set_info(mysql, &cs);
-  DIE_UNLESS(!strcmp(cs.csname, "utf8"));
-  DIE_UNLESS(!strcmp(cs.name, "utf8_general_ci"));
+  DIE_UNLESS(!strcmp(cs.csname, "utf8mb3"));
+  DIE_UNLESS(!strcmp(cs.name, "utf8mb3_general_ci"));
   /* Restore the default character set */
   rc= mysql_set_character_set(mysql, csdefault);
   myquery(rc);
@@ -15959,7 +15959,7 @@ static void test_bug15752()
                            opt_unix_socket,
                            CLIENT_MULTI_STATEMENTS))
   {
-    printf("Unable connect to MySQL server: %s\n", mysql_error(&mysql_local));
+    printf("Unable connect to MariaDB server: %s\n", mysql_error(&mysql_local));
     DIE_UNLESS(0);
   }
   rc= mysql_real_query(&mysql_local, query, strlen(query));
@@ -17110,10 +17110,10 @@ static void test_bug30472()
 
   /* Check that we have UTF8 on the server and on the client. */
 
-  DIE_UNLESS(strcmp(character_set_name_4, "utf8") == 0);
-  DIE_UNLESS(strcmp(character_set_client_4, "utf8") == 0);
-  DIE_UNLESS(strcmp(character_set_results_4, "utf8") == 0);
-  DIE_UNLESS(strcmp(collation_connnection_4, "utf8_general_ci") == 0);
+  DIE_UNLESS(strcmp(character_set_name_4, "utf8mb3") == 0);
+  DIE_UNLESS(strcmp(character_set_client_4, "utf8mb3") == 0);
+  DIE_UNLESS(strcmp(character_set_results_4, "utf8mb3") == 0);
+  DIE_UNLESS(strcmp(collation_connnection_4, "utf8mb3_general_ci") == 0);
 
   /* That's it. Cleanup. */
 
@@ -18883,7 +18883,7 @@ static void test_bug58036()
   if (!mysql_change_user(conn, opt_user, opt_password, NULL))
   {
     if (!opt_silent)
-      printf("mysql_change_user() succedded, error expected!");
+      printf("mysql_change_user() succeeded, error expected!");
     mysql_close(conn);
     DIE("");
   }

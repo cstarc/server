@@ -2,7 +2,7 @@
 
 Copyright (c) 2005, 2016, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2012, Facebook Inc.
-Copyright (c) 2014, 2020, MariaDB Corporation.
+Copyright (c) 2014, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -903,7 +903,7 @@ page_zip_compress_node_ptrs(
 	do {
 		const rec_t*	rec = *recs++;
 
-		offsets = rec_get_offsets(rec, index, offsets, false,
+		offsets = rec_get_offsets(rec, index, offsets, 0,
 					  ULINT_UNDEFINED, &heap);
 		/* Only leaf nodes may contain externally stored columns. */
 		ut_ad(!rec_offs_any_extern(offsets));
@@ -1152,7 +1152,7 @@ page_zip_compress_clust(
 	do {
 		const rec_t*	rec = *recs++;
 
-		offsets = rec_get_offsets(rec, index, offsets, true,
+		offsets = rec_get_offsets(rec, index, offsets, index->n_fields,
 					  ULINT_UNDEFINED, &heap);
 		ut_ad(rec_offs_n_fields(offsets)
 		      == dict_index_get_n_fields(index));
@@ -1370,33 +1370,6 @@ page_zip_compress(
 	}
 
 	MONITOR_INC(MONITOR_PAGE_COMPRESS);
-
-	/* Simulate a compression failure with a probability determined by
-	innodb_simulate_comp_failures, only if the page has 2 or more
-	records. */
-
-	if (srv_simulate_comp_failures
-	    && !dict_index_is_ibuf(index)
-	    && page_get_n_recs(page) >= 2
-	    && ((ulint)(rand() % 100) < srv_simulate_comp_failures)
-	    && strcmp(index->table->name.m_name, "IBUF_DUMMY")) {
-
-#ifdef UNIV_DEBUG
-		ib::error()
-			<< "Simulating a compression failure"
-			<< " for table " << index->table->name
-			<< " index "
-			<< index->name()
-			<< " page "
-			<< block->page.id().page_no()
-			<< "("
-			<< (page_is_leaf(page) ? "leaf" : "non-leaf")
-			<< ")";
-
-#endif
-
-		goto err_exit;
-	}
 
 	heap = mem_heap_create(page_zip_get_size(page_zip)
 			       + n_fields * (2 + sizeof(ulint))
@@ -1679,8 +1652,8 @@ page_zip_fields_decode(
 		return(NULL);
 	}
 
-	table = dict_mem_table_create("ZIP_DUMMY", NULL, n, 0,
-				      DICT_TF_COMPACT, 0);
+	table = dict_table_t::create({C_STRING_WITH_LEN("ZIP_DUMMY")},
+				     nullptr, n, 0, DICT_TF_COMPACT, 0);
 	index = dict_mem_index_create(table, "ZIP_DUMMY", 0, n);
 	index->n_uniq = static_cast<unsigned>(n) & dict_index_t::MAX_N_FIELDS;
 	/* avoid ut_ad(index->cached) in dict_index_get_n_unique_in_tree */
@@ -2054,7 +2027,7 @@ page_zip_apply_log(
 				sorted by address (indexed by
 				heap_no - PAGE_HEAP_NO_USER_LOW) */
 	ulint		n_dense,/*!< in: size of recs[] */
-	bool		is_leaf,/*!< in: whether this is a leaf page */
+	ulint		n_core,	/*!< in: index->n_fields, or 0 for non-leaf */
 	ulint		trx_id_col,/*!< in: column number of trx_id in the index,
 				or ULINT_UNDEFINED if none */
 	ulint		heap_status,
@@ -2130,7 +2103,7 @@ page_zip_apply_log(
 			/* Clear the data bytes of the record. */
 			mem_heap_t*	heap	= NULL;
 			rec_offs*	offs;
-			offs = rec_get_offsets(rec, index, offsets, is_leaf,
+			offs = rec_get_offsets(rec, index, offsets, n_core,
 					       ULINT_UNDEFINED, &heap);
 			memset(rec, 0, rec_offs_data_size(offs));
 
@@ -2148,7 +2121,7 @@ page_zip_apply_log(
 		This will be overwritten in page_zip_set_extra_bytes(),
 		called by page_zip_decompress_low(). */
 		ut_d(rec[-REC_NEW_INFO_BITS] = 0);
-		rec_offs_make_valid(rec, index, is_leaf, offsets);
+		rec_offs_make_valid(rec, index, n_core != 0, offsets);
 
 		/* Copy the extra bytes (backwards). */
 		{
@@ -2328,7 +2301,7 @@ page_zip_decompress_node_ptrs(
 		}
 
 		/* Read the offsets. The status bits are needed here. */
-		offsets = rec_get_offsets(rec, index, offsets, false,
+		offsets = rec_get_offsets(rec, index, offsets, 0,
 					  ULINT_UNDEFINED, &heap);
 
 		/* Non-leaf nodes should not have any externally
@@ -2415,7 +2388,7 @@ zlib_done:
 		const byte*	mod_log_ptr;
 		mod_log_ptr = page_zip_apply_log(d_stream->next_in,
 						 d_stream->avail_in + 1,
-						 recs, n_dense, false,
+						 recs, n_dense, 0,
 						 ULINT_UNDEFINED, heap_status,
 						 index, offsets);
 
@@ -2446,7 +2419,7 @@ zlib_done:
 	for (slot = 0; slot < n_dense; slot++) {
 		rec_t*		rec	= recs[slot];
 
-		offsets = rec_get_offsets(rec, index, offsets, false,
+		offsets = rec_get_offsets(rec, index, offsets, 0,
 					  ULINT_UNDEFINED, &heap);
 		/* Non-leaf nodes should not have any externally
 		stored columns. */
@@ -2568,7 +2541,8 @@ zlib_done:
 		const byte*	mod_log_ptr;
 		mod_log_ptr = page_zip_apply_log(d_stream->next_in,
 						 d_stream->avail_in + 1,
-						 recs, n_dense, true,
+						 recs, n_dense,
+						 index->n_fields,
 						 ULINT_UNDEFINED, heap_status,
 						 index, offsets);
 
@@ -2771,7 +2745,7 @@ page_zip_decompress_clust(
 		}
 
 		/* Read the offsets. The status bits are needed here. */
-		offsets = rec_get_offsets(rec, index, offsets, true,
+		offsets = rec_get_offsets(rec, index, offsets, index->n_fields,
 					  ULINT_UNDEFINED, &heap);
 
 		/* This is a leaf page in a clustered index. */
@@ -2898,7 +2872,8 @@ zlib_done:
 		const byte*	mod_log_ptr;
 		mod_log_ptr = page_zip_apply_log(d_stream->next_in,
 						 d_stream->avail_in + 1,
-						 recs, n_dense, true,
+						 recs, n_dense,
+						 index->n_fields,
 						 trx_id_col, heap_status,
 						 index, offsets);
 
@@ -2934,7 +2909,7 @@ zlib_done:
 		rec_t*	rec	= recs[slot];
 		bool	exists	= !page_zip_dir_find_free(
 			page_zip, page_offset(rec));
-		offsets = rec_get_offsets(rec, index, offsets, true,
+		offsets = rec_get_offsets(rec, index, offsets, index->n_fields,
 					  ULINT_UNDEFINED, &heap);
 
 		dst = rec_get_nth_field(rec, offsets,
@@ -3457,7 +3432,7 @@ page_zip_validate_low(
 			page + PAGE_NEW_INFIMUM, TRUE);
 		trec = page_rec_get_next_low(
 			temp_page + PAGE_NEW_INFIMUM, TRUE);
-		const bool is_leaf = page_is_leaf(page);
+		const ulint n_core = page_is_leaf(page) ? index->n_fields : 0;
 
 		do {
 			if (page_offset(rec) != page_offset(trec)) {
@@ -3472,7 +3447,7 @@ page_zip_validate_low(
 			if (index) {
 				/* Compare the data. */
 				offsets = rec_get_offsets(
-					rec, index, offsets, is_leaf,
+					rec, index, offsets, n_core,
 					ULINT_UNDEFINED, &heap);
 
 				if (memcmp(rec - rec_offs_extra_size(offsets),
@@ -4616,37 +4591,26 @@ page_zip_copy_recs(
 #endif /* !UNIV_INNOCHECKSUM */
 
 /** Calculate the compressed page checksum.
-@param[in]	data			compressed page
-@param[in]	size			size of compressed page
-@param[in]	algo			algorithm to use
+@param data		compressed page
+@param size		size of compressed page
+@param use_adler	whether to use Adler32 instead of a XOR of 3 CRC-32C
 @return page checksum */
-uint32_t
-page_zip_calc_checksum(
-	const void*			data,
-	ulint				size,
-	srv_checksum_algorithm_t	algo)
+uint32_t page_zip_calc_checksum(const void *data, size_t size, bool use_adler)
 {
 	uLong		adler;
 	const Bytef*	s = static_cast<const byte*>(data);
 
 	/* Exclude FIL_PAGE_SPACE_OR_CHKSUM, FIL_PAGE_LSN,
 	and FIL_PAGE_FILE_FLUSH_LSN from the checksum. */
+	ut_ad(size > FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID);
 
-	switch (algo) {
-	case SRV_CHECKSUM_ALGORITHM_FULL_CRC32:
-	case SRV_CHECKSUM_ALGORITHM_STRICT_FULL_CRC32:
-	case SRV_CHECKSUM_ALGORITHM_CRC32:
-	case SRV_CHECKSUM_ALGORITHM_STRICT_CRC32:
-		ut_ad(size > FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID);
+	if (!use_adler) {
 		return ut_crc32(s + FIL_PAGE_OFFSET,
 				FIL_PAGE_LSN - FIL_PAGE_OFFSET)
 			^ ut_crc32(s + FIL_PAGE_TYPE, 2)
 			^ ut_crc32(s + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID,
 				   size - FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID);
-	case SRV_CHECKSUM_ALGORITHM_INNODB:
-	case SRV_CHECKSUM_ALGORITHM_STRICT_INNODB:
-		ut_ad(size > FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID);
-
+	} else {
 		adler = adler32(0L, s + FIL_PAGE_OFFSET,
 				FIL_PAGE_LSN - FIL_PAGE_OFFSET);
 		adler = adler32(adler, s + FIL_PAGE_TYPE, 2);
@@ -4656,15 +4620,7 @@ page_zip_calc_checksum(
 			- FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID);
 
 		return(uint32_t(adler));
-	case SRV_CHECKSUM_ALGORITHM_NONE:
-	case SRV_CHECKSUM_ALGORITHM_STRICT_NONE:
-		return(BUF_NO_CHECKSUM_MAGIC);
-	/* no default so the compiler will emit a warning if new enum
-	is added and not handled here */
 	}
-
-	ut_error;
-	return(0);
 }
 
 /** Validate the checksum on a ROW_FORMAT=COMPRESSED page.
@@ -4673,13 +4629,6 @@ page_zip_calc_checksum(
 @return whether the stored checksum matches innodb_checksum_algorithm */
 bool page_zip_verify_checksum(const byte *data, size_t size)
 {
-	const srv_checksum_algorithm_t	curr_algo =
-		static_cast<srv_checksum_algorithm_t>(srv_checksum_algorithm);
-
-	if (curr_algo == SRV_CHECKSUM_ALGORITHM_NONE) {
-		return true;
-	}
-
 	if (buf_is_zeroes(span<const byte>(data, size))) {
 		return true;
 	}
@@ -4687,31 +4636,17 @@ bool page_zip_verify_checksum(const byte *data, size_t size)
 	const uint32_t stored = mach_read_from_4(
 		data + FIL_PAGE_SPACE_OR_CHKSUM);
 
-	uint32_t calc = page_zip_calc_checksum(data, size, curr_algo);
+	uint32_t calc = page_zip_calc_checksum(data, size, false);
 
 #ifdef UNIV_INNOCHECKSUM
+	extern FILE* log_file;
+	extern unsigned long long cur_page_num;
+
 	if (log_file) {
 		fprintf(log_file, "page::%llu;"
-			" %s checksum: calculated = %u;"
+			" checksum: calculated = %u;"
 			" recorded = %u\n", cur_page_num,
-			buf_checksum_algorithm_name(
-				static_cast<srv_checksum_algorithm_t>(
-				srv_checksum_algorithm)),
 			calc, stored);
-	}
-
-	if (!strict_verify) {
-		const uint32_t	crc32 = page_zip_calc_checksum(
-			data, size, SRV_CHECKSUM_ALGORITHM_CRC32);
-
-		if (log_file) {
-			fprintf(log_file, "page::%llu: crc32 checksum:"
-				" calculated = %u; recorded = %u\n",
-				cur_page_num, crc32, stored);
-			fprintf(log_file, "page::%llu: none checksum:"
-				" calculated = %lu; recorded = %u\n",
-				cur_page_num, BUF_NO_CHECKSUM_MAGIC, stored);
-		}
 	}
 #endif /* UNIV_INNOCHECKSUM */
 
@@ -4719,30 +4654,19 @@ bool page_zip_verify_checksum(const byte *data, size_t size)
 		return(TRUE);
 	}
 
-	switch (curr_algo) {
+#ifndef UNIV_INNOCHECKSUM
+	switch (srv_checksum_algorithm) {
 	case SRV_CHECKSUM_ALGORITHM_STRICT_FULL_CRC32:
 	case SRV_CHECKSUM_ALGORITHM_STRICT_CRC32:
-	case SRV_CHECKSUM_ALGORITHM_STRICT_INNODB:
-	case SRV_CHECKSUM_ALGORITHM_STRICT_NONE:
-		return FALSE;
-	case SRV_CHECKSUM_ALGORITHM_FULL_CRC32:
-	case SRV_CHECKSUM_ALGORITHM_CRC32:
+		break;
+	default:
 		if (stored == BUF_NO_CHECKSUM_MAGIC) {
 			return(TRUE);
 		}
 
-		return stored == page_zip_calc_checksum(
-			data, size, SRV_CHECKSUM_ALGORITHM_INNODB);
-	case SRV_CHECKSUM_ALGORITHM_INNODB:
-		if (stored == BUF_NO_CHECKSUM_MAGIC) {
-			return TRUE;
-		}
-
-		return stored == page_zip_calc_checksum(
-			data, size, SRV_CHECKSUM_ALGORITHM_CRC32);
-	case SRV_CHECKSUM_ALGORITHM_NONE:
-		return TRUE;
+		return stored == page_zip_calc_checksum(data, size, true);
 	}
+#endif /* !UNIV_INNOCHECKSUM */
 
 	return FALSE;
 }

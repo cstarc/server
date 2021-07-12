@@ -78,7 +78,7 @@ private:
 /** Global counters used inside InnoDB. */
 struct srv_stats_t
 {
-	typedef ib_counter_t<ulint, 64> ulint_ctr_64_t;
+	typedef ib_counter_t<ulint> ulint_ctr_n_t;
 	typedef simple_counter<lsn_t> lsn_ctr_1_t;
 	typedef simple_counter<ulint> ulint_ctr_1_t;
 	typedef simple_counter<int64_t> int64_ctr_1_t;
@@ -105,10 +105,6 @@ struct srv_stats_t
 	space in the log buffer and have to flush it */
 	ulint_ctr_1_t		log_waits;
 
-#if defined(LINUX_NATIVE_AIO)
-	ulint_ctr_1_t buffered_aio_submitted;
-#endif
-
 	/** Store the number of write requests issued */
 	ulint_ctr_1_t		buf_pool_write_requests;
 
@@ -117,79 +113,76 @@ struct srv_stats_t
 	ulint_ctr_1_t		buf_pool_reads;
 
 	/** Number of bytes saved by page compression */
-	ulint_ctr_64_t          page_compression_saved;
+	ulint_ctr_n_t          page_compression_saved;
 	/* Number of index pages written */
-	ulint_ctr_64_t          index_pages_written;
+	ulint_ctr_n_t          index_pages_written;
 	/* Number of non index pages written */
-	ulint_ctr_64_t          non_index_pages_written;
+	ulint_ctr_n_t          non_index_pages_written;
 	/* Number of pages compressed with page compression */
-        ulint_ctr_64_t          pages_page_compressed;
+        ulint_ctr_n_t          pages_page_compressed;
 	/* Number of TRIM operations induced by page compression */
-        ulint_ctr_64_t          page_compressed_trim_op;
+        ulint_ctr_n_t          page_compressed_trim_op;
 	/* Number of pages decompressed with page compression */
-        ulint_ctr_64_t          pages_page_decompressed;
+        ulint_ctr_n_t          pages_page_decompressed;
 	/* Number of page compression errors */
-	ulint_ctr_64_t          pages_page_compression_error;
+	ulint_ctr_n_t          pages_page_compression_error;
 	/* Number of pages encrypted */
-	ulint_ctr_64_t          pages_encrypted;
+	ulint_ctr_n_t          pages_encrypted;
    	/* Number of pages decrypted */
-	ulint_ctr_64_t          pages_decrypted;
+	ulint_ctr_n_t          pages_decrypted;
 	/* Number of merge blocks encrypted */
-	ulint_ctr_64_t          n_merge_blocks_encrypted;
+	ulint_ctr_n_t          n_merge_blocks_encrypted;
 	/* Number of merge blocks decrypted */
-	ulint_ctr_64_t          n_merge_blocks_decrypted;
+	ulint_ctr_n_t          n_merge_blocks_decrypted;
 	/* Number of row log blocks encrypted */
-	ulint_ctr_64_t          n_rowlog_blocks_encrypted;
+	ulint_ctr_n_t          n_rowlog_blocks_encrypted;
 	/* Number of row log blocks decrypted */
-	ulint_ctr_64_t          n_rowlog_blocks_decrypted;
+	ulint_ctr_n_t          n_rowlog_blocks_decrypted;
 
 	/** Number of data read in total (in bytes) */
 	ulint_ctr_1_t		data_read;
 
 	/** Number of rows read. */
-	ulint_ctr_64_t		n_rows_read;
+	ulint_ctr_n_t		n_rows_read;
 
 	/** Number of rows updated */
-	ulint_ctr_64_t		n_rows_updated;
+	ulint_ctr_n_t		n_rows_updated;
 
 	/** Number of rows deleted */
-	ulint_ctr_64_t		n_rows_deleted;
+	ulint_ctr_n_t		n_rows_deleted;
 
 	/** Number of rows inserted */
-	ulint_ctr_64_t		n_rows_inserted;
+	ulint_ctr_n_t		n_rows_inserted;
 
 	/** Number of system rows read. */
-	ulint_ctr_64_t		n_system_rows_read;
+	ulint_ctr_n_t		n_system_rows_read;
 
 	/** Number of system rows updated */
-	ulint_ctr_64_t		n_system_rows_updated;
+	ulint_ctr_n_t		n_system_rows_updated;
 
 	/** Number of system rows deleted */
-	ulint_ctr_64_t		n_system_rows_deleted;
+	ulint_ctr_n_t		n_system_rows_deleted;
 
 	/** Number of system rows inserted */
-	ulint_ctr_64_t		n_system_rows_inserted;
+	ulint_ctr_n_t		n_system_rows_inserted;
 
 	/** Number of times secondary index lookup triggered cluster lookup */
-	ulint_ctr_64_t		n_sec_rec_cluster_reads;
+	ulint_ctr_n_t		n_sec_rec_cluster_reads;
 
 	/** Number of times prefix optimization avoided triggering cluster lookup */
-	ulint_ctr_64_t		n_sec_rec_cluster_reads_avoided;
+	ulint_ctr_n_t		n_sec_rec_cluster_reads_avoided;
 
 	/** Number of encryption_get_latest_key_version calls */
-	ulint_ctr_64_t		n_key_requests;
+	ulint_ctr_n_t		n_key_requests;
 
 	/** Number of spaces in keyrotation list */
-	ulint_ctr_64_t		key_rotation_list_length;
+	ulint_ctr_n_t		key_rotation_list_length;
 
 	/** Number of temporary tablespace blocks encrypted */
-	ulint_ctr_64_t		n_temp_blocks_encrypted;
+	ulint_ctr_n_t		n_temp_blocks_encrypted;
 
 	/** Number of temporary tablespace blocks decrypted */
-	ulint_ctr_64_t		n_temp_blocks_decrypted;
-
-	/** Number of lock deadlocks */
-	ulint_ctr_1_t		lock_deadlock_count;
+	ulint_ctr_n_t		n_temp_blocks_decrypted;
 };
 
 /** We are prepared for a situation that we have this many threads waiting for
@@ -346,6 +339,9 @@ extern ulong srv_buf_pool_load_pages_abort;
 /** Lock table size in bytes */
 extern ulint	srv_lock_table_size;
 
+/** the value of innodb_checksum_algorithm */
+extern ulong	srv_checksum_algorithm;
+
 extern uint	srv_n_file_io_threads;
 extern my_bool	srv_random_read_ahead;
 extern ulong	srv_read_ahead_threshold;
@@ -434,6 +430,9 @@ enum srv_operation_mode {
 /** Current mode of operation */
 extern enum srv_operation_mode srv_operation;
 
+/** whether this is the server's first start after mariabackup --prepare */
+extern bool srv_start_after_restore;
+
 extern my_bool	srv_print_innodb_monitor;
 extern my_bool	srv_print_innodb_lock_monitor;
 extern ibool	srv_print_verbose_log;
@@ -489,9 +488,6 @@ extern struct export_var_t export_vars;
 
 /** Global counters */
 extern srv_stats_t	srv_stats;
-
-/** Simulate compression failures. */
-extern uint srv_simulate_comp_failures;
 
 /** Fatal semaphore wait threshold = maximum number of seconds
 that semaphore times out in InnoDB */
@@ -614,8 +610,7 @@ ibool
 srv_printf_innodb_monitor(
 /*======================*/
 	FILE*	file,		/*!< in: output stream */
-	ibool	nowait,		/*!< in: whether to wait for the
-				lock_sys_t::mutex */
+	ibool	nowait,		/*!< in: whether to wait for lock_sys.latch */
 	ulint*	trx_start,	/*!< out: file position of the start of
 				the list of active transactions */
 	ulint*	trx_end);	/*!< out: file position of the end of
@@ -705,6 +700,10 @@ void srv_master_thread_enable();
 
 /** Status variables to be passed to MySQL */
 struct export_var_t{
+#ifdef BTR_CUR_HASH_ADAPT
+	ulint innodb_ahi_hit;
+	ulint innodb_ahi_miss;
+#endif /* BTR_CUR_HASH_ADAPT */
 	char  innodb_buffer_pool_dump_status[OS_FILE_MAX_PATH + 128];/*!< Buf pool dump status */
 	char  innodb_buffer_pool_load_status[OS_FILE_MAX_PATH + 128];/*!< Buf pool load status */
 	char  innodb_buffer_pool_resize_status[512];/*!< Buf pool resize status */
@@ -757,9 +756,6 @@ struct export_var_t{
 	ulint innodb_os_log_fsyncs;		/*!< n_log_flushes */
 	ulint innodb_os_log_pending_writes;	/*!< srv_os_log_pending_writes */
 	ulint innodb_os_log_pending_fsyncs;	/*!< n_pending_log_flushes */
-	ulint innodb_pages_created;		/*!< buf_pool.stat.n_pages_created */
-	ulint innodb_pages_read;		/*!< buf_pool.stat.n_pages_read*/
-	ulint innodb_pages_written;		/*!< buf_pool.stat.n_pages_written */
 	ulint innodb_row_lock_waits;		/*!< srv_n_lock_wait_count */
 	ulint innodb_row_lock_current_waits;	/*!< srv_n_lock_wait_current_count */
 	int64_t innodb_row_lock_time;		/*!< srv_n_lock_wait_time

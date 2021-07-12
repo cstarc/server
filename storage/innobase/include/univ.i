@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1994, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2013, 2020, MariaDB Corporation.
+Copyright (c) 2013, 2021, MariaDB Corporation.
 Copyright (c) 2008, Google Inc.
 
 Portions of this file contain modifications contributed and copyrighted by
@@ -56,16 +56,6 @@ component, i.e. we show M.N.P as M.N */
 (time in seconds) */
 #define INNODB_EXTEND_TIMEOUT_INTERVAL 30
 
-#ifdef MYSQL_DYNAMIC_PLUGIN
-/* In the dynamic plugin, redefine some externally visible symbols
-in order not to conflict with the symbols of a builtin InnoDB. */
-
-/* Rename all C++ classes that contain virtual functions, because we
-have not figured out how to apply the visibility=hidden attribute to
-the virtual method table (vtable) in GCC 3. */
-# define ha_innobase ha_innodb
-#endif /* MYSQL_DYNAMIC_PLUGIN */
-
 #if defined(_WIN32)
 # include <windows.h>
 #endif /* _WIN32 */
@@ -78,15 +68,7 @@ support cross-platform development and expose comonly used SQL names. */
 #include <my_global.h>
 #include "my_counter.h"
 #include <m_string.h>
-
-/* JAN: TODO: missing 5.7 header */
-#ifdef HAVE_MY_THREAD_H
-//# include <my_thread.h>
-#endif
-
-#ifndef UNIV_INNOCHECKSUM
-# include <mysqld_error.h>
-#endif /* !UNIV_INNOCHECKSUM */
+#include <mysqld_error.h>
 
 /* Include <sys/stat.h> to get S_I... macros defined for os0file.cc */
 #include <sys/stat.h>
@@ -213,16 +195,6 @@ using the call command. */
 #define UNIV_LIGHT_MEM_DEBUG			/* light memory debugging */
 
 // #define UNIV_SQL_DEBUG
-
-/* Linkage specifier for non-static InnoDB symbols (variables and functions)
-that are only referenced from within InnoDB, not from MySQL. We disable the
-GCC visibility directive on all Sun operating systems because there is no
-easy way to get it to work. See http://bugs.mysql.com/bug.php?id=52263. */
-#if defined(__GNUC__) && (__GNUC__ >= 4) && !defined(sun) || defined(__INTEL_COMPILER)
-# define UNIV_INTERN __attribute__((visibility ("hidden")))
-#else
-# define UNIV_INTERN
-#endif
 
 #ifndef MY_ATTRIBUTE
 #if defined(__GNUC__)
@@ -415,12 +387,6 @@ in both 32-bit and 64-bit environments. */
 # define UINT64PFx	"%016" PRIx64
 #endif
 
-#ifdef UNIV_INNOCHECKSUM
-extern bool 			strict_verify;
-extern FILE* 			log_file;
-extern unsigned long long	cur_page_num;
-#endif /* UNIV_INNOCHECKSUM */
-
 typedef int64_t ib_int64_t;
 typedef uint64_t ib_uint64_t;
 typedef uint32_t ib_uint32_t;
@@ -521,14 +487,21 @@ it is read or written. */
 #  define UNIV_PREFETCH_RW(addr) ((void) 0)
 # endif /* COMPILER_HINTS */
 
-# elif defined __WIN__ && defined COMPILER_HINTS
-# include <xmmintrin.h>
+# elif defined _MSC_VER && defined COMPILER_HINTS
 # define UNIV_EXPECT(expr,value) (expr)
 # define UNIV_LIKELY_NULL(expr) (expr)
-// __MM_HINT_T0 - (temporal data)
-// prefetch data into all levels of the cache hierarchy.
-# define UNIV_PREFETCH_R(addr) _mm_prefetch((char *) addr, _MM_HINT_T0)
-# define UNIV_PREFETCH_RW(addr) _mm_prefetch((char *) addr, _MM_HINT_T0)
+# if defined _M_IX86 || defined _M_X64
+   // __MM_HINT_T0 - (temporal data)
+   // prefetch data into all levels of the cache hierarchy.
+#  define UNIV_PREFETCH_R(addr) _mm_prefetch((char *) addr, _MM_HINT_T0)
+#  define UNIV_PREFETCH_RW(addr) _mm_prefetch((char *) addr, _MM_HINT_T0)
+# elif defined _M_ARM64
+#  define UNIV_PREFETCH_R(addr) __prefetch(addr)
+#  define UNIV_PREFETCH_RW(addr) __prefetch(addr)
+# else
+#  define UNIV_PREFETCH_R ((void) 0)
+#  define  UNIV_PREFETCH_RW(addr) ((void) 0)
+# endif
 #else
 /* Dummy versions of the macros */
 # define UNIV_EXPECT(expr,value) (expr)
@@ -544,22 +517,6 @@ it is read or written. */
 
 /* Compile-time constant of the given array's size. */
 #define UT_ARR_SIZE(a) (sizeof(a) / sizeof((a)[0]))
-
-/* The return type from a thread's start function differs between Unix and
-Windows, so define a typedef for it and a macro to use at the end of such
-functions. */
-
-#ifdef _WIN32
-typedef DWORD os_thread_ret_t;
-# define OS_THREAD_DUMMY_RETURN		return(0)
-# define OS_PATH_SEPARATOR		'\\'
-# define OS_PATH_SEPARATOR_ALT		'/'
-#else
-typedef void* os_thread_ret_t;
-# define OS_THREAD_DUMMY_RETURN		return(NULL)
-# define OS_PATH_SEPARATOR		'/'
-# define OS_PATH_SEPARATOR_ALT		'\\'
-#endif
 
 #include <stdio.h>
 #include "db0err.h"
@@ -607,7 +564,6 @@ extern mysql_pfs_key_t srv_monitor_file_mutex_key;
 extern mysql_pfs_key_t buf_dblwr_mutex_key;
 extern mysql_pfs_key_t trx_pool_mutex_key;
 extern mysql_pfs_key_t trx_pool_manager_mutex_key;
-extern mysql_pfs_key_t lock_mutex_key;
 extern mysql_pfs_key_t lock_wait_mutex_key;
 extern mysql_pfs_key_t srv_threads_mutex_key;
 extern mysql_pfs_key_t thread_mutex_key;
@@ -622,5 +578,6 @@ extern mysql_pfs_key_t trx_purge_latch_key;
 extern mysql_pfs_key_t index_tree_rw_lock_key;
 extern mysql_pfs_key_t index_online_log_key;
 extern mysql_pfs_key_t trx_sys_rw_lock_key;
+extern mysql_pfs_key_t lock_latch_key;
 # endif /* UNIV_PFS_RWLOCK */
 #endif /* HAVE_PSI_INTERFACE */

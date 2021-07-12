@@ -97,14 +97,13 @@ static bool report_unknown_option(THD *thd, engine_option_value *val,
 {
   DBUG_ENTER("report_unknown_option");
 
-  if (val->parsed || suppress_warning)
+  if (val->parsed || suppress_warning || thd->slave_thread)
   {
     DBUG_PRINT("info", ("parsed => exiting"));
     DBUG_RETURN(FALSE);
   }
 
-  if (!(thd->variables.sql_mode & MODE_IGNORE_BAD_TABLE_OPTIONS) &&
-      !thd->slave_thread)
+  if (!(thd->variables.sql_mode & MODE_IGNORE_BAD_TABLE_OPTIONS))
   {
     my_error(ER_UNKNOWN_OPTION, MYF(0), val->name.str);
     DBUG_RETURN(TRUE);
@@ -403,7 +402,7 @@ static bool resolve_sysvars(handlerton *hton, ha_create_table_option *rules)
         str.length(0);
         for (const char **s= optp.typelib->type_names; *s; s++)
         {
-          if (str.append(*s) || str.append(','))
+          if (str.append(*s, strlen(*s)) || str.append(','))
             return 1;
         }
         DBUG_ASSERT(str.length());

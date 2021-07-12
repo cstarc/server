@@ -662,8 +662,16 @@ Events::drop_schema_events(THD *thd, const char *db)
   */
   if (event_queue)
     event_queue->drop_schema_events(thd, &db_lex);
-  db_repository->drop_schema_events(thd, &db_lex);
-
+  if (db_repository)
+    db_repository->drop_schema_events(thd, &db_lex);
+  else
+  {
+    if ((db_repository= new Event_db_repository))
+    {
+      db_repository->drop_schema_events(thd, &db_lex);
+      delete db_repository;
+    }
+  }
   DBUG_VOID_RETURN;
 }
 
@@ -732,14 +740,11 @@ send_show_create_event(THD *thd, Event_timed *et, Protocol *protocol)
   protocol->store(tz_name->ptr(), tz_name->length(), system_charset_info);
   protocol->store(show_str.ptr(), show_str.length(),
                   et->creation_ctx->get_client_cs());
-  protocol->store(et->creation_ctx->get_client_cs()->csname,
-                  strlen(et->creation_ctx->get_client_cs()->csname),
+  protocol->store(&et->creation_ctx->get_client_cs()->cs_name,
                   system_charset_info);
-  protocol->store(et->creation_ctx->get_connection_cl()->name,
-                  strlen(et->creation_ctx->get_connection_cl()->name),
+  protocol->store(&et->creation_ctx->get_connection_cl()->coll_name,
                   system_charset_info);
-  protocol->store(et->creation_ctx->get_db_cl()->name,
-                  strlen(et->creation_ctx->get_db_cl()->name),
+  protocol->store(&et->creation_ctx->get_db_cl()->coll_name,
                   system_charset_info);
 
   if (protocol->write())

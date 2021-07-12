@@ -22,7 +22,6 @@
 #include "rpl_rli.h"
 #include "log_event.h"
 #include "sql_parse.h"
-#include "sql_base.h" // close_thread_tables()
 #include "mysqld.h"   // start_wsrep_THD();
 #include "wsrep_applier.h"   // start_wsrep_THD();
 #include "mysql/service_wsrep.h"
@@ -126,11 +125,7 @@ bool wsrep_create_appliers(long threads, bool mutex_protected)
     return false;
   }
 
-  if (!wsrep_cluster_address || wsrep_cluster_address[0]== 0)
-  {
-    WSREP_DEBUG("wsrep_create_appliers exit due to empty address");
-    return false;
-  }
+  DBUG_ASSERT(wsrep_cluster_address[0]);
 
   long wsrep_threads=0;
 
@@ -285,16 +280,14 @@ static void wsrep_rollback_process(THD *rollbacker,
 
 void wsrep_create_rollbacker()
 {
-  if (wsrep_cluster_address && wsrep_cluster_address[0] != 0)
-  {
-    Wsrep_thd_args* args(new Wsrep_thd_args(wsrep_rollback_process,
-                                            WSREP_ROLLBACKER_THREAD,
-                                            pthread_self()));
+  DBUG_ASSERT(wsrep_cluster_address[0]);
+  Wsrep_thd_args* args(new Wsrep_thd_args(wsrep_rollback_process,
+                                          WSREP_ROLLBACKER_THREAD,
+                                          pthread_self()));
 
-    /* create rollbacker */
-    if (create_wsrep_THD(args, false))
-      WSREP_WARN("Can't create thread to manage wsrep rollback");
-   }
+  /* create rollbacker */
+  if (create_wsrep_THD(args, false))
+    WSREP_WARN("Can't create thread to manage wsrep rollback");
 }
 
 /*
@@ -355,8 +348,23 @@ bool wsrep_bf_abort(const THD* bf_thd, THD* victim_thd)
 
   if (WSREP(victim_thd) && !victim_thd->wsrep_trx().active())
   {
-    WSREP_DEBUG("wsrep_bf_abort, BF abort for non active transaction");
-    wsrep_start_transaction(victim_thd, victim_thd->wsrep_next_trx_id());
+    WSREP_DEBUG("wsrep_bf_abort, BF abort for non active transaction."
+                " Victim state %s bf state %s",
+                wsrep::to_c_string(victim_thd->wsrep_trx().state()),
+                wsrep::to_c_string(bf_thd->wsrep_trx().state()));
+
+    switch (victim_thd->wsrep_trx().state()) {
+    case wsrep::transaction::s_aborting: /* fall through */
+    case wsrep::transaction::s_aborted:
+      WSREP_DEBUG("victim is aborting or has aborted");
+      break;
+    default: break;
+    }
+    /* victim may not have started transaction yet in wsrep context, but it may
+       have acquired MDL locks (due to DDL execution), and this has caused BF conflict.
+       such case does not require aborting in wsrep or replication provider state.
+    */
+    return false;
   }
 
   bool ret;
@@ -366,6 +374,7 @@ bool wsrep_bf_abort(const THD* bf_thd, THD* victim_thd)
   }
   else
   {
+    DBUG_ASSERT(WSREP(victim_thd) ? victim_thd->wsrep_trx().active() : 1);
     ret= victim_thd->wsrep_cs().bf_abort(bf_seqno);
   }
   if (ret)
@@ -373,25 +382,6 @@ bool wsrep_bf_abort(const THD* bf_thd, THD* victim_thd)
     wsrep_bf_aborts_counter++;
   }
   return ret;
-}
-
-/*
-  Get auto increment variables for THD. Use global settings for
-  applier threads.
- */
-void wsrep_thd_auto_increment_variables(THD* thd,
-                                        unsigned long long* offset,
-                                        unsigned long long* increment)
-{
-  if (wsrep_thd_is_applying(thd) &&
-      thd->wsrep_trx().state() != wsrep::transaction::s_replaying)
-  {
-    *offset= global_system_variables.auto_increment_offset;
-    *increment= global_system_variables.auto_increment_increment;
-    return;
-  }
-  *offset= thd->variables.auto_increment_offset;
-  *increment= thd->variables.auto_increment_increment;
 }
 
 int wsrep_create_threadvars()

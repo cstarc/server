@@ -18,7 +18,7 @@ INCLUDE_DIRECTORIES(${CMAKE_SOURCE_DIR}/include ${ZLIB_INCLUDE_DIR})
 # Default install component for the files is Server here
 SET(MYSQL_INSTALL_COMPONENT Server)
 
-IF(NOT CMAKE_CROSSCOMPILING)
+IF(NOT CMAKE_CROSSCOMPILING OR DEFINED CMAKE_CROSSCOMPILING_EMULATOR)
  ADD_EXECUTABLE(comp_err comp_err.c)
  TARGET_LINK_LIBRARIES(comp_err mysys)
 ENDIF()
@@ -46,7 +46,7 @@ ADD_CUSTOM_TARGET(GenError
                   DEPENDS
                   ${CMAKE_BINARY_DIR}/include/mysqld_error.h.tmp)
 
-MYSQL_ADD_EXECUTABLE(my_print_defaults my_print_defaults.c)
+MYSQL_ADD_EXECUTABLE(my_print_defaults my_print_defaults.c COMPONENT Client)
 TARGET_LINK_LIBRARIES(my_print_defaults  mysys)
 
 MYSQL_ADD_EXECUTABLE(perror perror.c)
@@ -87,7 +87,7 @@ IF(WITH_INNOBASE_STORAGE_ENGINE)
   ADD_DEPENDENCIES(innochecksum GenError)
 ENDIF()
 
-MYSQL_ADD_EXECUTABLE(replace replace.c COMPONENT Server)
+MYSQL_ADD_EXECUTABLE(replace replace.c COMPONENT Client)
 TARGET_LINK_LIBRARIES(replace mysys)
 
 IF(UNIX)

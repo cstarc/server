@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 2011, 2018, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2016, 2020, MariaDB Corporation.
+Copyright (c) 2016, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -500,17 +500,29 @@ fts_add_doc_id_column(
 	dict_table_t*	table,	/*!< in/out: Table with FTS index */
 	mem_heap_t*	heap);	/*!< in: temporary memory heap, or NULL */
 
-/*********************************************************************//**
-Drops the ancillary tables needed for supporting an FTS index on the
-given table. row_mysql_lock_data_dictionary must have been called before
-this.
+/** Lock the internal FTS_ tables for an index, before fts_drop_index_tables().
+@param trx   transaction
+@param index fulltext index */
+dberr_t fts_lock_index_tables(trx_t *trx, const dict_index_t &index);
+
+/** Lock the internal common FTS_ tables, before fts_drop_common_tables().
+@param trx    transaction
+@param table  table containing FULLTEXT INDEX
 @return DB_SUCCESS or error code */
-dberr_t
-fts_drop_tables(
-/*============*/
-	trx_t*		trx,			/*!< in: transaction */
-	dict_table_t*	table);			/*!< in: table has the FTS
-						index */
+dberr_t fts_lock_common_tables(trx_t *trx, const dict_table_t &table);
+
+/** Lock the internal FTS_ tables for table, before fts_drop_tables().
+@param trx    transaction
+@param table  table containing FULLTEXT INDEX
+@return DB_SUCCESS or error code */
+dberr_t fts_lock_tables(trx_t *trx, const dict_table_t &table);
+
+/** Drop the internal FTS_ tables for table.
+@param trx    transaction
+@param table  table containing FULLTEXT INDEX
+@return DB_SUCCESS or error code */
+dberr_t fts_drop_tables(trx_t *trx, const dict_table_t &table);
+
 /******************************************************************//**
 The given transaction is about to be committed; do whatever is necessary
 from the FTS system's POV.
@@ -643,11 +655,7 @@ fts_optimize_init(void);
 /****************************************************************//**
 Drops index ancillary tables for a FTS index
 @return DB_SUCCESS or error code */
-dberr_t
-fts_drop_index_tables(
-/*==================*/
-	trx_t*		trx,			/*!< in: transaction */
-	dict_index_t*	index)			/*!< in: Index to drop */
+dberr_t fts_drop_index_tables(trx_t *trx, const dict_index_t &index)
 	MY_ATTRIBUTE((warn_unused_result));
 
 /** Add the table to add to the OPTIMIZER's list.
@@ -724,10 +732,6 @@ void
 fts_savepoint_rollback_last_stmt(
 /*=============================*/
 	trx_t*		trx);			/*!< in: transaction */
-
-/** Drop all orphaned FTS auxiliary tables, those that don't have a parent
-table or FTS index defined on them. */
-void fts_drop_orphaned_tables();
 
 /** Run SYNC on the table, i.e., write out data from the cache to the
 FTS auxiliary INDEX table and clear the cache at the end.
@@ -962,9 +966,8 @@ fts_trx_create(
 
 /** Clear all fts resources when there is no internal DOC_ID
 and there are no new fts index to add.
-@param[in,out]  table   table  where fts is to be freed
-@param[in]      trx     transaction to drop all fts tables */
-void fts_clear_all(dict_table_t *table, trx_t *trx);
+@param[in,out]  table   table  where fts is to be freed */
+void fts_clear_all(dict_table_t *table);
 
 /** Check whether the given name is fts auxiliary table
 and fetch the parent table id and index id

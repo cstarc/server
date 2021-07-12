@@ -1769,7 +1769,8 @@ end_with_setting_default_tz:
   /* If we have default time zone try to load it */
   if (default_tzname)
   {
-    String tmp_tzname2(default_tzname, &my_charset_latin1);
+    String tmp_tzname2(default_tzname, strlen(default_tzname),
+                       &my_charset_latin1);
     /*
       Time zone tables may be open here, and my_tz_find() may open
       most of them once more, but this is OK for system tables open
@@ -2417,7 +2418,7 @@ print_tz_as_sql(const char* tz_name, const TIME_ZONE_INFO *sp)
   }
 
   printf("INSERT INTO time_zone_transition_type \
-(Time_zone_id, Transition_type_id, Offset, Is_DST, Abbreviation) VALUES\n");
+(Time_zone_id, Transition_type_id, `Offset`, Is_DST, Abbreviation) VALUES\n");
 
   for (i= 0; i < sp->typecnt; i++)
     printf("%s(@time_zone_id, %u, %ld, %d, '%s')\n", (i == 0 ? " " : ","), i,
@@ -2564,7 +2565,7 @@ scan_tz_dir(char * name_end, uint symlink_recursion_level, uint verbose)
 
           /*
             This is a normal case and not critical. only print warning if
-            verbose mode is choosen.
+            verbose mode is chosen.
           */
           if (verbose > 0)
           {
@@ -2656,7 +2657,8 @@ static struct my_option my_long_options[] =
 
 
 C_MODE_START
-static my_bool get_one_option(const struct my_option *, char *, const char *);
+static my_bool get_one_option(const struct my_option *, const char *,
+                              const char *);
 C_MODE_END
 
 static void print_version(void)
@@ -2678,7 +2680,7 @@ static void print_usage(void)
 
 
 static my_bool
-get_one_option(const struct my_option *opt, char *argument, const char *)
+get_one_option(const struct my_option *opt, const char *argument, const char *)
 {
   switch(opt->id) {
   case '#':

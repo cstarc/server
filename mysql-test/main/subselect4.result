@@ -2578,7 +2578,7 @@ id	select_type	table	type	possible_keys	key	key_len	ref	rows	filtered	Extra
 1	PRIMARY	t1	ALL	NULL	NULL	NULL	NULL	3	100.00	Using where
 2	SUBQUERY	t2	ALL	NULL	NULL	NULL	NULL	4	100.00	
 Warnings:
-Note	1003	/* select#1 */ select `test`.`t1`.`l1` AS `l1`,`test`.`t1`.`i2` AS `i2` from `test`.`t1` where <nop>(<in_optimizer>(`test`.`t1`.`l1`,<max>(/* select#2 */ select max(`test`.`t2`.`v1`) from `test`.`t2`) > convert(<cache>(`test`.`t1`.`l1`) using utf8)))
+Note	1003	/* select#1 */ select `test`.`t1`.`l1` AS `l1`,`test`.`t1`.`i2` AS `i2` from `test`.`t1` where <nop>(<in_optimizer>(`test`.`t1`.`l1`,<max>(/* select#2 */ select max(`test`.`t2`.`v1`) from `test`.`t2`) > convert(<cache>(`test`.`t1`.`l1`) using utf8mb3)))
 SELECT * FROM t1 where  ( t1.l1 < ANY (SELECT MAX(t2.v1) FROM t2));
 l1	i2
 e	2
@@ -2687,6 +2687,50 @@ f
 bar
 DROP TABLE t1, t2;
 #
+# MDEV-23449: alias do not exist and a query do not report an error
+#
+CREATE TABLE t1(a INT, b INT);
+INSERT INTO t1 VALUES (1,1), (2,2), (3,3), (4,4), (5,5);
+SELECT a, b FROM t1 WHERE a IN (SELECT A.a FROM t1 A GROUP BY s.id);
+ERROR 42S22: Unknown column 's.id' in 'group statement'
+DROP TABLE t1;
+#
+# MDEV-24519: Server crashes in Charset::set_charset upon SELECT
+#
+CREATE TABLE t1 (a VARBINARY(8));
+INSERT INTO t1 VALUES ('foo'),('bar');
+CREATE TABLE t2 (b VARBINARY(8));
+EXPLAIN
+SELECT a FROM t1 WHERE (a, a) IN (SELECT 'qux', 'qux') AND a = (SELECT MIN(b) FROM t2);
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	PRIMARY	NULL	NULL	NULL	NULL	NULL	NULL	NULL	Impossible WHERE
+3	SUBQUERY	NULL	NULL	NULL	NULL	NULL	NULL	NULL	no matching row in const table
+2	SUBQUERY	NULL	NULL	NULL	NULL	NULL	NULL	NULL	No tables used
+SELECT a FROM t1 WHERE (a, a) IN (SELECT 'qux', 'qux') AND a = (SELECT MIN(b) FROM t2);
+a
+DROP TABLE t1,t2;
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 VALUES (1),(2);
+CREATE TABLE t2 (b VARBINARY(8));
+EXPLAIN
+SELECT a FROM t1 WHERE (a, a) IN (SELECT 1, 2) AND a = (SELECT MIN(b) FROM t2);
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	PRIMARY	t1	ALL	NULL	NULL	NULL	NULL	2	Using where
+3	SUBQUERY	NULL	NULL	NULL	NULL	NULL	NULL	NULL	no matching row in const table
+2	DEPENDENT SUBQUERY	NULL	NULL	NULL	NULL	NULL	NULL	NULL	No tables used
+SELECT a FROM t1 WHERE (a, a) IN (SELECT 1, 2) AND a = (SELECT MIN(b) FROM t2);
+a
+DROP TABLE t1,t2;
+#
+# MDEV-22462: Item_in_subselect::create_single_in_to_exists_cond(JOIN *, Item **, Item **): Assertion `false' failed.
+#
+select 1 from dual where 1 in (select 5 from dual where 1);
+1
+create table t1 (a int);
+insert into t1 values (1),(2),(3);
+update t1 set a = 2 where a in (select a from dual where a = a);
+drop table t1;
+#
 # MDEV-18335: Assertion `!error || error == 137' failed in subselect_rowid_merge_engine::init
 #
 CREATE TABLE t1 (i1 int,v1 varchar(1),KEY (v1,i1));
@@ -2717,7 +2761,6 @@ Warnings:
 Warning	1931	Query execution was interrupted. The query examined at least 3020 rows, which exceeds LIMIT ROWS EXAMINED (500). The query result may be incomplete
 SET join_cache_level= @save_join_cache_level;
 DROP TABLE t1,t2,t3,t4;
-# End of 10.2 tests
 #
 # MDEV-21265: IN predicate conversion to IN subquery should be allowed for a broader set of datatype comparison
 #
@@ -2752,6 +2795,78 @@ id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
 set names default;
 set @@in_predicate_conversion_threshold= @save_in_predicate_conversion_threshold;
 DROP TABLE t1,t2;
+#
+# MDEV-24925: Server crashes in Item_subselect::init_expr_cache_tracker
+#
+CREATE TABLE t1 (id INT PRIMARY KEY);
+INSERT INTO t1 VALUES (1),(2);
+SELECT
+1 IN (
+SELECT
+(SELECT COUNT(id)
+FROM t1
+WHERE t1_outer.id <> id
+) AS f
+FROM
+t1 AS t1_outer
+GROUP BY f
+);
+1 IN (
+SELECT
+(SELECT COUNT(id)
+FROM t1
+WHERE t1_outer.id <> id
+) AS f
+FROM
+t1 AS t1_outer
+GROUP BY f
+)
+1
+SELECT
+1 IN (
+SELECT
+(SELECT COUNT(id)
+FROM t1
+WHERE t1_outer.id <> id
+) AS f
+FROM
+t1 AS t1_outer
+GROUP BY 1
+);
+1 IN (
+SELECT
+(SELECT COUNT(id)
+FROM t1
+WHERE t1_outer.id <> id
+) AS f
+FROM
+t1 AS t1_outer
+GROUP BY 1
+)
+1
+DROP TABLE t1;
+#
+#  MDEV-24898: Server crashes in st_select_lex::next_select / Item_subselect::is_expensive
+#  (Testcase)
+#
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 VALUES (1),(2);
+CREATE TABLE t2 (b INT);
+INSERT INTO t2 VALUES (3),(4);
+SELECT 1 IN (SELECT (SELECT a FROM t1) AS x FROM t2 GROUP BY x);
+ERROR 21000: Subquery returns more than 1 row
+drop table t1,t2;
+#
+# MDEV-25629: Crash in get_sort_by_table() in subquery with order by having outer ref
+#
+CREATE TABLE t1 (i1 int);
+insert into t1 values (1),(2);
+SELECT 1
+FROM (t1 JOIN t1 AS ref_t1 ON
+(t1.i1 > (SELECT ref_t1.i1 AS c0 FROM t1 b ORDER BY -c0)));
+ERROR 21000: Subquery returns more than 1 row
+DROP TABLE t1;
+# End of 10.2 tests
 # End of 10.3 tests
 #
 # MDEV-19134: EXISTS() slower if ORDER BY is defined

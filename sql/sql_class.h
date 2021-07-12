@@ -1,6 +1,6 @@
 /*
    Copyright (c) 2000, 2016, Oracle and/or its affiliates.
-   Copyright (c) 2009, 2020, MariaDB Corporation.
+   Copyright (c) 2009, 2021, MariaDB Corporation.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -39,7 +39,7 @@
 #include "thr_lock.h"       /* thr_lock_type, THR_LOCK_DATA, THR_LOCK_INFO */
 #include "thr_timer.h"
 #include "thr_malloc.h"
-#include "log_slow.h"      /* LOG_SLOW_DISABLE_... */
+#include "log_slow.h"       /* LOG_SLOW_DISABLE_... */
 #include <my_tree.h>
 #include "sql_digest_stream.h"            // sql_digest_state
 #include <mysql/psi/mysql_stage.h>
@@ -50,6 +50,7 @@
 #include "session_tracker.h"
 #include "backup.h"
 #include "xa.h"
+#include "ddl_log.h"                            /* DDL_LOG_STATE */
 
 extern "C"
 void set_thd_stage_info(void *thd,
@@ -189,6 +190,7 @@ enum enum_binlog_row_image {
 #define OLD_MODE_NO_DUP_KEY_WARNINGS_WITH_IGNORE	(1 << 0)
 #define OLD_MODE_NO_PROGRESS_INFO			(1 << 1)
 #define OLD_MODE_ZERO_DATE_TIME_CAST                    (1 << 2)
+#define OLD_MODE_UTF8_IS_UTF8MB3      (1 << 3)
 
 extern char internal_table_name[2];
 extern char empty_c_string[1];
@@ -197,6 +199,7 @@ extern MYSQL_PLUGIN_IMPORT const char **errmesg;
 extern "C" LEX_STRING * thd_query_string (MYSQL_THD thd);
 extern "C" unsigned long long thd_query_id(const MYSQL_THD thd);
 extern "C" size_t thd_query_safe(MYSQL_THD thd, char *buf, size_t buflen);
+extern "C" const char *thd_priv_host(MYSQL_THD thd,  size_t *length);
 extern "C" const char *thd_user_name(MYSQL_THD thd);
 extern "C" const char *thd_client_host(MYSQL_THD thd);
 extern "C" const char *thd_client_ip(MYSQL_THD thd);
@@ -262,10 +265,12 @@ typedef struct st_user_var_events
       was actually changed or not.
 */
 typedef struct st_copy_info {
-  ha_rows records; /**< Number of processed records */
-  ha_rows deleted; /**< Number of deleted records */
-  ha_rows updated; /**< Number of updated records */
-  ha_rows copied;  /**< Number of copied records */
+  ha_rows records;        /**< Number of processed records */
+  ha_rows deleted;        /**< Number of deleted records */
+  ha_rows updated;        /**< Number of updated records */
+  ha_rows copied;         /**< Number of copied records */
+  ha_rows accepted_rows;  /**< Number of accepted original rows
+                             (same as number of rows in RETURNING) */
   ha_rows error_count;
   ha_rows touched; /* Number of touched records */
   enum enum_duplicates handle_duplicates;
@@ -378,6 +383,31 @@ public:
   Alter_rename_key *clone(MEM_ROOT *mem_root) const
     { return new (mem_root) Alter_rename_key(*this); }
 
+};
+
+
+/* An ALTER INDEX operation that changes the ignorability of an index. */
+class Alter_index_ignorability: public Sql_alloc
+{
+public:
+  Alter_index_ignorability(const char *name, bool is_ignored, bool if_exists) :
+    m_name(name), m_is_ignored(is_ignored), m_if_exists(if_exists)
+  {
+    assert(name != NULL);
+  }
+
+  const char *name() const { return m_name; }
+  bool if_exists() const { return m_if_exists; }
+
+  /* The ignorability after the operation is performed. */
+  bool is_ignored() const { return m_is_ignored; }
+  Alter_index_ignorability *clone(MEM_ROOT *mem_root) const
+    { return new (mem_root) Alter_index_ignorability(*this); }
+
+private:
+  const char *m_name;
+  bool m_is_ignored;
+  bool m_if_exists;
 };
 
 
@@ -664,6 +694,7 @@ typedef struct system_variables
     are based on the cluster size):
   */
   ulong saved_auto_increment_increment, saved_auto_increment_offset;
+  ulong saved_lock_wait_timeout;
   ulonglong wsrep_gtid_seq_no;
 #endif /* WITH_WSREP */
   uint eq_range_index_dive_limit;
@@ -993,11 +1024,24 @@ void add_to_status(STATUS_VAR *to_var, STATUS_VAR *from_var);
 void add_diff_to_status(STATUS_VAR *to_var, STATUS_VAR *from_var,
                         STATUS_VAR *dec_var);
 
+uint calc_sum_of_all_status(STATUS_VAR *to);
+static inline void calc_sum_of_all_status_if_needed(STATUS_VAR *to)
+{
+  if (to->local_memory_used == 0)
+  {
+    mysql_mutex_lock(&LOCK_status);
+    *to= global_status_var;
+    mysql_mutex_unlock(&LOCK_status);
+    calc_sum_of_all_status(to);
+    DBUG_ASSERT(to->local_memory_used);
+  }
+}
+
 /*
   Update global_memory_used. We have to do this with atomic_add as the
   global value can change outside of LOCK_status.
 */
-inline void update_global_memory_status(int64 size)
+static inline void update_global_memory_status(int64 size)
 {
   DBUG_PRINT("info", ("global memory_used: %lld  size: %lld",
                       (longlong) global_status_var.global_memory_used,
@@ -1015,14 +1059,15 @@ inline void update_global_memory_status(int64 size)
   @retval         NULL on error
   @retval         Pointter to CHARSET_INFO with the given name on success
 */
-inline CHARSET_INFO *
-mysqld_collation_get_by_name(const char *name,
+static inline CHARSET_INFO *
+mysqld_collation_get_by_name(const char *name, myf utf8_flag,
                              CHARSET_INFO *name_cs= system_charset_info)
 {
   CHARSET_INFO *cs;
   MY_CHARSET_LOADER loader;
   my_charset_loader_init_mysys(&loader);
-  if (!(cs= my_collation_get_by_name(&loader, name, MYF(0))))
+
+  if (!(cs= my_collation_get_by_name(&loader, name, MYF(utf8_flag))))
   {
     ErrConvString err(name, name_cs);
     my_error(ER_UNKNOWN_COLLATION, MYF(0), err.ptr());
@@ -1034,9 +1079,9 @@ mysqld_collation_get_by_name(const char *name,
   return cs;
 }
 
-inline bool is_supported_parser_charset(CHARSET_INFO *cs)
+static inline bool is_supported_parser_charset(CHARSET_INFO *cs)
 {
-  return MY_TEST(cs->mbminlen == 1);
+  return MY_TEST(cs->mbminlen == 1 && cs->number != 17 /* filename */);
 }
 
 /** THD registry */
@@ -1167,7 +1212,7 @@ public:
 
   void free_items();
   /* Close the active state associated with execution of this statement */
-  virtual void cleanup_stmt();
+  virtual void cleanup_stmt(bool /*restore_set_statement_vars*/);
 };
 
 
@@ -1970,6 +2015,25 @@ private:
 };
 
 
+class Turn_errors_to_warnings_handler : public Internal_error_handler
+{
+public:
+  Turn_errors_to_warnings_handler() {}
+  bool handle_condition(THD *thd,
+                        uint sql_errno,
+                        const char* sqlstate,
+                        Sql_condition::enum_warning_level *level,
+                        const char* msg,
+                        Sql_condition ** cond_hdl)
+  {
+    *cond_hdl= NULL;
+    if (*level == Sql_condition::WARN_LEVEL_ERROR)
+      *level= Sql_condition::WARN_LEVEL_WARN;
+    return(0);
+  }
+};
+
+
 /**
   Tables that were locked with LOCK TABLES statement.
 
@@ -2309,6 +2373,164 @@ struct THD_count
   ~THD_count() { thread_count--; }
 };
 
+/**
+  Support structure for asynchronous group commit, or more generally
+  any asynchronous operation that needs to finish before server writes
+  response to client.
+
+  An engine, or any other server component, can signal that there is
+  a pending operation by incrementing a counter, i.e inc_pending_ops()
+  and that pending operation is finished by decrementing that counter
+  dec_pending_ops().
+
+  NOTE: Currently, pending operations can not fail, i.e there is no
+  way to pass a return code in dec_pending_ops()
+
+  The server does not write response to the client before the counter
+  becomes 0. In  case of group commit it ensures that data is persistent
+  before success reported to client, i.e durability in ACID.
+*/
+struct thd_async_state
+{
+  enum class enum_async_state
+  {
+    NONE,
+    SUSPENDED, /* do_command() did not finish, and needs to be resumed */
+    RESUMED    /* do_command() is resumed*/
+  };
+  enum_async_state m_state{enum_async_state::NONE};
+
+  /* Stuff we need to resume do_command where we finished last time*/
+  enum enum_server_command m_command{COM_SLEEP};
+  LEX_STRING m_packet{0,0};
+
+  mysql_mutex_t m_mtx;
+  mysql_cond_t m_cond;
+
+  /** Pending counter*/
+  Atomic_counter<int> m_pending_ops=0;
+
+#ifndef DBUG_OFF
+  /* Checks */
+  pthread_t m_dbg_thread;
+#endif
+
+  thd_async_state()
+  {
+    mysql_mutex_init(PSI_NOT_INSTRUMENTED, &m_mtx, 0);
+    mysql_cond_init(PSI_INSTRUMENT_ME, &m_cond, 0);
+  }
+
+  /*
+   Currently only used with threadpool, one can "suspend" and "resume" a THD.
+   Suspend only means leaving do_command earlier, after saving some state.
+   Resume is continuing suspended THD's do_command(), from where it finished last time.
+  */
+  bool try_suspend()
+  {
+    bool ret;
+    mysql_mutex_lock(&m_mtx);
+    DBUG_ASSERT(m_state == enum_async_state::NONE);
+    DBUG_ASSERT(m_pending_ops >= 0);
+
+    if(m_pending_ops)
+    {
+      ret=true;
+      m_state= enum_async_state::SUSPENDED;
+    }
+    else
+    {
+      /*
+        If there is no pending operations, can't suspend, since
+        nobody can resume it.
+      */
+      ret=false;
+    }
+    mysql_mutex_unlock(&m_mtx);
+    return ret;
+  }
+
+  ~thd_async_state()
+  {
+    wait_for_pending_ops();
+    mysql_mutex_destroy(&m_mtx);
+    mysql_cond_destroy(&m_cond);
+  }
+
+  /*
+    Increment pending asynchronous operations.
+    The client response may not be written if
+    this count > 0.
+    So, without threadpool query needs to wait for
+    the operations to finish.
+    With threadpool, THD can be suspended and resumed
+    when this counter goes to 0.
+  */
+  void inc_pending_ops()
+  {
+    mysql_mutex_lock(&m_mtx);
+
+#ifndef DBUG_OFF
+    /*
+     Check that increments are always done by the same thread.
+    */
+    if (!m_pending_ops)
+      m_dbg_thread= pthread_self();
+    else
+      DBUG_ASSERT(pthread_equal(pthread_self(),m_dbg_thread));
+#endif
+
+    m_pending_ops++;
+    mysql_mutex_unlock(&m_mtx);
+  }
+
+  int dec_pending_ops(enum_async_state* state)
+  {
+    int ret;
+    mysql_mutex_lock(&m_mtx);
+    ret= --m_pending_ops;
+    if (!ret)
+      mysql_cond_signal(&m_cond);
+    *state = m_state;
+    mysql_mutex_unlock(&m_mtx);
+    return ret;
+  }
+
+  /*
+    This is used for "dirty" reading pending ops,
+    when dirty read is OK.
+  */
+  int pending_ops()
+  {
+    return m_pending_ops;
+  }
+
+  /* Wait for pending operations to finish.*/
+  void wait_for_pending_ops()
+  {
+    /*
+      It is fine to read m_pending_ops and compare it with 0,
+      without mutex protection.
+
+      The value is only incremented by the current thread, and will
+      be decremented by another one, thus "dirty" may show positive number
+      when it is really 0, but this is not a problem, and the only
+      bad thing from that will be rechecking under mutex.
+    */
+    if (!pending_ops())
+      return;
+
+    mysql_mutex_lock(&m_mtx);
+    DBUG_ASSERT(m_pending_ops >= 0);
+    while (m_pending_ops)
+      mysql_cond_wait(&m_cond, &m_mtx);
+    mysql_mutex_unlock(&m_mtx);
+  }
+};
+
+extern "C" MYSQL_THD thd_increment_pending_ops(void);
+extern "C" void thd_decrement_pending_ops(MYSQL_THD);
+
 
 /**
   @class THD
@@ -2421,7 +2643,7 @@ public:
     - mysys_var (used by KILL statement and shutdown).
     - Also ensures that THD is not deleted while mutex is hold
   */
-  mysql_mutex_t LOCK_thd_kill;
+  mutable mysql_mutex_t LOCK_thd_kill;
 
   /* all prepared statements and cursors of this connection */
   Statement_map stmt_map;
@@ -2639,6 +2861,11 @@ public:
 
 #ifndef MYSQL_CLIENT
   binlog_cache_mngr *  binlog_setup_trx_data();
+  /*
+    If set, tell binlog to store the value as query 'xid' in the next
+    Query_log_event
+  */
+  ulonglong binlog_xid;
 
   /*
     Public interface to write RBR events to the binlog
@@ -2825,7 +3052,7 @@ public:
   } default_transaction, *transaction;
   Global_read_lock global_read_lock;
   Field      *dup_field;
-#ifndef __WIN__
+#ifndef _WIN32
   sigset_t signals;
 #endif
 #ifdef SIGNAL_WITH_VIO_CLOSE
@@ -3464,7 +3691,7 @@ public:
   void update_all_stats();
   void update_stats(void);
   void change_user(void);
-  void cleanup(bool have_mutex=false);
+  void cleanup(void);
   void cleanup_after_query();
   void free_connection();
   void reset_for_reuse();
@@ -3492,19 +3719,13 @@ public:
   void awake_no_mutex(killed_state state_to_set);
   void awake(killed_state state_to_set)
   {
-    bool wsrep_on_local= variables.wsrep_on;
-    /*
-      mutex locking order (LOCK_thd_data - LOCK_thd_kill)) requires
-      to grab LOCK_thd_data here
-    */
-    if (wsrep_on_local)
-      mysql_mutex_lock(&LOCK_thd_data);
     mysql_mutex_lock(&LOCK_thd_kill);
+    mysql_mutex_lock(&LOCK_thd_data);
     awake_no_mutex(state_to_set);
+    mysql_mutex_unlock(&LOCK_thd_data);
     mysql_mutex_unlock(&LOCK_thd_kill);
-    if (wsrep_on_local)
-      mysql_mutex_unlock(&LOCK_thd_data);
   }
+  void abort_current_cond_wait(bool force);
  
   /** Disconnect the associated communication endpoint. */
   void disconnect();
@@ -3833,10 +4054,6 @@ public:
       return FALSE;
     give_protection_error();
     return TRUE;
-  }
-  inline bool fill_derived_tables()
-  {
-    return !stmt_arena->is_stmt_prepare() && !lex->only_view_structure();
   }
   inline bool fill_information_schema_tables()
   {
@@ -4260,8 +4477,7 @@ public:
     mysql_mutex_lock(&LOCK_thd_kill);
     int err= killed_errno();
     if (err)
-      my_message(err, killed_err ? killed_err->msg : ER_THD(this, err),
-                 MYF(0));
+      my_message(err, killed_err ? killed_err->msg : ER_THD(this, err), MYF(0));
     mysql_mutex_unlock(&LOCK_thd_kill);
   }
   /* return TRUE if we will abort query if we make a warning now */
@@ -4440,14 +4656,11 @@ public:
         to resolve all CTE names as we don't need this message to be thrown
         for any CTE references.
       */
-      if (!lex->with_clauses_list)
+      if (!lex->with_cte_resolution)
       {
         my_message(ER_NO_DB_ERROR, ER(ER_NO_DB_ERROR), MYF(0));
         return TRUE;
       }
-      /* This will allow to throw an error later for non-CTE references */
-      to->str= NULL;
-      to->length= 0;
       return FALSE;
     }
 
@@ -5025,6 +5238,7 @@ private:
   }
 
 public:
+  thd_async_state async_state;
 #ifdef HAVE_REPLICATION
   /*
     If we do a purge of binary logs, log index info of the threads
@@ -5087,6 +5301,8 @@ public:
   uint64                    wsrep_current_gtid_seqno;
   ulong                     wsrep_affected_rows;
   bool                      wsrep_has_ignored_error;
+  /* true if wsrep_on was ON in last wsrep_on_update */
+  bool                      wsrep_was_on;
 
   /*
     When enabled, do not replicate/binlog updates from the current table that's
@@ -5194,9 +5410,9 @@ public:
     transaction->all.m_unsafe_rollback_flags|=
       (transaction->stmt.m_unsafe_rollback_flags &
        (THD_TRANS::DID_WAIT | THD_TRANS::CREATED_TEMP_TABLE |
-        THD_TRANS::DROPPED_TEMP_TABLE | THD_TRANS::DID_DDL));
+        THD_TRANS::DROPPED_TEMP_TABLE | THD_TRANS::DID_DDL |
+        THD_TRANS::EXECUTED_TABLE_ADMIN_CMD));
   }
-
 
   uint get_net_wait_timeout()
   {
@@ -5248,6 +5464,41 @@ public:
   Item *sp_prepare_func_item(Item **it_addr, uint cols= 1);
   bool sp_eval_expr(Field *result_field, Item **expr_item_ptr);
 
+  bool sql_parser(LEX *old_lex, LEX *lex,
+                  char *str, uint str_len, bool stmt_prepare_mode);
+
+  myf get_utf8_flag() const
+  {
+    return (variables.old_behavior & OLD_MODE_UTF8_IS_UTF8MB3 ?
+            MY_UTF8_IS_UTF8MB3 : 0);
+  }
+
+  /**
+    Save current lex to the output parameter and reset it to point to
+    main_lex. This method is called from mysql_client_binlog_statement()
+    to temporary
+
+    @param[out] backup_lex  original value of current lex
+  */
+
+  void backup_and_reset_current_lex(LEX **backup_lex)
+  {
+    *backup_lex= lex;
+    lex= &main_lex;
+  }
+
+
+  /**
+    Restore current lex to its original value it had before calling the method
+    backup_and_reset_current_lex().
+
+    @param backup_lex  original value of current lex
+  */
+
+  void restore_current_lex(LEX *backup_lex)
+  {
+    lex= backup_lex;
+  }
 };
 
 
@@ -5824,6 +6075,7 @@ class select_create: public select_insert {
   MYSQL_LOCK **m_plock;
   bool       exit_done;
   TMP_TABLE_SHARE *saved_tmp_table_share;
+  DDL_LOG_STATE ddl_log_state_create, ddl_log_state_rm;
 
 public:
   select_create(THD *thd_arg, TABLE_LIST *table_arg,
@@ -5839,7 +6091,10 @@ public:
     alter_info(alter_info_arg),
     m_plock(NULL), exit_done(0),
     saved_tmp_table_share(0)
-    {}
+    {
+      bzero(&ddl_log_state_create, sizeof(ddl_log_state_create));
+      bzero(&ddl_log_state_rm, sizeof(ddl_log_state_rm));
+    }
   int prepare(List<Item> &list, SELECT_LEX_UNIT *u);
 
   void store_values(List<Item> &values);
@@ -5893,6 +6148,7 @@ public:
   List<Item> copy_funcs;
   Copy_field *copy_field, *copy_field_end;
   uchar	    *group_buff;
+  const char *tmp_name;
   Item	    **items_to_copy;			/* Fields in tmp table */
   TMP_ENGINE_COLUMNDEF *recinfo, *start_recinfo;
   KEY *keyinfo;
@@ -5966,7 +6222,9 @@ public:
      schema_table(0), materialized_subquery(0), force_not_null_cols(0),
      precomputed_group_by(0),
      force_copy_fields(0), bit_fields_as_long(0), skip_create_table(0)
-  {}
+  {
+    init();
+  }
   ~TMP_TABLE_PARAM()
   {
     cleanup();
@@ -6438,11 +6696,13 @@ public:
    - The sj-materialization temporary table
    - Members needed to make index lookup or a full scan of the temptable.
 */
+class POSITION;
+
 class SJ_MATERIALIZATION_INFO : public Sql_alloc
 {
 public:
   /* Optimal join sub-order */
-  struct st_position *positions;
+  POSITION *positions;
 
   uint tables; /* Number of tables in the sj-nest */
 
@@ -6700,7 +6960,8 @@ public:
 class multi_update :public select_result_interceptor
 {
   TABLE_LIST *all_tables; /* query/update command tables */
-  List<TABLE_LIST> *leaves;     /* list of leves of join table tree */
+  List<TABLE_LIST> *leaves;     /* list of leaves of join table tree */
+  List<TABLE_LIST> updated_leaves;  /* list of of updated leaves */
   TABLE_LIST *update_tables;
   TABLE **tmp_tables, *main_table, *table_to_update;
   TMP_TABLE_PARAM *tmp_table_param;
@@ -6738,6 +6999,7 @@ public:
 	       List<Item> *fields, List<Item> *values,
 	       enum_duplicates handle_duplicates, bool ignore);
   ~multi_update();
+  bool init(THD *thd);
   int prepare(List<Item> &list, SELECT_LEX_UNIT *u);
   int send_data(List<Item> &items);
   bool initialize_tables (JOIN *join);
@@ -6782,7 +7044,8 @@ public:
   ~my_var_sp() { }
   bool set(THD *thd, Item *val);
   my_var_sp *get_my_var_sp() { return this; }
-  const Type_handler *type_handler() const { return m_type_handler; }
+  const Type_handler *type_handler() const
+  { return m_type_handler; }
   sp_rcontext *get_rcontext(sp_rcontext *local_ctx) const;
 };
 
@@ -7355,10 +7618,10 @@ public:
   ErrConvDQName(const Database_qualified_name *name)
    :m_name(name)
   { }
-  const char *ptr() const
+  LEX_CSTRING lex_cstring() const override
   {
-    m_name->make_qname(err_buffer, sizeof(err_buffer));
-    return err_buffer;
+    size_t length= m_name->make_qname(err_buffer, sizeof(err_buffer));
+    return {err_buffer, length};
   }
 };
 
@@ -7375,10 +7638,10 @@ public:
     m_maybe_null(false)
   { }
 
-  void set_maybe_null(bool maybe_null_arg) { m_maybe_null= maybe_null_arg; }
+  void set_type_maybe_null(bool maybe_null_arg) { m_maybe_null= maybe_null_arg; }
   bool get_maybe_null() const { return m_maybe_null; }
 
-  uint decimal_precision() const
+  decimal_digits_t decimal_precision() const
   {
     /*
       Type_holder is not used directly to create fields, so
@@ -7401,11 +7664,12 @@ public:
 
   bool aggregate_attributes(THD *thd)
   {
+    static LEX_CSTRING union_name= { STRING_WITH_LEN("UNION") };
     for (uint i= 0; i < arg_count; i++)
-      m_maybe_null|= args[i]->maybe_null;
+      m_maybe_null|= args[i]->maybe_null();
     return
        type_handler()->Item_hybrid_func_fix_attributes(thd,
-                                                       "UNION", this, this,
+                                                       union_name, this, this,
                                                        args, arg_count);
   }
 };
@@ -7531,6 +7795,9 @@ public:
 };
 
 extern THD_list server_threads;
+
+void setup_tmp_table_column_bitmaps(TABLE *table, uchar *bitmaps,
+                                    uint field_count);
 
 #endif /* MYSQL_SERVER */
 #endif /* SQL_CLASS_INCLUDED */

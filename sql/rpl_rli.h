@@ -274,7 +274,7 @@ public:
     Needed for problems when slave stops and we want to restart it
     skipping one or more events in the master log that have caused
     errors, and have been manually applied by DBA already.
-    Must be ulong as it's refered to from set_var.cc
+    Must be ulong as it's referred to from set_var.cc
   */
   volatile ulonglong slave_skip_counter;
   ulonglong max_relay_log_size;
@@ -539,7 +539,8 @@ public:
   int32 get_sql_delay() { return sql_delay; }
   void set_sql_delay(int32 _sql_delay) { sql_delay= _sql_delay; }
   time_t get_sql_delay_end() { return sql_delay_end; }
-
+  rpl_gtid last_seen_gtid;
+  ulong last_trans_retry_count;
 private:
 
 

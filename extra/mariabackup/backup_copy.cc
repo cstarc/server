@@ -129,7 +129,6 @@ struct datadir_thread_ctxt_t {
 	uint			n_thread;
 	uint			*count;
 	pthread_mutex_t*	count_mutex;
-	os_thread_id_t		id;
 	bool			ret;
 };
 
@@ -205,9 +204,9 @@ datadir_iter_new(const char *path, bool skip_first_level = true)
 	pthread_mutex_init(&it->mutex, NULL);
 	it->datadir_path = strdup(path);
 
-	it->dir = os_file_opendir(it->datadir_path, TRUE);
+	it->dir = os_file_opendir(it->datadir_path);
 
-	if (it->dir == NULL) {
+	if (it->dir == IF_WIN(INVALID_HANDLE_VALUE, nullptr)) {
 
 		goto error;
 	}
@@ -238,11 +237,9 @@ bool
 datadir_iter_next_database(datadir_iter_t *it)
 {
 	if (it->dbdir != NULL) {
-		if (os_file_closedir(it->dbdir) != 0) {
-
+		if (os_file_closedir_failed(it->dbdir)) {
 			msg("Warning: could not"
 			      " close database directory %s", it->dbpath);
-
 			it->err = DB_ERROR;
 
 		}
@@ -274,7 +271,6 @@ datadir_iter_next_database(datadir_iter_t *it)
 		}
 		snprintf(it->dbpath, it->dbpath_len, "%s/%s",
 			 it->datadir_path, it->dbinfo.name);
-		os_normalize_path(it->dbpath);
 
 		if (it->dbinfo.type == OS_FILE_TYPE_FILE) {
 			it->is_file = true;
@@ -288,10 +284,9 @@ datadir_iter_next_database(datadir_iter_t *it)
 
 		/* We want wrong directory permissions to be a fatal error for
 		XtraBackup. */
-		it->dbdir = os_file_opendir(it->dbpath, TRUE);
+		it->dbdir = os_file_opendir(it->dbpath);
 
-		if (it->dbdir != NULL) {
-
+		if (it->dir != IF_WIN(INVALID_HANDLE_VALUE, nullptr)) {
 			it->is_file = false;
 			return(true);
 		}
@@ -731,9 +726,9 @@ directory_exists(const char *dir, bool create)
 	}
 
 	/* could be symlink */
-	os_dir = os_file_opendir(dir, FALSE);
+	os_dir = os_file_opendir(dir);
 
-	if (os_dir == NULL) {
+	if (os_dir == IF_WIN(INVALID_HANDLE_VALUE, nullptr)) {
 		my_strerror(errbuf, sizeof(errbuf), my_errno);
 		msg("Can not open directory %s: %s", dir,
 			errbuf);
@@ -761,9 +756,9 @@ directory_exists_and_empty(const char *dir, const char *comment)
 		return(false);
 	}
 
-	os_dir = os_file_opendir(dir, FALSE);
+	os_dir = os_file_opendir(dir);
 
-	if (os_dir == NULL) {
+	if (os_dir == IF_WIN(INVALID_HANDLE_VALUE, nullptr)) {
 		msg("%s can not open directory %s", comment, dir);
 		return(false);
 	}
@@ -947,7 +942,7 @@ backup_file_printf(const char *filename, const char *fmt, ...)
 
 static
 bool
-run_data_threads(datadir_iter_t *it, os_thread_func_t func, uint n)
+run_data_threads(datadir_iter_t *it, void (*func)(datadir_thread_ctxt_t *ctxt), uint n)
 {
 	datadir_thread_ctxt_t	*data_threads;
 	uint			i, count;
@@ -965,12 +960,12 @@ run_data_threads(datadir_iter_t *it, os_thread_func_t func, uint n)
 		data_threads[i].n_thread = i + 1;
 		data_threads[i].count = &count;
 		data_threads[i].count_mutex = &count_mutex;
-		data_threads[i].id = os_thread_create(func, data_threads + i);
+		std::thread(func, data_threads + i).detach();
 	}
 
 	/* Wait for threads to exit */
 	while (1) {
-		os_thread_sleep(100000);
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		pthread_mutex_lock(&count_mutex);
 		if (count == 0) {
 			pthread_mutex_unlock(&count_mutex);
@@ -1008,6 +1003,7 @@ copy_file(ds_ctxt_t *datasink,
 	ds_file_t		*dstfile = NULL;
 	datafile_cur_t		 cursor;
 	xb_fil_cur_result_t	 res;
+	DBUG_ASSERT(datasink->datasink->remove);
 	const char	*dst_path =
 		(xtrabackup_copy_back || xtrabackup_move_back)?
 		dst_file_path : trim_dotslash(dst_file_path);
@@ -1033,6 +1029,7 @@ copy_file(ds_ctxt_t *datasink,
 		if (ds_write(dstfile, cursor.buf, cursor.buf_read)) {
 			goto error;
 		}
+		DBUG_EXECUTE_IF("copy_file_error", errno=ENOSPC;goto error;);
 	}
 
 	if (res == XB_FIL_CUR_ERROR) {
@@ -1050,6 +1047,7 @@ copy_file(ds_ctxt_t *datasink,
 error:
 	datafile_close(&cursor);
 	if (dstfile != NULL) {
+		datasink->datasink->remove(dstfile->path);
 		ds_close(dstfile);
 	}
 
@@ -1094,17 +1092,18 @@ move_file(ds_ctxt_t *datasink,
 
 	if (my_rename(src_file_path, dst_file_path_abs, MYF(0)) != 0) {
 		if (my_errno == EXDEV) {
-			bool ret;
-			ret = copy_file(datasink, src_file_path,
-					dst_file_path, thread_n);
+			/* Fallback to copy/unlink */
+			if(!copy_file(datasink, src_file_path,
+					dst_file_path, thread_n))
+					return false;
 			msg(thread_n,"Removing %s", src_file_path);
 			if (unlink(src_file_path) != 0) {
 				my_strerror(errbuf, sizeof(errbuf), errno);
-				msg("Error: unlink %s failed: %s",
+				msg("Warning: unlink %s failed: %s",
 					src_file_path,
 					errbuf);
 			}
-			return(ret);
+			return true;
 		}
 		my_strerror(errbuf, sizeof(errbuf), my_errno);
 		msg("Can not move file %s to %s: %s",
@@ -1134,13 +1133,12 @@ read_link_file(const char *ibd_filepath, const char *link_filepath)
 		os_file_read_string(file, filepath, OS_FILE_MAX_PATH);
 		fclose(file);
 
-		if (strlen(filepath)) {
+		if (size_t len = strlen(filepath)) {
 			/* Trim whitespace from end of filepath */
-			ulint lastch = strlen(filepath) - 1;
+			ulint lastch = len - 1;
 			while (lastch > 4 && filepath[lastch] <= 0x20) {
 				filepath[lastch--] = 0x00;
 			}
-			os_normalize_path(filepath);
 		}
 
 		tablespace_locations[ibd_filepath] = filepath;
@@ -1853,9 +1851,8 @@ copy_back()
 	     end(srv_sys_space.end());
 	     iter != end;
 	     ++iter) {
-		const char *filename = base_name(iter->name());
-
-		if (!(ret = copy_or_move_file(filename, iter->name(),
+		const char *filepath = iter->filepath();
+		if (!(ret = copy_or_move_file(base_name(filepath), filepath,
 					      dst_dir, 1))) {
 			goto cleanup;
 		}
@@ -1878,7 +1875,6 @@ copy_back()
 		const char *filename;
 		char c_tmp;
 		int i_tmp;
-		bool is_ibdata_file;
 
 		if (strstr(node.filepath,"/" ROCKSDB_BACKUP_DIR "/")
 #ifdef _WIN32
@@ -1933,23 +1929,19 @@ copy_back()
 		}
 
 		/* skip innodb data files */
-		is_ibdata_file = false;
 		for (Tablespace::const_iterator iter(srv_sys_space.begin()),
 		       end(srv_sys_space.end()); iter != end; ++iter) {
-			const char *ibfile = base_name(iter->name());
-			if (strcmp(ibfile, filename) == 0) {
-				is_ibdata_file = true;
-				break;
+			if (!strcmp(base_name(iter->filepath()), filename)) {
+				goto next_file;
 			}
-		}
-		if (is_ibdata_file) {
-			continue;
 		}
 
 		if (!(ret = copy_or_move_file(node.filepath, node.filepath_rel,
 					      mysql_data_home, 1))) {
 			goto cleanup;
 		}
+	next_file:
+		continue;
 	}
 
 	/* copy buffer pool dump */
@@ -2036,13 +2028,10 @@ decrypt_decompress_file(const char *filepath, uint thread_n)
  	return(true);
 }
 
-static
-os_thread_ret_t STDCALL
-decrypt_decompress_thread_func(void *arg)
+static void decrypt_decompress_thread_func(datadir_thread_ctxt_t *ctxt)
 {
 	bool ret = true;
 	datadir_node_t node;
-	datadir_thread_ctxt_t *ctxt = (datadir_thread_ctxt_t *)(arg);
 
 	datadir_node_init(&node);
 
@@ -2072,9 +2061,6 @@ cleanup:
 	pthread_mutex_unlock(ctxt->count_mutex);
 
 	ctxt->ret = ret;
-
-	os_thread_exit();
-	OS_THREAD_DUMMY_RETURN;
 }
 
 bool
@@ -2122,7 +2108,9 @@ decrypt_decompress()
 */
 static bool backup_files_from_datadir(const char *dir_path)
 {
-	os_file_dir_t dir = os_file_opendir(dir_path, TRUE);
+	os_file_dir_t dir = os_file_opendir(dir_path);
+	if (dir == IF_WIN(INVALID_HANDLE_VALUE, nullptr)) return false;
+
 	os_file_stat_t info;
 	bool ret = true;
 	while (os_file_readdir_next_file(dir_path, dir, &info) == 0) {
@@ -2130,7 +2118,14 @@ static bool backup_files_from_datadir(const char *dir_path)
 		if (info.type != OS_FILE_TYPE_FILE)
 			continue;
 
-		const char *pname = strrchr(info.name, OS_PATH_SEPARATOR);
+		const char *pname = strrchr(info.name, '/');
+#ifdef _WIN32
+		if (const char *last = strrchr(info.name, '\\')) {
+			if (!pname || last >pname) {
+				pname = last;
+			}
+		}
+#endif
 		if (!pname)
 			pname = info.name;
 
@@ -2147,7 +2142,7 @@ static bool backup_files_from_datadir(const char *dir_path)
 			unlink(info.name);
 
 		std::string full_path(dir_path);
-		full_path.append(1, OS_PATH_SEPARATOR).append(info.name);
+		full_path.append(1, '/').append(info.name);
 		if (!(ret = copy_file(ds_data, full_path.c_str() , info.name, 1)))
 			break;
 	}

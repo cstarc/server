@@ -128,13 +128,13 @@ static ulonglong	srv_log_file_size_requested;
 static bool		srv_start_has_been_called;
 
 /** Whether any undo log records can be generated */
-UNIV_INTERN bool	srv_undo_sources;
+bool	srv_undo_sources;
 
 #ifdef UNIV_DEBUG
 /** InnoDB system tablespace to set during recovery */
-UNIV_INTERN uint	srv_sys_space_size_debug;
+uint	srv_sys_space_size_debug;
 /** whether redo log file have been created at startup */
-UNIV_INTERN bool	srv_log_file_created;
+bool	srv_log_file_created;
 #endif /* UNIV_DEBUG */
 
 /** whether some background threads that create redo log have been started */
@@ -479,15 +479,12 @@ static ulint trx_rseg_get_n_undo_tablespaces()
 static ulint srv_undo_tablespace_open(bool create, const char* name, ulint i)
 {
   bool success;
-  char undo_name[sizeof "innodb_undo000"];
   ulint space_id= 0;
   ulint fsp_flags= 0;
 
   if (create)
   {
     space_id= srv_undo_space_id_start + i;
-    snprintf(undo_name, sizeof(undo_name),
-             "innodb_undo%03u", static_cast<unsigned>(space_id));
     switch (srv_checksum_algorithm) {
     case SRV_CHECKSUM_ALGORITHM_FULL_CRC32:
     case SRV_CHECKSUM_ALGORITHM_STRICT_FULL_CRC32:
@@ -542,7 +539,6 @@ err_exit:
     }
 
     space_id= id;
-    snprintf(undo_name, sizeof undo_name, "innodb_undo%03u", id);
     aligned_free(page);
   }
 
@@ -554,7 +550,7 @@ err_exit:
 
   fil_set_max_space_id_if_bigger(space_id);
 
-  fil_space_t *space= fil_space_t::create(undo_name, space_id, fsp_flags,
+  fil_space_t *space= fil_space_t::create(space_id, fsp_flags,
 					  FIL_TYPE_TABLESPACE, NULL);
   ut_a(fil_validate());
   ut_a(space);
@@ -594,11 +590,7 @@ srv_check_undo_redo_logs_exists()
 	/* Check if any undo tablespaces exist */
 	for (ulint i = 1; i <= srv_undo_tablespaces; ++i) {
 
-		snprintf(
-			name, sizeof(name),
-			"%s%cundo%03zu",
-			srv_undo_dir, OS_PATH_SEPARATOR,
-			i);
+		snprintf(name, sizeof name, "%s/undo%03zu", srv_undo_dir, i);
 
 		fh = os_file_create(
 			innodb_data_file_key, name,
@@ -656,8 +648,7 @@ static dberr_t srv_all_undo_tablespaces_open(bool create_new_db, ulint n_undo)
   for (ulint i= 0; i < n_undo; ++i)
   {
     char name[OS_FILE_MAX_PATH];
-    snprintf(name, sizeof name, "%s%cundo%03zu", srv_undo_dir,
-             OS_PATH_SEPARATOR, i + 1);
+    snprintf(name, sizeof name, "%s/undo%03zu", srv_undo_dir, i + 1);
     ulint space_id= srv_undo_tablespace_open(create_new_db, name, i);
     if (!space_id)
     {
@@ -687,8 +678,7 @@ static dberr_t srv_all_undo_tablespaces_open(bool create_new_db, ulint n_undo)
        ++i)
   {
      char name[OS_FILE_MAX_PATH];
-     snprintf(name, sizeof(name),
-              "%s%cundo%03zu", srv_undo_dir, OS_PATH_SEPARATOR, i);
+     snprintf(name, sizeof name, "%s/undo%03zu", srv_undo_dir, i);
      if (!srv_undo_tablespace_open(create_new_db, name, i))
        break;
      ++srv_undo_tablespaces_open;
@@ -722,8 +712,7 @@ srv_undo_tablespaces_init(bool create_new_db)
     for (ulint i= 0; i < srv_undo_tablespaces; ++i)
     {
       char name[OS_FILE_MAX_PATH];
-      snprintf(name, sizeof name, "%s%cundo%03zu",
-               srv_undo_dir, OS_PATH_SEPARATOR, i + 1);
+      snprintf(name, sizeof name, "%s/undo%03zu", srv_undo_dir, i + 1);
       if (dberr_t err= srv_undo_tablespace_create(name))
       {
         ib::error() << "Could not create undo tablespace '" << name << "'.";
@@ -952,7 +941,7 @@ static lsn_t srv_prepare_to_delete_redo_log_file(bool old_exists)
 			log_sys.log.flush();
 		}
 
-		ut_ad(flushed_lsn == log_get_lsn());
+		ut_ad(flushed_lsn == log_sys.get_lsn());
 
 		/* Check if the buffer pools are clean.  If not
 		retry till it is clean. */
@@ -967,7 +956,8 @@ static lsn_t srv_prepare_to_delete_redo_log_file(bool old_exists)
 				count = 0;
 			}
 
-			os_thread_sleep(100000);
+			std::this_thread::sleep_for(
+				std::chrono::milliseconds(100));
 			continue;
 		}
 
@@ -999,6 +989,9 @@ static dberr_t find_and_check_log_file(bool &log_file_found)
     if (is_operation_restore())
       return DB_NOT_FOUND;
 
+    /* This might be first start after mariabackup
+    copy-back or move-back. */
+    srv_start_after_restore= true;
     return DB_SUCCESS;
   }
 
@@ -1029,7 +1022,9 @@ static dberr_t find_and_check_log_file(bool &log_file_found)
   header, checkpoint page 1, empty, checkpoint page 2, redo log page(s).
 
   Mariabackup --prepare would create an empty LOG_FILE_NAME. Tolerate it. */
-  if (size != 0 && size <= OS_FILE_LOG_BLOCK_SIZE * 4)
+  if (size == 0)
+    srv_start_after_restore= true;
+  else if (size <= OS_FILE_LOG_BLOCK_SIZE * 4)
   {
     ib::error() << "Log file " << logfile0 << " size " << size
                 << " is too small";
@@ -1040,6 +1035,11 @@ static dberr_t find_and_check_log_file(bool &log_file_found)
   log_file_found= true;
   return DB_SUCCESS;
 }
+
+static tpool::task_group rollback_all_recovered_group(1);
+static tpool::task rollback_all_recovered_task(trx_rollback_all_recovered,
+                                               nullptr,
+                                               &rollback_all_recovered_group);
 
 /** Start InnoDB.
 @param[in]	create_new_db	whether to create a new database
@@ -1054,6 +1054,11 @@ dberr_t srv_start(bool create_new_db)
 	ut_ad(srv_operation == SRV_OPERATION_NORMAL
 	      || srv_operation == SRV_OPERATION_RESTORE
 	      || srv_operation == SRV_OPERATION_RESTORE_EXPORT);
+
+	if (srv_force_recovery) {
+		ib::info() << "!!! innodb_force_recovery is set to "
+			<< srv_force_recovery << " !!!";
+	}
 
 	if (srv_force_recovery == SRV_FORCE_NO_LOG_REDO) {
 		srv_read_only_mode = true;
@@ -1092,7 +1097,7 @@ dberr_t srv_start(bool create_new_db)
 	if (srv_start_has_been_called) {
 		ib::error() << "Startup called second time"
 			" during the process lifetime."
-			" In the MySQL Embedded Server Library"
+			" In the MariaDB Embedded Server Library"
 			" you cannot call server_init() more than"
 			" once during the process lifetime.";
 	}
@@ -1191,6 +1196,11 @@ dberr_t srv_start(bool create_new_db)
 #ifdef LINUX_NATIVE_AIO
 	if (srv_use_native_aio) {
 		ib::info() << "Using Linux native AIO";
+	}
+#endif
+#ifdef HAVE_URING
+	if (srv_use_native_aio) {
+		ib::info() << "Using liburing";
 	}
 #endif
 
@@ -1324,7 +1334,7 @@ dberr_t srv_start(bool create_new_db)
 
 			/* Suppress the message about
 			crash recovery. */
-			flushed_lsn = log_get_lsn();
+			flushed_lsn = log_sys.get_lsn();
 			goto file_checked;
 		}
 
@@ -1392,7 +1402,11 @@ file_checked:
 		All the remaining rollback segments will be created later,
 		after the double write buffer has been created. */
 		trx_sys_create_sys_pages();
-		trx_lists_init_at_db_start();
+		err = trx_lists_init_at_db_start();
+
+		if (err != DB_SUCCESS) {
+			return(srv_init_abort(err));
+		}
 
 		err = dict_create();
 
@@ -1402,7 +1416,7 @@ file_checked:
 
 		buf_flush_sync();
 
-		flushed_lsn = log_get_lsn();
+		flushed_lsn = log_sys.get_lsn();
 
 		err = fil_write_flushed_lsn(flushed_lsn);
 
@@ -1454,7 +1468,11 @@ file_checked:
 			if (srv_operation == SRV_OPERATION_RESTORE) {
 				break;
 			}
-			trx_lists_init_at_db_start();
+			dict_sys.load_sys_tables();
+			err = trx_lists_init_at_db_start();
+			if (err != DB_SUCCESS) {
+				return srv_init_abort(err);
+			}
 			break;
 		case SRV_OPERATION_RESTORE_DELTA:
 		case SRV_OPERATION_BACKUP:
@@ -1509,11 +1527,7 @@ file_checked:
 				fil_system.sys_space->size_in_header
 					= uint32_t(size);
 				mtr.commit();
-				/* Immediately write the log record about
-				increased tablespace size to disk, so that it
-				is durable even if mysqld would crash
-				quickly */
-				log_buffer_flush_to_disk();
+				log_write_up_to(mtr.commit_lsn(), true);
 			}
 		}
 
@@ -1575,9 +1589,9 @@ file_checked:
 			to the data files and truncate or delete the log.
 			Unless --export is specified, no further change to
 			InnoDB files is needed. */
-			ut_ad(!srv_force_recovery);
+			ut_ad(srv_force_recovery <= SRV_FORCE_IGNORE_CORRUPT);
 			ut_ad(recv_no_log_write);
-			err = fil_write_flushed_lsn(log_get_lsn());
+			err = fil_write_flushed_lsn(log_sys.get_lsn());
 			DBUG_ASSERT(!buf_pool.any_io_pending());
 			log_sys.log.close_file();
 			if (err == DB_SUCCESS) {
@@ -1767,19 +1781,9 @@ file_checked:
 		    && !srv_read_only_mode) {
 			/* Drop partially created indexes. */
 			row_merge_drop_temp_indexes();
-			/* Drop garbage tables. */
-			row_mysql_drop_garbage_tables();
-
-			/* Drop any auxiliary tables that were not
-			dropped when the parent table was
-			dropped. This can happen if the parent table
-			was dropped but the server crashed before the
-			auxiliary tables were dropped. */
-			fts_drop_orphaned_tables();
-
 			/* Rollback incomplete non-DDL transactions */
 			trx_rollback_is_active = true;
-			os_thread_create(trx_rollback_all_recovered);
+			srv_thread_pool->submit_task(&rollback_all_recovered_task);
 		}
 	}
 
@@ -1807,11 +1811,7 @@ skip_monitors:
 		}
 	}
 
-	/* Create the SYS_FOREIGN and SYS_FOREIGN_COLS system tables */
-	err = dict_create_or_check_foreign_constraint_tables();
-	if (err == DB_SUCCESS) {
-		err = dict_create_or_check_sys_virtual();
-	}
+	err = dict_sys.create_or_check_sys_tables();
 	switch (err) {
 	case DB_SUCCESS:
 		break;
@@ -1841,13 +1841,6 @@ skip_monitors:
 		}
 	}
 
-	if (!srv_read_only_mode && srv_operation == SRV_OPERATION_NORMAL
-	    && srv_force_recovery < SRV_FORCE_NO_BACKGROUND) {
-		srv_init_purge_tasks();
-		purge_sys.coordinator_startup();
-		srv_wake_purge_thread_if_not_active();
-	}
-
 	srv_is_being_started = false;
 
 	if (srv_print_verbose_log) {
@@ -1855,11 +1848,6 @@ skip_monitors:
 			   << " started; log sequence number "
 			   << recv_sys.recovered_lsn
 			   << "; transaction id " << trx_sys.get_max_trx_id();
-	}
-
-	if (srv_force_recovery > 0) {
-		ib::info() << "!!! innodb_force_recovery is set to "
-			<< srv_force_recovery << " !!!";
 	}
 
 	if (srv_force_recovery == 0) {
@@ -1919,10 +1907,6 @@ void srv_shutdown_bg_undo_sources()
 		ut_ad(!srv_read_only_mode);
 		fts_optimize_shutdown();
 		dict_stats_shutdown();
-		while (row_get_background_drop_list_len_low()) {
-			srv_inc_activity_count();
-			os_thread_yield();
-		}
 		srv_undo_sources = false;
 	}
 }
@@ -1948,7 +1932,7 @@ void innodb_preshutdown()
 
     if (trx_sys.is_initialised())
       while (trx_sys.any_active_transactions())
-        os_thread_sleep(1000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   srv_shutdown_bg_undo_sources();
   srv_purge_shutdown();
@@ -1975,9 +1959,9 @@ void innodb_shutdown()
 		}
 		mysql_mutex_lock(&buf_pool.flush_list_mutex);
 		while (buf_page_cleaner_is_active) {
-			mysql_cond_signal(&buf_pool.do_flush_list);
-			mysql_cond_wait(&buf_pool.done_flush_list,
-					&buf_pool.flush_list_mutex);
+			pthread_cond_signal(&buf_pool.do_flush_list);
+			my_cond_wait(&buf_pool.done_flush_list,
+				     &buf_pool.flush_list_mutex.m_mutex);
 		}
 		mysql_mutex_unlock(&buf_pool.flush_list_mutex);
 		break;
@@ -2049,7 +2033,6 @@ void innodb_shutdown()
 
 	dict_sys.close();
 	btr_search_sys_free();
-	row_mysql_close();
 	srv_free();
 	fil_system.close();
 	pars_lexer_close();
@@ -2060,7 +2043,9 @@ void innodb_shutdown()
 
 	srv_sys_space.shutdown();
 	if (srv_tmp_space.get_sanity_check_status()) {
-		fil_system.temp_space->close();
+		if (fil_system.temp_space) {
+			fil_system.temp_space->close();
+		}
 		srv_tmp_space.delete_files();
 	}
 	srv_tmp_space.shutdown();
@@ -2093,15 +2078,12 @@ srv_get_meta_data_filename(
 	/* Make sure the data_dir_path is set. */
 	dict_get_and_save_data_dir_path(table, false);
 
-	if (DICT_TF_HAS_DATA_DIR(table->flags)) {
-		ut_a(table->data_dir_path);
+	const char* data_dir_path = DICT_TF_HAS_DATA_DIR(table->flags)
+		? table->data_dir_path : nullptr;
+	ut_ad(!DICT_TF_HAS_DATA_DIR(table->flags) || data_dir_path);
 
-		path = fil_make_filepath(
-			table->data_dir_path, table->name.m_name, CFG, true);
-	} else {
-		path = fil_make_filepath(NULL, table->name.m_name, CFG, false);
-	}
-
+	path = fil_make_filepath(data_dir_path, table->name, CFG,
+				 data_dir_path != nullptr);
 	ut_a(path);
 	len = strlen(path);
 	ut_a(max_len >= len);

@@ -15,6 +15,7 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1335  USA */
 
 #include "mariadb.h"
+#include "my_dbug.h"
 #include <signal.h>
 
 //#include "sys_vars.h"
@@ -23,11 +24,16 @@
 #include "sql_class.h"
 #include "my_stacktrace.h"
 
-#ifdef __WIN__
+#ifdef _WIN32
 #include <crtdbg.h>
 #define SIGNAL_FMT "exception 0x%x"
 #else
 #define SIGNAL_FMT "signal %d"
+#endif
+
+
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/sysctl.h>
 #endif
 
 #ifndef PATH_MAX
@@ -48,7 +54,7 @@ extern const char *optimizer_switch_names[];
 static inline void output_core_info()
 {
   /* proc is optional on some BSDs so it can't hurt to look */
-#ifdef HAVE_READLINK
+#if defined(HAVE_READLINK) && !defined(__APPLE__) && !defined(__FreeBSD__)
   char buff[PATH_MAX];
   ssize_t len;
   int fd;
@@ -59,9 +65,9 @@ static inline void output_core_info()
                           (int) len, buff);
   }
 #ifdef __FreeBSD__
-  if ((fd= my_open("/proc/curproc/rlimit", O_RDONLY, MYF(0))) >= 0)
+  if ((fd= my_open("/proc/curproc/rlimit", O_RDONLY, MYF(MY_NO_REGISTER))) >= 0)
 #else
-  if ((fd= my_open("/proc/self/limits", O_RDONLY, MYF(0))) >= 0)
+  if ((fd= my_open("/proc/self/limits", O_RDONLY, MYF(MY_NO_REGISTER))) >= 0)
 #endif
   {
     my_safe_printf_stderr("Resource Limits:\n");
@@ -72,13 +78,21 @@ static inline void output_core_info()
     my_close(fd, MYF(0));
   }
 #ifdef __linux__
-  if ((fd= my_open("/proc/sys/kernel/core_pattern", O_RDONLY, MYF(0))) >= 0)
+  if ((fd= my_open("/proc/sys/kernel/core_pattern", O_RDONLY,
+                   MYF(MY_NO_REGISTER))) >= 0)
   {
     len= my_read(fd, (uchar*)buff, sizeof(buff),  MYF(0));
     my_safe_printf_stderr("Core pattern: %.*s\n", (int) len, buff);
     my_close(fd, MYF(0));
   }
 #endif
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+  char buff[PATH_MAX];
+  size_t len = sizeof(buff);
+  if (sysctlbyname("kern.corefile", buff, &len, NULL, 0) == 0)
+  {
+    my_safe_printf_stderr("Core pattern: %.*s\n", (int) len, buff);
+  }
 #else
   char buff[80];
   my_getwd(buff, sizeof(buff), 0);
@@ -120,8 +134,8 @@ extern "C" sig_handler handle_fatal_signal(int sig)
     my_safe_printf_stderr("Fatal " SIGNAL_FMT " while backtracing\n", sig);
     goto end;
   }
-
   segfaulted = 1;
+  DBUG_PRINT("error", ("handling fatal signal"));
 
   curr_time= my_time(0);
   localtime_r(&curr_time, &tm);
@@ -332,7 +346,7 @@ extern "C" sig_handler handle_fatal_signal(int sig)
 #endif
 
 end:
-#ifndef __WIN__
+#ifndef _WIN32
   /*
      Quit, without running destructors (etc.)
      Use a signal, because the parent (systemd) can check that with WIFSIGNALED

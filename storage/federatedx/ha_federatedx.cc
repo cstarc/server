@@ -872,7 +872,7 @@ uint ha_federatedx::convert_row_to_internal_format(uchar *record,
   ulong *lengths;
   Field **field;
   int column= 0;
-  my_bitmap_map *old_map= dbug_tmp_use_all_columns(table, table->write_set);
+  MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->write_set);
   Time_zone *saved_time_zone= table->in_use->variables.time_zone;
   DBUG_ENTER("ha_federatedx::convert_row_to_internal_format");
 
@@ -902,7 +902,7 @@ uint ha_federatedx::convert_row_to_internal_format(uchar *record,
     (*field)->move_field_offset(-old_ptr);
   }
   table->in_use->variables.time_zone= saved_time_zone;
-  dbug_tmp_restore_column_map(table->write_set, old_map);
+  dbug_tmp_restore_column_map(&table->write_set, old_map);
   DBUG_RETURN(0);
 }
 
@@ -937,19 +937,17 @@ static bool emit_key_part_element(String *to, KEY_PART_INFO *part,
   }
   else if (part->key_part_flag & HA_BLOB_PART)
   {
-    String blob;
     uint blob_length= uint2korr(ptr);
-    blob.set_quick((char*) ptr+HA_KEY_BLOB_LENGTH,
-                   blob_length, &my_charset_bin);
+    String blob((char*) ptr+HA_KEY_BLOB_LENGTH,
+                blob_length, &my_charset_bin);
     if (to->append_for_single_quote(&blob))
       DBUG_RETURN(1);
   }
   else if (part->key_part_flag & HA_VAR_LENGTH_PART)
   {
-    String varchar;
     uint var_length= uint2korr(ptr);
-    varchar.set_quick((char*) ptr+HA_KEY_BLOB_LENGTH,
-                      var_length, &my_charset_bin);
+    String varchar((char*) ptr+HA_KEY_BLOB_LENGTH,
+                   var_length, &my_charset_bin);
     if (to->append_for_single_quote(&varchar))
       DBUG_RETURN(1);
   }
@@ -1231,7 +1229,6 @@ bool ha_federatedx::create_where_from_key(String *to,
   String tmp(tmpbuff, sizeof(tmpbuff), system_charset_info);
   const key_range *ranges[2]= { start_key, end_key };
   Time_zone *saved_time_zone= table->in_use->variables.time_zone;
-  my_bitmap_map *old_map;
   DBUG_ENTER("ha_federatedx::create_where_from_key");
 
   tmp.length(0); 
@@ -1239,7 +1236,7 @@ bool ha_federatedx::create_where_from_key(String *to,
     DBUG_RETURN(1);
 
   table->in_use->variables.time_zone= UTC;
-  old_map= dbug_tmp_use_all_columns(table, table->write_set);
+  MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->write_set);
   for (uint i= 0; i <= 1; i++)
   {
     bool needs_quotes;
@@ -1272,14 +1269,18 @@ bool ha_federatedx::create_where_from_key(String *to,
       {
         if (*ptr++)
         {
+          LEX_CSTRING constraint;
+          if (ranges[i]->flag == HA_READ_KEY_EXACT)
+            constraint= {STRING_WITH_LEN(" IS NULL ") };
+          else
+            constraint= {STRING_WITH_LEN(" IS NOT NULL ") };
           /*
             We got "IS [NOT] NULL" condition against nullable column. We
             distinguish between "IS NOT NULL" and "IS NULL" by flag. For
             "IS NULL", flag is set to HA_READ_KEY_EXACT.
           */
           if (emit_key_part_name(&tmp, key_part) ||
-              tmp.append(ranges[i]->flag == HA_READ_KEY_EXACT ?
-                         " IS NULL " : " IS NOT NULL "))
+              tmp.append(constraint))
             goto err;
           /*
             We need to adjust pointer and length to be prepared for next
@@ -1331,7 +1332,7 @@ bool ha_federatedx::create_where_from_key(String *to,
       case HA_READ_AFTER_KEY:
         if (eq_range)
         {
-          if (tmp.append("1=1"))                // Dummy
+          if (tmp.append(STRING_WITH_LEN("1=1")))                // Dummy
             goto err;
           break;
         }
@@ -1415,7 +1416,7 @@ prepare_for_next_key_part:
                   tmp.c_ptr_quick()));
     }
   }
-  dbug_tmp_restore_column_map(table->write_set, old_map);
+  dbug_tmp_restore_column_map(&table->write_set, old_map);
   table->in_use->variables.time_zone= saved_time_zone;
 
   if (both_not_null)
@@ -1431,7 +1432,7 @@ prepare_for_next_key_part:
   DBUG_RETURN(0);
 
 err:
-  dbug_tmp_restore_column_map(table->write_set, old_map);
+  dbug_tmp_restore_column_map(&table->write_set, old_map);
   table->in_use->variables.time_zone= saved_time_zone;
   DBUG_RETURN(1);
 }
@@ -1440,13 +1441,16 @@ static void fill_server(MEM_ROOT *mem_root, FEDERATEDX_SERVER *server,
                         FEDERATEDX_SHARE *share, CHARSET_INFO *table_charset)
 {
   char buffer[STRING_BUFFER_USUAL_SIZE];
+  const char *socket_arg= share->socket ? share->socket : "";
+  const char *password_arg= share->password ? share->password : "";
+
   String key(buffer, sizeof(buffer), &my_charset_bin);  
-  String scheme(share->scheme, &my_charset_latin1);
-  String hostname(share->hostname, &my_charset_latin1);
-  String database(share->database, system_charset_info);
-  String username(share->username, system_charset_info);
-  String socket(share->socket ? share->socket : "", files_charset_info);
-  String password(share->password ? share->password : "", &my_charset_bin);
+  String scheme(share->scheme, strlen(share->scheme), &my_charset_latin1);
+  String hostname(share->hostname, strlen(share->hostname), &my_charset_latin1);
+  String database(share->database, strlen(share->database), system_charset_info);
+  String username(share->username, strlen(share->username), system_charset_info);
+  String socket(socket_arg, strlen(socket_arg), files_charset_info);
+  String password(password_arg, strlen(password_arg), &my_charset_bin);
   DBUG_ENTER("fill_server");
 
   /* Do some case conversions */
@@ -1462,7 +1466,7 @@ static void fill_server(MEM_ROOT *mem_root, FEDERATEDX_SERVER *server,
     database.length(my_casedn_str(system_charset_info, database.c_ptr_safe()));
   }
 
-#ifndef __WIN__
+#ifndef _WIN32
   /*
     TODO: there is no unix sockets under windows so the engine should be
     revised about using sockets in such environment.
@@ -1519,7 +1523,7 @@ static void fill_server(MEM_ROOT *mem_root, FEDERATEDX_SERVER *server,
     server->password= NULL;
 
   if (table_charset)
-    server->csname= strdup_root(mem_root, table_charset->csname);
+    server->csname= strdup_root(mem_root, table_charset->cs_name.str);
 
   DBUG_VOID_RETURN;
 }
@@ -1530,13 +1534,16 @@ static FEDERATEDX_SERVER *get_server(FEDERATEDX_SHARE *share, TABLE *table)
   FEDERATEDX_SERVER *server= NULL, tmp_server;
   MEM_ROOT mem_root;
   char buffer[STRING_BUFFER_USUAL_SIZE];
+  const char *socket_arg= share->socket ? share->socket : "";
+  const char *password_arg= share->password ? share->password : "";
+
   String key(buffer, sizeof(buffer), &my_charset_bin);  
-  String scheme(share->scheme, &my_charset_latin1);
-  String hostname(share->hostname, &my_charset_latin1);
-  String database(share->database, system_charset_info);
-  String username(share->username, system_charset_info);
-  String socket(share->socket ? share->socket : "", files_charset_info);
-  String password(share->password ? share->password : "", &my_charset_bin);
+  String scheme(share->scheme, strlen(share->scheme), &my_charset_latin1);
+  String hostname(share->hostname, strlen(share->hostname), &my_charset_latin1);
+  String database(share->database, strlen(share->database), system_charset_info);
+  String username(share->username, strlen(share->username), system_charset_info);
+  String socket(socket_arg, strlen(socket_arg), files_charset_info);
+  String password(password_arg, strlen(password_arg), &my_charset_bin);
   DBUG_ENTER("ha_federated.cc::get_server");
 
   mysql_mutex_assert_owner(&federatedx_mutex);
@@ -1638,13 +1645,14 @@ static FEDERATEDX_SHARE *get_share(const char *table_name, TABLE *table)
 
     if (!(share= (FEDERATEDX_SHARE *) memdup_root(&mem_root, (char*)&tmp_share, sizeof(*share))) ||
         !(share->share_key= (char*) memdup_root(&mem_root, tmp_share.share_key, tmp_share.share_key_length+1)) ||
-        !(share->select_query= (char*) strmake_root(&mem_root, query.ptr(), query.length())))
+        !(share->select_query.str= (char*) strmake_root(&mem_root, query.ptr(), query.length())))
       goto error;
+    share->select_query.length= query.length();
 
     share->mem_root= mem_root;
 
     DBUG_PRINT("info",
-               ("share->select_query %s", share->select_query));
+               ("share->select_query %s", share->select_query.str));
 
     if (!(share->s= get_server(share, table)))
       goto error;
@@ -2010,7 +2018,7 @@ int ha_federatedx::write_row(const uchar *buf)
                                    sizeof(insert_field_value_buffer),
                                    &my_charset_bin);
   Time_zone *saved_time_zone= table->in_use->variables.time_zone;
-  my_bitmap_map *old_map= dbug_tmp_use_all_columns(table, table->read_set);
+  MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->read_set);
   DBUG_ENTER("ha_federatedx::write_row");
 
   table->in_use->variables.time_zone= UTC;
@@ -2065,7 +2073,7 @@ int ha_federatedx::write_row(const uchar *buf)
       values_string.append(STRING_WITH_LEN(", "));
     }
   }
-  dbug_tmp_restore_column_map(table->read_set, old_map);
+  dbug_tmp_restore_column_map(&table->read_set, old_map);
   table->in_use->variables.time_zone= saved_time_zone;
 
   /*
@@ -2390,7 +2398,7 @@ int ha_federatedx::update_row(const uchar *old_data, const uchar *new_data)
       else
       {
         /* otherwise = */
-        my_bitmap_map *old_map= tmp_use_all_columns(table, table->read_set);
+        MY_BITMAP *old_map= tmp_use_all_columns(table, &table->read_set);
         bool needs_quote= (*field)->str_needs_quotes();
 	(*field)->val_str(&field_value);
         if (needs_quote)
@@ -2399,7 +2407,7 @@ int ha_federatedx::update_row(const uchar *old_data, const uchar *new_data)
         if (needs_quote)
           update_string.append(value_quote_char);
         field_value.length(0);
-        tmp_restore_column_map(table->read_set, old_map);
+        tmp_restore_column_map(&table->read_set, old_map);
       }
       update_string.append(STRING_WITH_LEN(", "));
     }
@@ -2823,8 +2831,7 @@ int ha_federatedx::rnd_init(bool scan)
     if (stored_result)
       (void) free_result();
 
-    if (io->query(share->select_query,
-                  strlen(share->select_query)))
+    if (io->query(share->select_query.str, share->select_query.length))
       goto error;
 
     stored_result= io->store_result();
@@ -3426,7 +3433,9 @@ int ha_federatedx::create(const char *name, TABLE *table_arg,
   {
     FEDERATEDX_SERVER server;
 
-    fill_server(thd->mem_root, &server, &tmp_share, create_info->table_charset);
+    // It's possibly wrong to use alter_table_convert_to_charset here.
+    fill_server(thd->mem_root, &server, &tmp_share,
+                create_info->alter_table_convert_to_charset);
 
 #ifndef DBUG_OFF
     mysql_mutex_init(fe_key_mutex_FEDERATEDX_SERVER_mutex,
@@ -3475,7 +3484,7 @@ bool ha_federatedx::get_error_message(int error, String* buf)
     buf->append(STRING_WITH_LEN("Error on remote system: "));
     buf->qs_append(remote_error_number);
     buf->append(STRING_WITH_LEN(": "));
-    buf->append(remote_error_buf);
+    buf->append(remote_error_buf, strlen(remote_error_buf));
     /* Ensure string ends with \0 */
     (void) buf->c_ptr_safe();
 
@@ -3639,7 +3648,7 @@ int ha_federatedx::discover_assisted(handlerton *hton, THD* thd,
     return HA_WRONG_CREATE_OPTION;
 
   mysql_init(&mysql);
-  mysql_options(&mysql, MYSQL_SET_CHARSET_NAME, cs->csname);
+  mysql_options(&mysql, MYSQL_SET_CHARSET_NAME, cs->cs_name.str);
   mysql_options(&mysql, MYSQL_OPT_USE_THREAD_SPECIFIC_MEMORY, (char*)&my_true);
 
   if (!mysql_real_connect(&mysql, tmp_share.hostname, tmp_share.username,
@@ -3716,7 +3725,7 @@ maria_declare_plugin(federatedx)
   &federatedx_storage_engine,
   "FEDERATED",
   "Patrick Galbraith",
-  "Allows to access tables on other MariaDB servers, supports transactions and more",
+  "Allows one to access tables on other MariaDB servers, supports transactions and more",
   PLUGIN_LICENSE_GPL,
   federatedx_db_init, /* Plugin Init */
   federatedx_done, /* Plugin Deinit */
@@ -3727,4 +3736,3 @@ maria_declare_plugin(federatedx)
   MariaDB_PLUGIN_MATURITY_STABLE /* maturity */
 }
 maria_declare_plugin_end;
-

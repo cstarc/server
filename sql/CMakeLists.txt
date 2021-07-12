@@ -66,15 +66,17 @@ ADD_CUSTOM_COMMAND(
 )
 
 ADD_CUSTOM_COMMAND(
-  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc_ora.yy
-  COMMAND ${CMAKE_COMMAND}
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/yy_mariadb.yy
+         ${CMAKE_CURRENT_BINARY_DIR}/yy_oracle.yy
+  COMMAND ${CMAKE_COMMAND} "-DVAL1=ORACLE" "-DVAL2=MARIADB"
+   "-DOUT1=${CMAKE_CURRENT_BINARY_DIR}/yy_oracle.yy"
+   "-DOUT2=${CMAKE_CURRENT_BINARY_DIR}/yy_mariadb.yy"
    "-DIN=${CMAKE_CURRENT_SOURCE_DIR}/sql_yacc.yy"
-   "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/sql_yacc_ora.yy"
-   -P ${CMAKE_CURRENT_SOURCE_DIR}/gen_sql_yacc_ora_yy.cmake
+   -P ${CMAKE_CURRENT_SOURCE_DIR}/gen_yy_files.cmake
+  COMMENT "Building yy_mariadb.yy and yy_oracle.yy from sql_yacc.yy"
   DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/sql_yacc.yy
+          ${CMAKE_CURRENT_SOURCE_DIR}/gen_yy_files.cmake
 )
-
-ADD_CUSTOM_TARGET(gen_sql_yacc_ora_yy DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc_ora.yy)
 
 ADD_DEFINITIONS(-DMYSQL_SERVER -DHAVE_EVENT_SCHEDULER)
 
@@ -83,8 +85,8 @@ IF(SSL_DEFINES)
 ENDIF()
 
 SET (SQL_SOURCE
-               ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc.cc
-               ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc_ora.cc
+               ${CMAKE_CURRENT_BINARY_DIR}/yy_mariadb.cc
+               ${CMAKE_CURRENT_BINARY_DIR}/yy_oracle.cc
               ../sql-common/client.c compat56.cc derror.cc des_key_file.cc
                discover.cc ../sql-common/errmsg.c
                field.cc field_conv.cc field_comp.cc
@@ -117,15 +119,17 @@ SET (SQL_SOURCE
                sql_list.cc sql_load.cc sql_manager.cc
                sql_parse.cc sql_bootstrap.cc
                sql_partition.cc sql_plugin.cc sql_prepare.cc sql_rename.cc 
-               debug_sync.cc
+               debug_sync.cc debug.cc
                sql_repl.cc sql_select.cc sql_show.cc sql_state.c
                group_by_handler.cc derived_handler.cc select_handler.cc
                sql_statistics.cc sql_string.cc lex_string.h
                sql_table.cc sql_test.cc sql_trigger.cc sql_udf.cc sql_union.cc
+               ddl_log.cc ddl_log.h
                sql_update.cc sql_view.cc strfunc.cc table.cc thr_malloc.cc 
                sql_time.cc tztime.cc unireg.cc item_xmlfunc.cc 
                uniques.cc
-               rpl_tblmap.cc sql_binlog.cc event_scheduler.cc event_data_objects.cc
+               rpl_tblmap.cc sql_binlog.cc event_scheduler.cc
+               event_data_objects.cc
                event_queue.cc event_db_repository.cc 
                sql_tablespace.cc events.cc ../sql-common/my_user.c 
                partition_info.cc rpl_utility.cc rpl_utility_server.cc
@@ -164,6 +168,7 @@ SET (SQL_SOURCE
                rowid_filter.cc rowid_filter.h
                opt_trace.cc
                table_cache.cc encryption.cc temporary_tables.cc
+               json_table.cc
                proxy_protocol.cc backup.cc xa.cc
                ${CMAKE_CURRENT_BINARY_DIR}/lex_hash.h
                ${CMAKE_CURRENT_BINARY_DIR}/lex_token.h
@@ -186,7 +191,7 @@ IF ((CMAKE_SYSTEM_NAME MATCHES "Linux" OR
 ENDIF()
 
 IF(WIN32)
-  SET(SQL_SOURCE ${SQL_SOURCE} handle_connections_win.cc)
+  SET(SQL_SOURCE ${SQL_SOURCE} handle_connections_win.cc winmain.cc)
 ENDIF()
 
 MYSQL_ADD_PLUGIN(partition ha_partition.cc STORAGE_ENGINE DEFAULT STATIC_ONLY
@@ -216,7 +221,7 @@ FOREACH(se aria partition perfschema sql_sequence wsrep)
 ENDFOREACH()
 
 IF(WIN32)
-  SET(MYSQLD_SOURCE winmain.cc  message.rc)
+  SET(MYSQLD_SOURCE main.cc  message.rc)
 ELSE()
   SET(MYSQLD_SOURCE main.cc ${DTRACE_PROBES_ALL})
 ENDIF()
@@ -258,7 +263,9 @@ IF(MSVC OR CMAKE_SYSTEM_NAME MATCHES AIX)
    sql_builtins
   )
   IF(MSVC)
-    SET_TARGET_PROPERTIES(server PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+    IF(NOT WITHOUT_DYNAMIC_PLUGINS)
+     SET_TARGET_PROPERTIES(server PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+    ENDIF()
   ELSE()
     SET_TARGET_PROPERTIES(server PROPERTIES AIX_EXPORT_ALL_SYMBOLS TRUE)
   ENDIF()
@@ -326,7 +333,7 @@ FIND_PACKAGE(BISON 2.0)
 # there
 IF (NOT BISON_FOUND)
   IF (NOT ${CMAKE_CURRENT_SOURCE_DIR} STREQUAL ${CMAKE_CURRENT_BINARY_DIR})
-    FOREACH(file sql_yacc.cc sql_yacc.hh sql_yacc_ora.cc sql_yacc_ora.hh)
+    FOREACH(file yy_mariadb.cc yy_mariadb.hh yy_oracle.cc yy_oracle.hh)
     IF(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${file} AND (NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/${file}))
         CONFIGURE_FILE(${CMAKE_CURRENT_SOURCE_DIR}/${file}
         ${CMAKE_CURRENT_BINARY_DIR}/${file} COPYONLY)
@@ -334,7 +341,7 @@ IF (NOT BISON_FOUND)
     ENDFOREACH()
   ENDIF()
 
-  IF(NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc.cc)
+  IF(NOT EXISTS ${CMAKE_CURRENT_BINARY_DIR}/yy_mariadb.cc)
      # Output files are missing, bail out.
       SET(ERRMSG
          "Bison (GNU parser generator) is required to build MySQL."
@@ -349,15 +356,17 @@ IF (NOT BISON_FOUND)
       MESSAGE(FATAL_ERROR ${ERRMSG})
   ENDIF()
 ELSE()
-  BISON_TARGET(gen_sql_yacc ${CMAKE_CURRENT_SOURCE_DIR}/sql_yacc.yy ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc.cc
-             COMPILE_FLAGS "-p MYSQL")
-  BISON_TARGET(gen_sql_yacc_ora ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc_ora.yy ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc_ora.cc
-             COMPILE_FLAGS "-p ORA")
+  BISON_TARGET(gen_mariadb_cc_hh ${CMAKE_CURRENT_BINARY_DIR}/yy_mariadb.yy
+                                 ${CMAKE_CURRENT_BINARY_DIR}/yy_mariadb.cc
+               COMPILE_FLAGS "-p MYSQL -S ${CMAKE_CURRENT_SOURCE_DIR}/myskel.m4")
+  BISON_TARGET(gen_oracle_cc_hh ${CMAKE_CURRENT_BINARY_DIR}/yy_oracle.yy
+                                ${CMAKE_CURRENT_BINARY_DIR}/yy_oracle.cc
+               COMPILE_FLAGS "-p ORA -S ${CMAKE_CURRENT_SOURCE_DIR}/myskel.m4")
 ENDIF()
 
-IF(NOT CMAKE_CROSSCOMPILING)
+IF(NOT CMAKE_CROSSCOMPILING OR DEFINED CMAKE_CROSSCOMPILING_EMULATOR)
   ADD_EXECUTABLE(gen_lex_token gen_lex_token.cc
-   ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc.hh)
+   ${CMAKE_CURRENT_BINARY_DIR}/yy_mariadb.hh)
   ADD_EXECUTABLE(gen_lex_hash gen_lex_hash.cc)
 ENDIF()
 
@@ -367,7 +376,7 @@ ADD_CUSTOM_COMMAND(
   DEPENDS gen_lex_hash
 )
 
-MYSQL_ADD_EXECUTABLE(mariadb-tzinfo-to-sql tztime.cc COMPONENT Server)
+MYSQL_ADD_EXECUTABLE(mariadb-tzinfo-to-sql tztime.cc)
 SET_TARGET_PROPERTIES(mariadb-tzinfo-to-sql PROPERTIES COMPILE_FLAGS "-DTZINFO2SQL")
 TARGET_LINK_LIBRARIES(mariadb-tzinfo-to-sql mysys mysys_ssl)
 
@@ -376,10 +385,9 @@ ADD_CUSTOM_TARGET(
         DEPENDS
         ${CMAKE_CURRENT_BINARY_DIR}/lex_hash.h
         ${CMAKE_CURRENT_BINARY_DIR}/lex_token.h
-        ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc_ora.cc
+        ${CMAKE_CURRENT_BINARY_DIR}/yy_mariadb.cc
+        ${CMAKE_CURRENT_BINARY_DIR}/yy_oracle.cc
 )
-
-ADD_DEPENDENCIES(GenServerSource gen_sql_yacc_ora_yy)
 
 IF(WIN32 OR HAVE_DLOPEN AND NOT DISABLE_SHARED)
   ADD_LIBRARY(udf_example MODULE udf_example.c udf_example.def)
@@ -393,8 +401,8 @@ CONFIGURE_FILE(
 
 ADD_CUSTOM_TARGET(dist
   COMMAND ${CMAKE_COMMAND} -P ${CMAKE_BINARY_DIR}/make_dist.cmake
-  DEPENDS ${CMAKE_BINARY_DIR}/sql/sql_yacc.cc ${CMAKE_BINARY_DIR}/sql/sql_yacc.hh
-  DEPENDS ${CMAKE_BINARY_DIR}/sql/sql_yacc_ora.cc ${CMAKE_BINARY_DIR}/sql/sql_yacc_ora.hh
+  DEPENDS ${CMAKE_BINARY_DIR}/sql/yy_mariadb.cc ${CMAKE_BINARY_DIR}/sql/yy_mariadb.hh
+  DEPENDS ${CMAKE_BINARY_DIR}/sql/yy_oracle.cc ${CMAKE_BINARY_DIR}/sql/yy_oracle.hh
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
 )
 
@@ -405,7 +413,7 @@ ADD_CUSTOM_TARGET(distclean
   )
 
 # Install initial database (default on windows, optional target elsewhere)
-IF(TARGET mariadbd AND NOT CMAKE_CROSSCOMPILING)
+IF(TARGET mariadbd AND (NOT CMAKE_CROSSCOMPILING OR DEFINED CMAKE_CROSSCOMPILING_EMULATOR))
   IF(GENERATOR_IS_MULTI_CONFIG)
     SET (CONFIG_PARAM -DCONFIG=${CMAKE_CFG_INTDIR})
   ENDIF()
@@ -416,7 +424,7 @@ IF(TARGET mariadbd AND NOT CMAKE_CROSSCOMPILING)
      COMMAND ${CMAKE_COMMAND} -E make_directory data
      COMMAND ${CMAKE_COMMAND} -E chdir data ${CMAKE_COMMAND}
      ${CONFIG_PARAM}
-     -DTOP_SRCDIR="${CMAKE_SOURCE_DIR}"
+     -DTOP_SRCDIR="${CMAKE_BINARY_DIR}"
      -DBINDIR="${CMAKE_CURRENT_BINARY_DIR}"
      -DMYSQLD_EXECUTABLE="$<TARGET_FILE:mariadbd>"
      -DCMAKE_CFG_INTDIR="${CMAKE_CFG_INTDIR}"
@@ -443,14 +451,15 @@ IF(WIN32)
   # Create bootstrapper SQL script
   ADD_CUSTOM_COMMAND(OUTPUT    
     ${my_bootstrap_sql}
-    COMMAND ${CMAKE_COMMAND} -E chdir ${CMAKE_SOURCE_DIR}/scripts
-    cmd /c copy mysql_system_tables.sql+mysql_system_tables_data.sql+fill_help_tables.sql+mysql_performance_tables.sql+mysql_test_db.sql ${native_outfile}
+    COMMAND ${CMAKE_COMMAND} -E chdir ${CMAKE_BINARY_DIR}/scripts
+    cmd /c copy mysql_system_tables.sql+mysql_system_tables_data.sql+fill_help_tables.sql+mysql_performance_tables.sql+mysql_test_db.sql+mysql_sys_schema.sql ${native_outfile}
     DEPENDS
     ${CMAKE_SOURCE_DIR}/scripts/mysql_system_tables.sql
     ${CMAKE_SOURCE_DIR}/scripts/mysql_system_tables_data.sql
     ${CMAKE_SOURCE_DIR}/scripts/fill_help_tables.sql
     ${CMAKE_SOURCE_DIR}/scripts/mysql_performance_tables.sql
     ${CMAKE_SOURCE_DIR}/scripts/mysql_test_db.sql
+    ${CMAKE_BINARY_DIR}/scripts/mysql_sys_schema.sql
   )
 
   ADD_CUSTOM_COMMAND(

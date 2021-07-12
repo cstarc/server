@@ -1220,6 +1220,7 @@ pars_update_statement(
 		sel_node->row_lock_mode = LOCK_X;
 	} else {
 		node->has_clust_rec_x_lock = sel_node->set_x_locks;
+		ut_ad(node->has_clust_rec_x_lock);
 	}
 
 	ut_a(sel_node->n_tables == 1);
@@ -1782,8 +1783,9 @@ pars_create_table(
 
 	n_cols = que_node_list_get_len(column_defs);
 
-	table = dict_mem_table_create(
-		table_sym->name, NULL, n_cols, 0, flags, flags2);
+	table = dict_table_t::create(
+		{table_sym->name, strlen(table_sym->name)},
+		nullptr, n_cols, 0, flags, flags2);
 
 	mem_heap_t* heap = pars_sym_tab_global->heap;
 	column = column_defs;
@@ -1801,9 +1803,7 @@ pars_create_table(
 	}
 
 	dict_table_add_system_columns(table, heap);
-	node = tab_create_graph_create(table, heap,
-				       FIL_ENCRYPTION_DEFAULT,
-				       FIL_DEFAULT_ENCRYPTION_KEY);
+	node = tab_create_graph_create(table, heap);
 
 	table_sym->resolved = TRUE;
 	table_sym->token_type = SYM_TABLE;
@@ -1857,7 +1857,9 @@ pars_create_index(
 	}
 
 	node = ind_create_graph_create(index, table_sym->name,
-				       pars_sym_tab_global->heap);
+				       pars_sym_tab_global->heap,
+				       FIL_ENCRYPTION_DEFAULT,
+				       FIL_DEFAULT_ENCRYPTION_KEY);
 
 	table_sym->resolved = TRUE;
 	table_sym->token_type = SYM_TABLE;

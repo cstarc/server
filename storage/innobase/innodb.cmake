@@ -1,5 +1,5 @@
 # Copyright (c) 2006, 2016, Oracle and/or its affiliates. All rights reserved.
-# Copyright (c) 2017, 2020, MariaDB Corporation.
+# Copyright (c) 2017, 2021, MariaDB Corporation.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -53,16 +53,7 @@ ENDIF()
 # OS tests
 IF(UNIX)
   IF(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-
     ADD_DEFINITIONS("-DUNIV_LINUX -D_GNU_SOURCE=1")
-
-    CHECK_INCLUDE_FILES (libaio.h HAVE_LIBAIO_H)
-    CHECK_LIBRARY_EXISTS(aio io_queue_init "" HAVE_LIBAIO)
-
-    IF(HAVE_LIBAIO_H AND HAVE_LIBAIO)
-      ADD_DEFINITIONS(-DLINUX_NATIVE_AIO=1)
-      LINK_LIBRARIES(aio)
-    ENDIF()
     IF(HAVE_LIBNUMA)
       LINK_LIBRARIES(numa)
     ENDIF()
@@ -104,11 +95,6 @@ ENDIF()
 CHECK_FUNCTION_EXISTS(sched_getcpu  HAVE_SCHED_GETCPU)
 IF(HAVE_SCHED_GETCPU)
  ADD_DEFINITIONS(-DHAVE_SCHED_GETCPU=1)
-ENDIF()
-
-CHECK_FUNCTION_EXISTS(nanosleep HAVE_NANOSLEEP)
-IF(HAVE_NANOSLEEP)
- ADD_DEFINITIONS(-DHAVE_NANOSLEEP=1)
 ENDIF()
 
 IF(HAVE_FALLOC_PUNCH_HOLE_AND_KEEP_SIZE)

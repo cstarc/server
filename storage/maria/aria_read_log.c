@@ -24,7 +24,7 @@
 static const char *load_default_groups[]= { "aria_read_log",0 };
 static void get_options(int *argc,char * * *argv);
 #ifndef DBUG_OFF
-#if defined(__WIN__)
+#if defined(_WIN32)
 const char *default_dbug_option= "d:t:O,\\aria_read_log.trace";
 #else
 const char *default_dbug_option= "d:t:o,/tmp/aria_read_log.trace";
@@ -83,7 +83,7 @@ int main(int argc, char **argv)
   uint warnings_count;
   MY_INIT(argv[0]);
 
-  maria_data_root= (char *)".";
+  maria_data_root= ".";
   sf_leaking_memory=1; /* don't report memory leaks on early exits */
   load_defaults_or_exit("my", load_default_groups, &argc, &argv);
   default_argv= argv;
@@ -248,7 +248,7 @@ static struct my_option my_long_options[] =
     0, 0, 0, 0 },
   {"aria-log-dir-path", 'h',
     "Path to the directory where to store transactional log",
-    (uchar **) &maria_data_root, (uchar **) &maria_data_root, 0,
+    (char **) &maria_data_root, (char **) &maria_data_root, 0,
     GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
   { "page-buffer-size", 'P',
     "The size of the buffer used for index blocks for Aria tables",
@@ -269,11 +269,11 @@ static struct my_option my_long_options[] =
    &opt_silent, &opt_silent, 0,
    GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
   {"tables-to-redo", 'T',
-   "List of tables sepearated with , that we should apply REDO on. Use this if you only want to recover some tables",
+   "List of tables separated with , that we should apply REDO on. Use this if you only want to recover some tables",
    0, 0, 0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
   {"tmpdir", 't', "Path for temporary files. Multiple paths can be specified, "
    "separated by "
-#if defined( __WIN__) || defined(__NETWARE__)
+#if defined( _WIN32)
    "semicolon (;)"
 #else
    "colon (:)"
@@ -343,7 +343,8 @@ static uchar* my_hash_get_string(const uchar *record, size_t *length,
 
 static my_bool
 get_one_option(const struct my_option *opt,
-               char *argument, const char *filename __attribute__((unused)))
+               const char *argument,
+               const char *filename __attribute__((unused)))
 {
   switch (opt->id) {
   case '?':

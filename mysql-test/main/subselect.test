@@ -30,11 +30,15 @@ SET optimizer_switch='mrr=on,mrr_sort_keys=on,index_condition_pushdown=on';
 SET optimizer_use_condition_selectivity=4;
 
 select (select 2);
+
+--enable_prepare_warnings
 explain extended select (select 2);
 SELECT (SELECT 1) UNION SELECT (SELECT 2);
 explain extended SELECT (SELECT 1) UNION SELECT (SELECT 2);
 SELECT (SELECT (SELECT 0 UNION SELECT 0));
 explain extended SELECT (SELECT (SELECT 0 UNION SELECT 0));
+--disable_prepare_warnings
+
 -- error ER_ILLEGAL_REFERENCE
 SELECT (SELECT 1 FROM (SELECT 1) as b HAVING a=1) as a;
 -- error ER_ILLEGAL_REFERENCE
@@ -441,11 +445,15 @@ SELECT * FROM (SELECT 1) b WHERE 1 IN (SELECT *);
 CREATE TABLE t2 (id int(11) default NULL, KEY id (id)) ENGINE=MyISAM CHARSET=latin1;
 INSERT INTO t2 VALUES (1),(2);
 SELECT * FROM t2 WHERE id IN (SELECT 1);
+--enable_prepare_warnings
 EXPLAIN EXTENDED SELECT * FROM t2 WHERE id IN (SELECT 1);
+--disable_prepare_warnings
 SELECT * FROM t2 WHERE id IN (SELECT 1 UNION SELECT 3);
 SELECT * FROM t2 WHERE id IN (SELECT 1+(select 1));
+--enable_prepare_warnings
 EXPLAIN EXTENDED SELECT * FROM t2 WHERE id IN (SELECT 1+(select 1));
 EXPLAIN EXTENDED SELECT * FROM t2 WHERE id IN (SELECT 1 UNION SELECT 3);
+--disable_prepare_warnings
 SELECT * FROM t2 WHERE id IN (SELECT 5 UNION SELECT 3);
 SELECT * FROM t2 WHERE id IN (SELECT 5 UNION SELECT 2);
 -- error ER_UPDATE_TABLE_USED
@@ -501,7 +509,9 @@ select 1.5 > ALL (SELECT * from t1);
 select 10.5 > ALL (SELECT * from t1);
 select 1.5 > ANY (SELECT * from t1);
 select 10.5 > ANY (SELECT * from t1);
+--enable_prepare_warnings
 explain extended select (select a+1) from t1;
+--disable_prepare_warnings
 select (select a+1) from t1;
 drop table t1;
 
@@ -6168,6 +6178,41 @@ SELECT * FROM t t1 RIGHT JOIN t t2 ON (t2.pk = t1.pk)
   WHERE (t2.i, t2.pk) NOT IN ( SELECT t3.i, t3.i FROM t t3, t t4 ) AND t1.c = 'foo';
 
 DROP TABLE t;
+
+--echo #
+--echo # MDEV-25002: Outer reference in ON clause of subselect
+--echo #
+
+create table t1 (
+  pk int primary key,
+  a int
+) engine=myisam;
+insert into t1 values (1,1), (2,2);
+
+create table t2 (
+  pk int primary key,
+  b int
+) engine=myisam;
+insert into t2 values (1,1), (2,3);
+
+create table t3 (a int);
+insert into t3 values (1),(2);
+
+select a,
+       (select count(*) from t1, t2
+          where t2.pk=t3.a and t1.pk=1) as sq
+from t3;
+select a,
+       (select count(*) from t1 join t2 on t2.pk=t3.a
+          where t1.pk=1) as sq
+from t3;
+
+select a from t3
+  where a in (select t2.b from t1,t2 where t2.pk=t3.a and t1.pk=1);
+select a from t3
+  where a in (select t2.b from t1 join t2 on t2.pk=t3.a where t1.pk=1);
+
+drop table t1,t2,t3;
 
 --echo # End of 10.2 tests
 

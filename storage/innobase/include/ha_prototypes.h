@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 2006, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2017, 2020, MariaDB Corporation.
+Copyright (c) 2017, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -119,13 +119,6 @@ thd_has_edited_nontrans_tables(
 /*===========================*/
 	THD*	thd);	/*!< in: thread handle */
 
-/**
-Get high resolution timestamp for the current query start time.
-
-@retval timestamp in microseconds precision
-*/
-unsigned long long thd_query_start_micro(const MYSQL_THD thd);
-
 /*************************************************************//**
 Prints info of a THD object (== user session thread) to the given file. */
 void
@@ -135,16 +128,6 @@ innobase_mysql_print_thd(
 	THD*	thd,		/*!< in: pointer to a MySQL THD object */
 	uint	max_query_len);	/*!< in: max query length to print, or 0 to
 				   use the default max length */
-
-/*****************************************************************//**
-Log code calls this whenever log has been written and/or flushed up
-to a new position. We use this to notify upper layer of a new commit
-checkpoint when necessary.*/
-UNIV_INTERN
-void
-innobase_mysql_log_notify(
-/*======================*/
-	ib_uint64_t	flush_lsn);	/*!< in: LSN flushed to disk */
 
 /** Converts a MySQL type to an InnoDB type. Note that this function returns
 the 'mtype' of InnoDB. InnoDB differentiates between MySQL's old <= 4.1
@@ -209,13 +192,20 @@ innobase_casedn_str(
 	char*	a);	/*!< in/out: string to put in lower case */
 
 #ifdef WITH_WSREP
-int wsrep_innobase_kill_one_trx(THD *bf_thd, trx_t *victim_trx, bool signal);
 ulint wsrep_innobase_mysql_sort(int mysql_type, uint charset_number,
                              unsigned char* str, ulint str_length,
-                             unsigned int buf_length);
+                             ulint buf_length);
 #endif /* WITH_WSREP */
 
 extern "C" struct charset_info_st *thd_charset(THD *thd);
+
+/** Get high resolution timestamp for the current query start time.
+The timestamp is not anchored to any specific point in time,
+but can be used for comparison.
+@param thd user thread
+@retval timestamp in microseconds precision
+*/
+extern "C" unsigned long long thd_start_utime(const MYSQL_THD thd);
 
 /** Determines the current SQL statement.
 Thread unsafe, can only be called from the thread owning the THD.
@@ -247,45 +237,16 @@ innobase_get_at_most_n_mbchars(
 @param[in]	thd	thread handle, or NULL to query
 			the global innodb_tmpdir.
 @retval NULL if innodb_tmpdir="" */
-UNIV_INTERN
-const char*
-thd_innodb_tmpdir(
-	THD*	thd);
+const char *thd_innodb_tmpdir(THD *thd);
 
 /******************************************************************//**
 Returns the lock wait timeout for the current connection.
 @return the lock wait timeout, in seconds */
-ulong
+uint
 thd_lock_wait_timeout(
 /*==================*/
 	THD*	thd);	/*!< in: thread handle, or NULL to query
 			the global innodb_lock_wait_timeout */
-/** Get status of innodb_tmpdir.
-@param[in]	thd	thread handle, or NULL to query
-			the global innodb_tmpdir.
-@retval NULL if innodb_tmpdir="" */
-const char*
-thd_innodb_tmpdir(
-	THD*	thd);
-
-/**********************************************************************//**
-Get the current setting of the table_cache_size global parameter. We do
-a dirty read because for one there is no synchronization object and
-secondly there is little harm in doing so even if we get a torn read.
-@return SQL statement string */
-ulint
-innobase_get_table_cache_size(void);
-/*===============================*/
-
-/**********************************************************************//**
-Get the current setting of the lower_case_table_names global parameter from
-mysqld.cc. We do a dirty read because for one there is no synchronization
-object and secondly there is little harm in doing so even if we get a torn
-read.
-@return value of lower_case_table_names */
-ulint
-innobase_get_lower_case_table_names(void);
-/*=====================================*/
 
 /******************************************************************//**
 compare two character string case insensitively according to their charset. */
@@ -455,7 +416,6 @@ innobase_convert_to_filename_charset(
 
 /********************************************************************//**
 Helper function to push warnings from InnoDB internals to SQL-layer. */
-UNIV_INTERN
 void
 ib_push_warning(
 	trx_t*		trx,	/*!< in: trx */
@@ -465,7 +425,6 @@ ib_push_warning(
 
 /********************************************************************//**
 Helper function to push warnings from InnoDB internals to SQL-layer. */
-UNIV_INTERN
 void
 ib_push_warning(
 	void*		ithd,	/*!< in: thd */
@@ -475,7 +434,6 @@ ib_push_warning(
 
 /********************************************************************//**
 Helper function to push warnings from InnoDB internals to SQL-layer. */
-UNIV_INTERN
 void
 ib_foreign_warn(
 	trx_t*		trx,	/*!< in: trx */
@@ -495,19 +453,13 @@ normalize_table_name_c_low(
 	char*		norm_name,	/*!< out: normalized name as a
 					null-terminated string */
 	const char*	name,		/*!< in: table name string */
-	ibool		set_lower_case); /*!< in: TRUE if we want to set
+	bool		set_lower_case); /*!< in: true if we want to set
 					name to lower case */
-/** Update the system variable with the given value of the InnoDB
-buffer pool size.
-@param[in]	buf_pool_size	given value of buffer pool size.*/
-void
-innodb_set_buf_pool_size(ulonglong buf_pool_size);
 
 /** Create a MYSQL_THD for a background thread and mark it as such.
 @param name thread info for SHOW PROCESSLIST
 @return new MYSQL_THD */
-MYSQL_THD
-innobase_create_background_thd(const char* name);
+MYSQL_THD innobase_create_background_thd(const char* name);
 
 /** Destroy a background purge thread THD.
 @param[in]	thd	MYSQL_THD to destroy */

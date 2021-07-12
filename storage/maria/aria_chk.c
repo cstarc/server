@@ -37,6 +37,7 @@ static MY_TMPDIR maria_chk_tmpdir;
 static my_bool opt_transaction_logging, opt_debug;
 static my_bool opt_ignore_control_file, opt_require_control_file;
 static my_bool opt_warning_for_wrong_transid, opt_update_state;
+static my_bool have_control_file= 0;
 
 static const char *type_names[]=
 {
@@ -128,7 +129,7 @@ int main(int argc, char **argv)
   MY_INIT(argv[0]);
 
   my_setup_stacktrace();
-  default_log_dir= opt_log_dir= maria_data_root= (char *)".";
+  default_log_dir= opt_log_dir= maria_data_root= ".";
   maria_chk_init(&check_param);
   check_param.opt_lock_memory= 1;		/* Lock memory if possible */
   check_param.using_global_keycache = 0;
@@ -144,15 +145,19 @@ int main(int argc, char **argv)
   {
     if ((ma_control_file_open(FALSE, opt_require_control_file ||
                               !(check_param.testflag & T_SILENT),
-                              TRUE) &&
-         (opt_require_control_file ||
-          (opt_transaction_logging && (check_param.testflag & T_REP_ANY)))))
+                              TRUE)))
     {
-      error= 1;
-      goto end;
+      if (opt_require_control_file ||
+          (opt_transaction_logging && (check_param.testflag & T_REP_ANY)))
+      {
+        error= 1;
+        goto end;
+      }
     }
+    else
+      have_control_file= 1;
   }
-  else
+  if (!have_control_file)
     opt_warning_for_wrong_transid= 0;
 
   /*
@@ -322,7 +327,7 @@ static struct my_option my_long_options[] =
    0, GET_ULL, REQUIRED_ARG, -1, 0, 0, 0, 0, 0},
   {"datadir", 'h',
    "Path for control file (and logs if --logdir not used).",
-   &maria_data_root, 0, 0, GET_STR, REQUIRED_ARG,
+   (char**) &maria_data_root, 0, 0, GET_STR, REQUIRED_ARG,
    0, 0, 0, 0, 0, 0},
   {"logdir", OPT_LOG_DIR,
    "Path for log files.",
@@ -456,7 +461,7 @@ static struct my_option my_long_options[] =
     (char**) &maria_stats_method_str, (char**) &maria_stats_method_str, 0,
     GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
   { "zerofill", 'z',
-    "Fill empty space in data and index files with zeroes. This makes the data file movable between different servers.",
+    "Fill empty space in data and index files with zeroes. This makes the data file movable between different servers. It also fixes any wrong transaction or LSN numbers in the table after a crash or if someone removed the Aria log files.",
     0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0},
   { "zerofill-keep-lsn", OPT_ZEROFILL_KEEP_LSN,
     "Like --zerofill but does not zero out LSN of data/index pages;"
@@ -468,7 +473,7 @@ static struct my_option my_long_options[] =
 
 static void print_version(void)
 {
-  printf("%s  Ver 1.2 for %s on %s\n", my_progname, SYSTEM_TYPE,
+  printf("%s  Ver 1.3 for %s on %s\n", my_progname, SYSTEM_TYPE,
 	 MACHINE_TYPE);
 }
 
@@ -500,7 +505,7 @@ static void usage(void)
 		      maria_chk very silent.\n\
   -t, --tmpdir=path   Path for temporary files. Multiple paths can be\n\
                       specified, separated by ");
-#if defined( __WIN__) || defined(__NETWARE__)
+#if defined( _WIN32)
    printf("semicolon (;)");
 #else
    printf("colon (:)");
@@ -586,7 +591,7 @@ Recover (repair)/ options (When using '--recover' or '--safe-recover'):\n\
   -q, --quick         Faster repair by not modifying the data file.\n\
                       One can give a second '-q' to force aria_chk to\n\
 		      modify the original datafile in case of duplicate keys.\n\
-		      NOTE: Tables where the data file is currupted can't be\n\
+		      NOTE: Tables where the data file is corrupted can't be\n\
 		      fixed with this option.\n\
   -u, --unpack        Unpack file packed with ariapack.\n\
 ");
@@ -614,7 +619,9 @@ Recover (repair)/ options (When using '--recover' or '--safe-recover'):\n\
                       Find a record, a block at given offset belongs to.\n\
   -z,  --zerofill     Fill empty space in data and index files with zeroes.\n\
                       This makes the data file movable between different \n\
-                      servers.\n\
+                      servers.  It also fixes any wrong transaction or LSN\n\
+                      numbers in the table after a crash or if someone\n\
+                      removed the Aria log files.\n\
   --zerofill-keep-lsn Like --zerofill but does not zero out LSN of\n\
                       data/index pages.");
 
@@ -639,7 +646,8 @@ TYPELIB maria_stats_method_typelib= {
 
 static my_bool
 get_one_option(const struct my_option *opt,
-	       char *argument, const char *filename __attribute__((unused)))
+	       const char *argument,
+               const char *filename __attribute__((unused)))
 {
   switch (opt->id) {
 #ifdef __NETWARE__
@@ -978,7 +986,7 @@ static void get_options(register int *argc,register char ***argv)
 
   if (set_collation_name)
     if (!(set_collation= get_charset_by_name(set_collation_name,
-                                             MYF(MY_WME))))
+                                             MYF(MY_UTF8_IS_UTF8MB3 | MY_WME))))
       my_exit(1);
 
   if (maria_data_root != default_log_dir && opt_log_dir == default_log_dir)
@@ -1033,7 +1041,7 @@ static int maria_chk(HA_CHECK *param, char *filename)
                         0)))
   {
     /* Avoid twice printing of isam file name */
-    param->error_printed=1;
+    param->error_printed++;
     switch (my_errno) {
     case HA_ERR_CRASHED:
       _ma_check_print_error(param,"'%s' doesn't have a correct index definition. You need to recreate it before you can do a repair",filename);
@@ -1358,7 +1366,7 @@ static int maria_chk(HA_CHECK *param, char *filename)
       error= maria_zerofill(param, info, filename);
     if (!error)
     {
-      DBUG_PRINT("info", ("Reseting crashed state"));
+      DBUG_PRINT("info", ("Resetting crashed state"));
       share->state.changed&= ~(STATE_CHANGED | STATE_CRASHED_FLAGS |
                                STATE_IN_REPAIR);
     }
@@ -1422,7 +1430,7 @@ static int maria_chk(HA_CHECK *param, char *filename)
            share->state.open_count != 0)
           && (param->testflag & T_UPDATE_STATE))
         info->update|=HA_STATE_CHANGED | HA_STATE_ROW_CHANGED;
-      DBUG_PRINT("info", ("Reseting crashed state"));
+      DBUG_PRINT("info", ("Resetting crashed state"));
       share->state.changed&= ~(STATE_CHANGED | STATE_CRASHED_FLAGS |
                                STATE_IN_REPAIR);
     }
@@ -1505,8 +1513,7 @@ end2:
                 "the --force (-f) option or by not using the --quick (-q) "
                 "flag\n");
     }
-    else if (!(param->error_printed & 2) &&
-	     !(param->testflag & T_FORCE_CREATE))
+    else if (!(param->testflag & T_FORCE_CREATE))
       fprintf(stderr, "Aria table '%s' is corrupted\nFix it using switch "
               "\"-r\" or \"-o\"\n", filename);
   }
@@ -1587,10 +1594,20 @@ static void descript(HA_CHECK *param, register MARIA_HA *info, char *name)
     buff[MY_UUID_STRING_LENGTH]= 0;
     my_uuid2str(share->base.uuid, buff);
     printf("UUID:                %s\n", buff);
+    if (ma_control_file_inited() &&
+        memcmp(share->base.uuid, maria_uuid, MY_UUID_SIZE))
+      printf("Warning: File UUID not match control file UUID! "
+             "File is probably moved\n"
+             "It will be updated to new system on first usage if zerofill is "
+             "not done\n");
     pos=buff;
     if (share->state.changed & STATE_CRASHED)
       strmov(buff, share->state.changed & STATE_CRASHED_ON_REPAIR ?
              "crashed on repair" : "crashed");
+    else if (have_control_file &&
+             (share->state.changed & (STATE_MOVED | STATE_NOT_ZEROFILLED)) ==
+             (STATE_MOVED | STATE_NOT_ZEROFILLED))
+      strmov(buff, "moved from another system. Use --zerofill to fix it");
     else
     {
       if (share->state.open_count)
@@ -1609,6 +1626,8 @@ static void descript(HA_CHECK *param, register MARIA_HA *info, char *name)
 	pos=strmov(pos,"zerofilled,");
       if (!(share->state.changed & STATE_NOT_MOVABLE))
 	pos=strmov(pos,"movable,");
+      if (have_control_file && (share->state.changed & STATE_MOVED))
+	pos=strmov(pos,"moved,");
       pos[-1]=0;				/* Remove extra ',' */
     }
     printf("Status:              %s\n",buff);

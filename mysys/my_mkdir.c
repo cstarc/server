@@ -18,7 +18,7 @@
 #include "mysys_err.h"
 #include <sys/types.h>
 #include <sys/stat.h>
-#ifdef __WIN__
+#ifdef _WIN32
 #include <direct.h>
 #endif
 
@@ -39,7 +39,7 @@ int my_mkdir(const char *dir, int Flags, myf MyFlags)
   {
 #endif
     my_errno=errno;
-    DBUG_PRINT("error",("error %d when creating direcory %s",my_errno,dir));
+    DBUG_PRINT("error",("error %d when creating directory %s",my_errno,dir));
     if (MyFlags & (MY_FFNF | MY_FAE | MY_WME))
       my_error(EE_CANT_MKDIR,  MYF(ME_BELL), dir, my_errno);
     DBUG_RETURN(-1);

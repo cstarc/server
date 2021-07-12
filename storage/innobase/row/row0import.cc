@@ -1839,7 +1839,8 @@ PageConverter::update_records(
 
 		if (deleted || clust_index) {
 			m_offsets = rec_get_offsets(
-				rec, m_index->m_srv_index, m_offsets, true,
+				rec, m_index->m_srv_index, m_offsets,
+				m_index->m_srv_index->n_core_fields,
 				ULINT_UNDEFINED, &m_heap);
 		}
 
@@ -1880,37 +1881,32 @@ dberr_t
 PageConverter::update_index_page(
 	buf_block_t*	block) UNIV_NOTHROW
 {
-	index_id_t	id;
-	buf_frame_t*	page = block->frame;
 	const page_id_t page_id(block->page.id());
 
 	if (is_free(page_id.page_no())) {
 		return(DB_SUCCESS);
-	} else if ((id = btr_page_get_index_id(page)) != m_index->m_id) {
+	}
 
-		row_index_t*	index = find_index(id);
+	buf_frame_t* page = block->frame;
+	const index_id_t id = btr_page_get_index_id(page);
+
+	if (id != m_index->m_id) {
+		row_index_t* index = find_index(id);
 
 		if (UNIV_UNLIKELY(!index)) {
-			ib::error() << "Page for tablespace " << m_space
-				<< " is index page with id " << id
-				<< " but that index is not found from"
-				<< " configuration file. Current index name "
-				<< m_index->m_name << " and id " <<  m_index->m_id;
-			m_index = 0;
-			return(DB_CORRUPTION);
+			ib::warn() << "Unknown index id " << id
+				   << " on page " << page_id.page_no();
+			return DB_SUCCESS;
 		}
 
-		/* Update current index */
 		m_index = index;
 	}
 
 	/* If the .cfg file is missing and there is an index mismatch
 	then ignore the error. */
-	if (m_cfg->m_missing && (m_index == 0 || m_index->m_srv_index == 0)) {
+	if (m_cfg->m_missing && !m_index->m_srv_index) {
 		return(DB_SUCCESS);
 	}
-
-
 
 	if (m_index && page_id.page_no() == m_index->m_page_no) {
 		byte *b = FIL_PAGE_DATA + PAGE_BTR_SEG_LEAF + FSEG_HDR_SPACE
@@ -3335,6 +3331,64 @@ struct fil_iterator_t {
 	byte*           crypt_io_buffer;        /*!< IO buffer when encrypted */
 };
 
+
+/** InnoDB writes page by page when there is page compressed
+tablespace involved. It does help to save the disk space when
+punch hole is enabled
+@param iter     Tablespace iterator
+@param full_crc32    whether the file is in the full_crc32 format
+@param offset   offset of the file to be written
+@param writeptr buffer to be written
+@param n_bytes  number of bytes to be written
+@param try_punch_only   Try the range punch only because the
+                        current range is full of empty pages
+@return DB_SUCCESS */
+static
+dberr_t fil_import_compress_fwrite(const fil_iterator_t &iter,
+                                   bool full_crc32,
+                                   os_offset_t offset,
+                                   const byte *writeptr,
+                                   ulint n_bytes,
+                                   bool try_punch_only= false)
+{
+  if (dberr_t err= os_file_punch_hole(iter.file, offset, n_bytes))
+    return err;
+
+  if (try_punch_only)
+    return DB_SUCCESS;
+
+  for (ulint j= 0; j < n_bytes; j+= srv_page_size)
+  {
+    /* Read the original data length from block and
+    safer to read FIL_PAGE_COMPRESSED_SIZE because it
+    is not encrypted*/
+    ulint n_write_bytes= srv_page_size;
+    if (j || offset)
+    {
+      n_write_bytes= mach_read_from_2(writeptr + j + FIL_PAGE_DATA);
+      const unsigned ptype= mach_read_from_2(writeptr + j + FIL_PAGE_TYPE);
+      /* Ignore the empty page */
+      if (ptype == 0 && n_write_bytes == 0)
+        continue;
+      if (full_crc32)
+        n_write_bytes= buf_page_full_crc32_size(writeptr + j,
+                                                nullptr, nullptr);
+      else
+      {
+        n_write_bytes+= ptype == FIL_PAGE_PAGE_COMPRESSED_ENCRYPTED
+          ? FIL_PAGE_DATA + FIL_PAGE_ENCRYPT_COMP_METADATA_LEN
+          : FIL_PAGE_DATA + FIL_PAGE_COMP_METADATA_LEN;
+      }
+    }
+
+    if (dberr_t err= os_file_write(IORequestWrite, iter.filepath, iter.file,
+                                   writeptr + j, offset + j, n_write_bytes))
+      return err;
+  }
+
+  return DB_SUCCESS;
+}
+
 /********************************************************************//**
 TODO: This can be made parallel trivially by chunking up the file and creating
 a callback per thread. . Main benefit will be to use multiple CPUs for
@@ -3380,7 +3434,9 @@ fil_iterate(
 	/* TODO: For ROW_FORMAT=COMPRESSED tables we do a lot of useless
 	copying for non-index pages. Unfortunately, it is
 	required by buf_zip_decompress() */
-	dberr_t err = DB_SUCCESS;
+	dberr_t		err = DB_SUCCESS;
+	bool		page_compressed = false;
+	bool		punch_hole = !my_test_if_thinly_provisioned(iter.file);
 
 	for (offset = iter.start; offset < iter.end; offset += n_bytes) {
 		if (callback.is_interrupted()) {
@@ -3458,7 +3514,7 @@ page_corrupted:
 			}
 
 			const uint16_t type = fil_page_get_type(src);
-			const bool page_compressed =
+			page_compressed =
 				(full_crc32
 				 && fil_space_t::is_compressed(
 					callback.get_space_flags())
@@ -3650,8 +3706,20 @@ not_encrypted:
 			}
 		}
 
-		/* A page was updated in the set, write back to disk. */
-		if (updated) {
+		if (page_compressed && punch_hole) {
+			err = fil_import_compress_fwrite(
+				iter, full_crc32, offset, writeptr, n_bytes,
+				!updated);
+
+			if (err != DB_SUCCESS) {
+				punch_hole = false;
+				if (updated) {
+					goto normal_write;
+				}
+			}
+		} else if (updated) {
+normal_write:
+			/* A page was updated in the set, write it back. */
 			err = os_file_write(IORequestWrite,
 					    iter.filepath, iter.file,
 					    writeptr, offset, n_bytes);
@@ -3694,16 +3762,15 @@ fil_tablespace_iterate(
 	/* Make sure the data_dir_path is set. */
 	dict_get_and_save_data_dir_path(table, false);
 
-	if (DICT_TF_HAS_DATA_DIR(table->flags)) {
-		ut_a(table->data_dir_path);
+	ut_ad(!DICT_TF_HAS_DATA_DIR(table->flags) || table->data_dir_path);
 
-		filepath = fil_make_filepath(
-			table->data_dir_path, table->name.m_name, IBD, true);
-	} else {
-		filepath = fil_make_filepath(
-			NULL, table->name.m_name, IBD, false);
-	}
+	const char *data_dir_path = DICT_TF_HAS_DATA_DIR(table->flags)
+		? table->data_dir_path : nullptr;
 
+	filepath = fil_make_filepath(data_dir_path,
+				     {table->name.m_name,
+				      strlen(table->name.m_name)},
+				     IBD, data_dir_path != nullptr);
 	if (!filepath) {
 		return(DB_OUT_OF_MEMORY);
 	} else {
@@ -3860,18 +3927,12 @@ row_import_for_mysql(
 
 	trx = trx_create();
 
-	/* So that the table is not DROPped during recovery. */
-	trx_set_dict_operation(trx, TRX_DICT_OP_INDEX);
+	trx->dict_operation = true;
 
 	trx_start_if_not_started(trx, true);
 
 	/* So that we can send error messages to the user. */
 	trx->mysql_thd = prebuilt->trx->mysql_thd;
-
-	/* Ensure that the table will be dropped by trx_rollback_active()
-	in case of a crash. */
-
-	trx->table_id = table->id;
 
 	/* Assign an undo segment for the transaction, so that the
 	transaction will be recovered after a crash. */
@@ -4028,16 +4089,13 @@ row_import_for_mysql(
 	dict_get_and_save_data_dir_path(table, true);
 
 	ut_ad(!DICT_TF_HAS_DATA_DIR(table->flags) || table->data_dir_path);
+	const char *data_dir_path = DICT_TF_HAS_DATA_DIR(table->flags)
+		? table->data_dir_path : nullptr;
+	fil_space_t::name_type name{
+		table->name.m_name, strlen(table->name.m_name)};
 
-	if (DICT_TF_HAS_DATA_DIR(table->flags)) {
-		ut_a(table->data_dir_path);
-
-		filepath = fil_make_filepath(
-			table->data_dir_path, table->name.m_name, IBD, true);
-	} else {
-		filepath = fil_make_filepath(
-			NULL, table->name.m_name, IBD, false);
-	}
+	filepath = fil_make_filepath(data_dir_path, name, IBD,
+				     data_dir_path != nullptr);
 
 	DBUG_EXECUTE_IF(
 		"ib_import_OOM_15",
@@ -4061,7 +4119,7 @@ row_import_for_mysql(
 
 	table->space = fil_ibd_open(
 		true, FIL_TYPE_IMPORT, table->space_id,
-		fsp_flags, table->name, filepath, &err);
+		fsp_flags, name, filepath, &err);
 
 	ut_ad((table->space == NULL) == (err != DB_SUCCESS));
 	DBUG_EXECUTE_IF("ib_import_open_tablespace_failure",
@@ -4155,7 +4213,17 @@ row_import_for_mysql(
 	/* Ensure that all pages dirtied during the IMPORT make it to disk.
 	The only dirty pages generated should be from the pessimistic purge
 	of delete marked records that couldn't be purged in Phase I. */
-	while (buf_flush_dirty_pages(prebuilt->table->space_id));
+	while (buf_flush_list_space(prebuilt->table->space));
+
+	for (ulint count = 0; prebuilt->table->space->referenced(); count++) {
+		/* Issue a warning every 10.24 seconds, starting after
+		2.56 seconds */
+		if ((count & 511) == 128) {
+			ib::warn() << "Waiting for flush to complete on "
+				   << prebuilt->table->name;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	}
 
 	ib::info() << "Phase IV - Flush complete";
 	prebuilt->table->space->set_imported();

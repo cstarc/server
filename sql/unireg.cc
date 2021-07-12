@@ -57,13 +57,7 @@ static bool make_empty_rec(THD *, uchar *, uint, List<Create_field> &, uint,
 */
 static uchar *extra2_write_len(uchar *pos, size_t len)
 {
-  /* TODO: should be
-     if (len > 0 && len <= 255)
-       *pos++= (uchar)len;
-     ...
-     because extra2_read_len() uses 0 for 2-byte lengths.
-     extra2_str_size() must be fixed too.
-  */
+  DBUG_ASSERT(len);
   if (len <= 255)
     *pos++= (uchar)len;
   else
@@ -125,8 +119,23 @@ static uchar *extra2_write_field_properties(uchar *pos,
   return pos;
 }
 
-static uint16
-get_fieldno_by_name(HA_CREATE_INFO *create_info, List<Create_field> &create_fields,
+static uchar *extra2_write_index_properties(uchar *pos, const KEY *keyinfo,
+                                            uint keys)
+{
+  *pos++= EXTRA2_INDEX_FLAGS;
+  pos= extra2_write_len(pos, keys);
+  for (uint i=0; i < keys; i++)
+  {
+    *pos++= keyinfo[i].is_ignored ?
+            EXTRA2_IGNORED_KEY :
+            EXTRA2_DEFAULT_INDEX_FLAGS;
+  }
+  return pos;
+}
+
+static field_index_t
+get_fieldno_by_name(HA_CREATE_INFO *create_info,
+                    List<Create_field> &create_fields,
                     const Lex_ident &field_name)
 {
   List_iterator<Create_field> it(create_fields);
@@ -134,17 +143,17 @@ get_fieldno_by_name(HA_CREATE_INFO *create_info, List<Create_field> &create_fiel
 
   DBUG_ASSERT(field_name);
 
-  for (unsigned field_no = 0; (sql_field = it++); ++field_no)
+  for (field_index_t field_no= 0; (sql_field = it++); ++field_no)
   {
     if (field_name.streq(sql_field->field_name))
     {
-      DBUG_ASSERT(field_no <= uint16(~0U));
-      return uint16(field_no);
+      DBUG_ASSERT(field_no < NO_CACHED_FIELD_INDEX);
+      return field_no;
     }
   }
 
   DBUG_ASSERT(0); /* Not Reachable */
-  return 0;
+  return NO_CACHED_FIELD_INDEX;
 }
 
 static inline
@@ -409,6 +418,14 @@ LEX_CUSTRING build_frm_image(THD *thd, const LEX_CSTRING &table,
     extra2_size+= 1 + extra2_str_size(create_fields.elements);
   }
 
+  /*
+    To store the ignorability flag for each key.
+    Here 1 bytes is reserved to store the extra index flags for keys.
+    Currently only 1 bit is used, rest of the bits can be used in the future
+  */
+  if (keys)
+    extra2_size+= 1 + extra2_str_size(keys);
+
   for (i= 0; i < keys; i++)
     if (key_info[i].algorithm == HA_KEY_ALG_LONG_HASH)
       e_unique_hash_extra_parts++;
@@ -524,6 +541,10 @@ LEX_CUSTRING build_frm_image(THD *thd, const LEX_CSTRING &table,
 
   if (has_extra2_field_flags_)
     pos= extra2_write_field_properties(pos, create_fields);
+
+
+  if (keys)
+    pos= extra2_write_index_properties(pos, key_info, keys);
 
   int4store(pos, filepos); // end of the extra2 segment
   pos+= 4;
@@ -849,7 +870,7 @@ static bool pack_header(THD *thd, uchar *forminfo,
       as auto-update field.
     */
     if (field->real_field_type() == MYSQL_TYPE_TIMESTAMP &&
-        MTYP_TYPENR(field->unireg_check) != Field::NONE &&
+        field->unireg_check != Field::NONE &&
 	!time_stamp_pos)
       time_stamp_pos= (uint) field->offset+ (uint) data_offset + 1;
     length=field->pack_length;
@@ -1151,6 +1172,8 @@ static bool make_empty_rec(THD *thd, uchar *buff, uint table_options,
   TABLE table;
   TABLE_SHARE share;
   Create_field *field;
+  Check_level_instant_set old_count_cuted_fields(thd, CHECK_FIELD_WARN);
+  Abort_on_warning_instant_set old_abort_on_warning(thd, 0);
   DBUG_ENTER("make_empty_rec");
 
   /* We need a table to generate columns for default values */
@@ -1169,7 +1192,6 @@ static bool make_empty_rec(THD *thd, uchar *buff, uint table_options,
   null_pos= buff;
 
   List_iterator<Create_field> it(create_fields);
-  Check_level_instant_set check_level_save(thd, CHECK_FIELD_WARN);
   while ((field=it++))
   {
     Record_addr addr(buff + field->offset + data_offset,

@@ -1948,6 +1948,28 @@ dberr_t trx_undo_report_rename(trx_t* trx, const dict_table_t* table)
 	return err;
 }
 
+ATTRIBUTE_COLD ATTRIBUTE_NOINLINE
+/** @return whether the transaction holds an exclusive lock on a table */
+static bool trx_has_lock_x(const trx_t &trx, dict_table_t& table)
+{
+  if (table.is_temporary())
+    return true;
+
+  table.lock_mutex_lock();
+  const auto n= table.n_lock_x_or_s;
+  table.lock_mutex_unlock();
+
+  /* This thread is executing trx. No other thread can modify our table locks
+  (only record locks might be created, in an implicit-to-explicit conversion).
+  Hence, no mutex is needed here. */
+  if (n == 1)
+    for (const lock_t *lock : trx.lock.table_locks)
+      if (lock && lock->type_mode == (LOCK_X | LOCK_TABLE))
+        return true;
+
+  return false;
+}
+
 /***********************************************************************//**
 Writes information to an undo log about an insert, update, or a delete marking
 of a clustered index record. This information is used in a rollback of the
@@ -2012,12 +2034,10 @@ trx_undo_report_row_operation(
 		/* We already wrote a TRX_UNDO_EMPTY record. */
 		ut_ad(thr->run_node);
 		ut_ad(que_node_get_type(thr->run_node) == QUE_NODE_INSERT);
-		ut_ad(static_cast<ins_node_t*>(thr->run_node)->bulk_insert);
+		ut_ad(trx->bulk_insert);
 		return DB_SUCCESS;
-	} else if (m.second
-		   && thr->run_node
-		   && que_node_get_type(thr->run_node) == QUE_NODE_INSERT
-		   && static_cast<ins_node_t*>(thr->run_node)->bulk_insert) {
+	} else if (m.second && trx->bulk_insert
+		   && trx_has_lock_x(*trx, *index->table)) {
 		m.first->second.start_bulk_insert();
 	} else {
 		bulk = false;
@@ -2092,9 +2112,9 @@ err_exit:
 					mtr.set_log_mode(MTR_LOG_NO_REDO);
 				}
 
-				mysql_mutex_lock(&rseg->mutex);
+				rseg->latch.wr_lock();
 				trx_undo_free_last_page(undo, &mtr);
-				mysql_mutex_unlock(&rseg->mutex);
+				rseg->latch.wr_unlock();
 
 				if (m.second) {
 					/* We are not going to modify
@@ -2121,12 +2141,11 @@ err_exit:
 					   - FIL_PAGE_DATA_END, 0);
 			}
 
-			mtr_commit(&mtr);
+			mtr.commit();
 		} else {
 			/* Success */
-			mtr_commit(&mtr);
-
 			undo->top_page_no = undo_block->page.id().page_no();
+			mtr.commit();
 			undo->top_offset  = offset;
 			undo->top_undo_no = trx->undo_no++;
 			undo->guess_block = undo_block;
@@ -2147,8 +2166,8 @@ err_exit:
 
 			if (!bulk) {
 				*roll_ptr = trx_undo_build_roll_ptr(
-					!rec, rseg->id, undo->top_page_no,
-					offset);
+					!rec, trx_sys.rseg_id(rseg, !is_temp),
+					undo->top_page_no, offset);
 			}
 
 			return(DB_SUCCESS);
@@ -2201,7 +2220,6 @@ trx_undo_get_undo_rec_low(
 	ulint		rseg_id;
 	uint32_t	page_no;
 	uint16_t	offset;
-	trx_rseg_t*	rseg;
 	bool		is_insert;
 	mtr_t		mtr;
 
@@ -2209,7 +2227,7 @@ trx_undo_get_undo_rec_low(
 				 &offset);
 	ut_ad(page_no > FSP_FIRST_INODE_PAGE_NO);
 	ut_ad(offset >= TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_HDR_SIZE);
-	rseg = trx_sys.rseg_array[rseg_id];
+	trx_rseg_t* rseg = &trx_sys.rseg_array[rseg_id];
 	ut_ad(rseg->is_persistent());
 
 	mtr.start();
@@ -2513,7 +2531,8 @@ trx_undo_prev_version_build(
 	rec_offs offsets_dbg[REC_OFFS_NORMAL_SIZE];
 	rec_offs_init(offsets_dbg);
 	ut_a(!rec_offs_any_null_extern(
-		*old_vers, rec_get_offsets(*old_vers, index, offsets_dbg, true,
+		*old_vers, rec_get_offsets(*old_vers, index, offsets_dbg,
+					   index->n_core_fields,
 					   ULINT_UNDEFINED, &heap)));
 #endif // defined UNIV_DEBUG || defined UNIV_BLOB_LIGHT_DEBUG
 

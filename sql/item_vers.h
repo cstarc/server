@@ -22,23 +22,52 @@
 #pragma interface			/* gcc class implementation */
 #endif
 
+class Item_func_history: public Item_bool_func
+{
+public:
+  /*
+     @param    a  Item_field for row_end system field
+  */
+  Item_func_history(THD *thd, Item *a): Item_bool_func(thd, a)
+  {
+    DBUG_ASSERT(a->type() == Item::FIELD_ITEM);
+  }
+
+  bool val_bool() override;
+  longlong val_int() override { return val_bool(); }
+  bool fix_length_and_dec() override
+  {
+    set_maybe_null();
+    null_value= 0;
+    decimals= 0;
+    max_length= 1;
+    return FALSE;
+  }
+  LEX_CSTRING func_name_cstring() const override
+  {
+    static LEX_CSTRING name= {STRING_WITH_LEN("is_history") };
+    return name;
+  }
+  void print(String *str, enum_query_type query_type) override;
+  Item *get_copy(THD *thd) override
+  { return get_item_copy<Item_func_history>(thd, this); }
+};
+
 class Item_func_trt_ts: public Item_datetimefunc
 {
   TR_table::field_id_t trt_field;
 public:
   Item_func_trt_ts(THD *thd, Item* a, TR_table::field_id_t _trt_field);
-  const char *func_name() const
+  LEX_CSTRING func_name_cstring() const override
   {
-    if (trt_field == TR_table::FLD_BEGIN_TS)
-    {
-      return "trt_begin_ts";
-    }
-    return "trt_commit_ts";
+    static LEX_CSTRING begin_name=  {STRING_WITH_LEN("trt_begin_ts") };
+    static LEX_CSTRING commit_name= {STRING_WITH_LEN("trt_commit_ts") };
+    return (trt_field == TR_table::FLD_BEGIN_TS) ? begin_name : commit_name;
   }
-  bool get_date(THD *thd, MYSQL_TIME *res, date_mode_t fuzzydate);
-  Item *get_copy(THD *thd)
+  bool get_date(THD *thd, MYSQL_TIME *res, date_mode_t fuzzydate) override;
+  Item *get_copy(THD *thd) override
   { return get_item_copy<Item_func_trt_ts>(thd, this); }
-  bool fix_length_and_dec()
+  bool fix_length_and_dec() override
   { fix_attributes_datetime(decimals); return FALSE; }
 };
 
@@ -54,31 +83,34 @@ public:
   Item_func_trt_id(THD *thd, Item* a, TR_table::field_id_t _trt_field, bool _backwards= false);
   Item_func_trt_id(THD *thd, Item* a, Item* b, TR_table::field_id_t _trt_field);
 
-  const char *func_name() const
+  LEX_CSTRING func_name_cstring() const override
   {
-    switch (trt_field)
-    {
+    static LEX_CSTRING trx_name= {STRING_WITH_LEN("trt_trx_id") };
+    static LEX_CSTRING commit_name= {STRING_WITH_LEN("trt_commit_id") };
+    static LEX_CSTRING iso_name= {STRING_WITH_LEN("trt_iso_level") };
+
+    switch (trt_field) {
     case TR_table::FLD_TRX_ID:
-      return "trt_trx_id";
+      return trx_name;
     case TR_table::FLD_COMMIT_ID:
-        return "trt_commit_id";
+      return commit_name;
     case TR_table::FLD_ISO_LEVEL:
-      return "trt_iso_level";
+      return iso_name;
     default:
       DBUG_ASSERT(0);
     }
-    return NULL;
+    return NULL_clex_str;
   }
 
-  bool fix_length_and_dec()
+  bool fix_length_and_dec() override
   {
     bool res= Item_int_func::fix_length_and_dec();
     max_length= 20;
     return res;
   }
 
-  longlong val_int();
-  Item *get_copy(THD *thd)
+  longlong val_int() override;
+  Item *get_copy(THD *thd) override
   { return get_item_copy<Item_func_trt_id>(thd, this); }
 };
 
@@ -89,12 +121,13 @@ protected:
 
 public:
   Item_func_trt_trx_sees(THD *thd, Item* a, Item* b);
-  const char *func_name() const
+  LEX_CSTRING func_name_cstring() const override
   {
-    return "trt_trx_sees";
+    static LEX_CSTRING name= {STRING_WITH_LEN("trt_trx_sees") };
+    return name;
   }
-  longlong val_int();
-  Item *get_copy(THD *thd)
+  longlong val_int() override;
+  Item *get_copy(THD *thd) override
   { return get_item_copy<Item_func_trt_trx_sees>(thd, this); }
 };
 
@@ -107,9 +140,10 @@ public:
   {
     accept_eq= true;
   }
-  const char *func_name() const
+  LEX_CSTRING func_name_cstring() const override
   {
-    return "trt_trx_sees_eq";
+    static LEX_CSTRING name= {STRING_WITH_LEN("trt_trx_sees_eq") };
+    return name;
   }
 };
 

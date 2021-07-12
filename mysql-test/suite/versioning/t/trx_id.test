@@ -5,6 +5,10 @@ if (!$TEST_VERSIONING_SO)
 --source include/have_innodb.inc
 --source include/default_charset.inc
 
+--disable_query_log
+--eval install plugin test_versioning soname '$TEST_VERSIONING_SO'
+--enable_query_log
+
 set default_storage_engine= innodb;
 
 create or replace table t1 (
@@ -13,6 +17,8 @@ create or replace table t1 (
   sys_trx_end bigint(20) unsigned as row end invisible,
   period for system_time (sys_trx_start, sys_trx_end)
 ) with system versioning;
+
+--enable_prepare_warnings
 
 --echo # No history inside the transaction
 start transaction;
@@ -499,6 +505,13 @@ alter table t add `row_start` bigint unsigned as row start,
               add period for system_time(`row_start`,`row_end`),
               modify x int after row_start,
               with system versioning;
+drop table t;
 
+--echo #
+--echo # MDEV-20842 Crash using versioning plugin functions after plugin was removed from server
+--echo #
+uninstall plugin test_versioning;
+--error ER_SP_DOES_NOT_EXIST
+select trt_begin_ts(0);
 
-create or replace database test;
+--disable_prepare_warnings

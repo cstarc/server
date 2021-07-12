@@ -1,6 +1,6 @@
 /*
    Copyright (c) 2002, 2013, Oracle and/or its affiliates.
-   Copyright (c) 2011, 2020, MariaDB Corporation.
+   Copyright (c) 2011, 2021, MariaDB Corporation.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -143,8 +143,6 @@ int MBR::within(const MBR *mbr)
 
 
 /***************************** Gis_class_info *******************************/
-
-String Geometry::bad_geometry_data("Bad object", &my_charset_bin);
 
 Geometry::Class_info *Geometry::ci_collection[Geometry::wkb_last+1]=
 {
@@ -382,7 +380,7 @@ int Geometry::as_json(String *wkt, uint max_dec_digits, const char **end)
   if (wkt->reserve(4 + type_keyname_len + 2 + len + 2 + 2 +
                    coord_keyname_len + 4, 512))
     return 1;
-  wkt->qs_append("\"", 1);
+  wkt->qs_append('"');
   wkt->qs_append((const char *) type_keyname, type_keyname_len);
   wkt->qs_append("\": \"", 4);
   wkt->qs_append(get_class_info()->m_geojson_name.str, len);
@@ -406,7 +404,7 @@ int Geometry::bbox_as_json(String *wkt)
   const char *end;
   if (wkt->reserve(5 + bbox_keyname_len + (FLOATING_POINT_DECIMALS+2)*4, 512))
     return 1;
-  wkt->qs_append("\"", 1);
+  wkt->qs_append('"');
   wkt->qs_append((const char *) bbox_keyname, bbox_keyname_len);
   wkt->qs_append("\": [", 4);
 
@@ -420,7 +418,7 @@ int Geometry::bbox_as_json(String *wkt)
   wkt->qs_append(mbr.xmax);
   wkt->qs_append(", ", 2);
   wkt->qs_append(mbr.ymax);
-  wkt->qs_append("]", 1);
+  wkt->qs_append(']');
 
   return 0;
 }
@@ -565,7 +563,11 @@ Geometry *Geometry::create_from_json(Geometry_buffer *buffer,
             goto handle_geometry_key;
           feature_type_found= 1;
         }
+        else /* can't understand the type. */
+          break;
       }
+      else /* The "type" value can only be string. */
+        break;
     }
     else if (key_len == coord_keyname_len &&
              memcmp(key_buf, coord_keyname, coord_keyname_len) == 0)
@@ -582,6 +584,8 @@ Geometry *Geometry::create_from_json(Geometry_buffer *buffer,
         coord_start= je->value_begin;
         if (ci && ci != &geometrycollection_class)
           goto create_geom;
+        if (json_skip_level(je))
+          goto err_return;
       }
     }
     else if (key_len == geometries_keyname_len &&
@@ -631,6 +635,7 @@ Geometry *Geometry::create_from_json(Geometry_buffer *buffer,
         if (feature_type_found)
           goto handle_geometry_key;
       }
+      goto err_return;
     }
     else
     {
@@ -1056,6 +1061,127 @@ const Geometry::Class_info *Gis_point::get_class_info() const
 }
 
 
+/**
+  Function to calculate haversine.
+  Taking as arguments Point and Multipoint geometries.
+  Multipoint geometry has to be single point only.
+  It is up to caller to ensure valid input.
+
+  @param    g      pointer to the Geometry
+  @param    r      sphere radius
+  @param    error  pointer describing the error in case of the boundary conditions
+
+  @return distance in case without error, it is caclulcated distance (non-negative),
+                   in case error exist, negative value.
+*/
+double Gis_point::calculate_haversine(const Geometry *g,
+                                      const double sphere_radius,
+                                      int *error)
+{
+  DBUG_ASSERT(sphere_radius > 0);
+  double x1r, x2r, y1r, y2r;
+
+  // This check is done only for optimization purposes where we know it will
+  // be one and only one point in Multipoint
+  if (g->get_class_info()->m_type_id == Geometry::wkb_multipoint)
+  {
+    const char point_size= 4 + WKB_HEADER_SIZE + POINT_DATA_SIZE+1; //1 for the type
+    char point_temp[point_size];
+    memset(point_temp+4, Geometry::wkb_point, 1);
+    memcpy(point_temp+5, static_cast<const Gis_multi_point *>(g)->get_data_ptr()+5, 4);
+    memcpy(point_temp+4+WKB_HEADER_SIZE, g->get_data_ptr()+4+WKB_HEADER_SIZE,
+           POINT_DATA_SIZE);
+    point_temp[point_size-1]= '\0';
+    Geometry_buffer gbuff;
+    Geometry *gg= Geometry::construct(&gbuff, point_temp, point_size-1);
+    DBUG_ASSERT(gg);
+    if (static_cast<Gis_point *>(gg)->get_xy_radian(&x2r, &y2r))
+    {
+      DBUG_ASSERT(0);
+      return -1;
+    }
+  }
+  else
+  {
+    if (static_cast<const Gis_point *>(g)->get_xy_radian(&x2r, &y2r))
+    {
+      DBUG_ASSERT(0);
+      return -1;
+    }
+  }
+  if (this->get_xy_radian(&x1r, &y1r))
+  {
+    DBUG_ASSERT(0);
+    return -1;
+  }
+  // Check boundary conditions: longitude[-180,180]
+  if (!((x2r >= -M_PI && x2r <= M_PI) && (x1r >= -M_PI && x1r <= M_PI)))
+  {
+    *error=1;
+    return -1;
+  }
+  // Check boundary conditions: latitude[-90,90]
+  if (!((y2r >= -M_PI/2 && y2r <= M_PI/2) && (y1r >= -M_PI/2 && y1r <= M_PI/2)))
+  {
+    *error=-1;
+    return -1;
+  }
+  double dlat= sin((y2r - y1r)/2)*sin((y2r - y1r)/2);
+  double dlong= sin((x2r - x1r)/2)*sin((x2r - x1r)/2);
+  return 2*sphere_radius*asin((sqrt(dlat + cos(y1r)*cos(y2r)*dlong)));
+}
+
+
+/**
+  Function that calculate spherical distance of Point from Multipoint geometries.
+  In case there is single point in Multipoint geometries calculate_haversine()
+  can handle such case. Otherwise, new geometry (Point) has to be constructed.
+
+  @param    g pointer to the Geometry
+  @param    r sphere radius
+  @param    result pointer to the result
+  @param    err    pointer to the error obtained from calculate_haversin()
+
+  @return state
+  @retval TRUE  failed
+  @retval FALSE success
+*/
+int Gis_point::spherical_distance_multipoints(Geometry *g, const double r,
+                                              double *result, int *err)
+{  
+  uint32 num_of_points2;
+    // To find the minimum radius it cannot be greater than Earth radius
+  double res= 6370986.0;
+  double temp_res= 0.0;
+  const uint32 len= 4 + WKB_HEADER_SIZE + POINT_DATA_SIZE + 1;
+  char s[len];
+  g->num_geometries(&num_of_points2);
+  DBUG_ASSERT(num_of_points2 >= 1);
+  if (num_of_points2 == 1)
+  {
+    *result= this->calculate_haversine(g, r, err);
+    return 0;
+  }
+  for (uint32 i=1; i <= num_of_points2; i++)
+  {
+    Geometry_buffer buff_temp;
+    Geometry *temp;
+
+    // First 4 bytes are handled already, make sure to create a Point
+    memset(s + 4, Geometry::wkb_point, 1);
+    memcpy(s + 5, g->get_data_ptr() + 5, 4);
+    memcpy(s + 4 + WKB_HEADER_SIZE, g->get_data_ptr() + 4 + WKB_HEADER_SIZE*i +\
+                                    POINT_DATA_SIZE*(i-1), POINT_DATA_SIZE);
+    s[len-1]= '\0';
+    temp= Geometry::construct(&buff_temp, s, len);
+    DBUG_ASSERT(temp);
+    temp_res= this->calculate_haversine(temp, r, err);
+    if (res > temp_res)
+      res= temp_res;
+  }
+  *result= res;
+  return 0;
+}
 /***************************** LineString *******************************/
 
 uint32 Gis_line_string::get_data_size() const 
@@ -2187,6 +2313,81 @@ const Geometry::Class_info *Gis_multi_point::get_class_info() const
 }
 
 
+/**
+  Function that calculate spherical distance of Multipoints geometries.
+  In case there is single point in Multipoint geometries calculate_haversine()
+  can handle such case. Otherwise, new geometry (Point) has to be constructed.
+
+  @param    g pointer to the Geometry
+  @param    r sphere radius
+  @param    result pointer to the result
+  @param    err    pointer to the error obtained from calculate_haversin()
+
+  @return state
+  @retval TRUE  failed
+  @retval FALSE success
+*/
+int Gis_multi_point::spherical_distance_multipoints(Geometry *g, const double r,
+                                                    double *result, int *err)
+{
+  const uint32 len= 4 + WKB_HEADER_SIZE + POINT_DATA_SIZE + 1;
+  // Check how many points are stored in Multipoints
+  uint32 num_of_points1, num_of_points2;
+  // To find the minimum radius it cannot be greater than Earth radius
+  double res= 6370986.0;
+
+  /* From Item_func_sphere_distance::spherical_distance_points,
+     we are sure that there will be multiple points and we have to construct
+     Point geometry and return the smallest result.
+  */
+  num_geometries(&num_of_points1);
+  DBUG_ASSERT(num_of_points1 >= 1);
+  g->num_geometries(&num_of_points2);
+  DBUG_ASSERT(num_of_points2 >= 1);
+
+  for (uint32 i=1; i <= num_of_points1; i++)
+  {
+    Geometry_buffer buff_temp;
+    Geometry *temp;
+    double temp_res= 0.0;
+    char s[len];
+    // First 4 bytes are handled already, make sure to create a Point
+    memset(s + 4, Geometry::wkb_point, 1);
+    memcpy(s + 5, this->get_data_ptr() + 5, 4);
+    memcpy(s + 4 + WKB_HEADER_SIZE, this->get_data_ptr() + 4 + WKB_HEADER_SIZE*i +\
+                                    POINT_DATA_SIZE*(i-1), POINT_DATA_SIZE);
+    s[len-1]= '\0';
+    temp= Geometry::construct(&buff_temp, s, len);
+    DBUG_ASSERT(temp);
+    // Optimization for single Multipoint
+    if (num_of_points2 == 1)
+    {
+      *result= static_cast<Gis_point *>(temp)->calculate_haversine(g, r, err);
+      return 0;
+    }
+    for (uint32 j=1; j<= num_of_points2; j++)
+    {
+      Geometry_buffer buff_temp2;
+      Geometry *temp2;
+      char s2[len];
+      // First 4 bytes are handled already, make sure to create a Point
+      memset(s2 + 4, Geometry::wkb_point, 1);
+      memcpy(s2 + 5, g->get_data_ptr() + 5, 4);
+      memcpy(s2 + 4 + WKB_HEADER_SIZE, g->get_data_ptr() + 4 + WKB_HEADER_SIZE*j +\
+                                       POINT_DATA_SIZE*(j-1), POINT_DATA_SIZE);
+      s2[len-1]= '\0';
+      temp2= Geometry::construct(&buff_temp2, s2, len);
+      DBUG_ASSERT(temp2);
+      temp_res= static_cast<Gis_point *>(temp)->calculate_haversine(temp2, r, err);
+      if (res > temp_res)
+        res= temp_res;
+    }
+  }
+  *result= res;
+  return 0;
+}
+
+
 /***************************** MultiLineString *******************************/
 
 uint32 Gis_multi_line_string::get_data_size() const 
@@ -3309,13 +3510,13 @@ bool Gis_geometry_collection::get_data_as_json(String *txt, uint max_dec_digits,
     if (!(geom= create_by_typeid(&buffer, wkb_type)))
       return 1;
     geom->set_data_ptr(data, (uint) (m_data_end - data));
-    if (txt->append("{", 1) ||
+    if (txt->append('{') ||
         geom->as_json(txt, max_dec_digits, &data) ||
         txt->append(STRING_WITH_LEN("}, "), 512))
       return 1;
   }
   txt->length(txt->length() - 2);
-  if (txt->append("]", 1))
+  if (txt->append(']'))
     return 1;
 
   *end= data;

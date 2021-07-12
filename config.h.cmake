@@ -103,6 +103,7 @@
 /* Libraries */
 #cmakedefine HAVE_LIBWRAP 1
 #cmakedefine HAVE_SYSTEMD 1
+#cmakedefine HAVE_SYSTEMD_SD_LISTEN_FDS_WITH_NAMES 1
 
 /* Does "struct timespec" have a "sec" and "nsec" field? */
 #cmakedefine HAVE_TIMESPEC_TS_SEC 1
@@ -169,6 +170,8 @@
 #cmakedefine HAVE_DECL_MADVISE 1
 #cmakedefine HAVE_DECL_MHA_MAPSIZE_VA 1
 #cmakedefine HAVE_MALLINFO 1
+#cmakedefine HAVE_MALLINFO2 1
+#cmakedefine HAVE_MALLOC_ZONE 1
 #cmakedefine HAVE_MEMCPY 1
 #cmakedefine HAVE_MEMMOVE 1
 #cmakedefine HAVE_MKSTEMP 1
@@ -426,7 +429,7 @@
 #define PSAPI_VERSION 1     /* for GetProcessMemoryInfo() */
 
 /* We don't want the min/max macros */
-#ifdef __WIN__
+#ifdef _WIN32
 #define NOMINMAX 1
 #endif
 

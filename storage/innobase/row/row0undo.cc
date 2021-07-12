@@ -187,7 +187,8 @@ row_undo_search_clust_to_pcur(
 
 	rec = btr_pcur_get_rec(&node->pcur);
 
-	offsets = rec_get_offsets(rec, clust_index, offsets, true,
+	offsets = rec_get_offsets(rec, clust_index, offsets,
+				  clust_index->n_core_fields,
 				  ULINT_UNDEFINED, &heap);
 
 	found = row_get_rec_roll_ptr(rec, clust_index, offsets)
@@ -195,7 +196,7 @@ row_undo_search_clust_to_pcur(
 
 	if (found) {
 		ut_ad(row_get_rec_trx_id(rec, clust_index, offsets)
-		      == node->trx->id);
+		      == node->trx->id || node->table->is_temporary());
 
 		if (dict_table_has_atomic_blobs(node->table)) {
 			/* There is no prefix of externally stored
@@ -283,22 +284,13 @@ static bool row_undo_rec_get(undo_node_t* node)
 	}
 
 	trx_undo_t*	undo	= NULL;
-	trx_undo_t*	insert	= trx->rsegs.m_redo.old_insert;
 	trx_undo_t*	update	= trx->rsegs.m_redo.undo;
 	trx_undo_t*	temp	= trx->rsegs.m_noredo.undo;
 	const undo_no_t	limit	= trx->roll_limit;
+	bool		is_temp = false;
 
-	ut_ad(!insert || !update || insert->empty() || update->empty()
-	      || insert->top_undo_no != update->top_undo_no);
-	ut_ad(!insert || !temp || insert->empty() || temp->empty()
-	      || insert->top_undo_no != temp->top_undo_no);
 	ut_ad(!update || !temp || update->empty() || temp->empty()
 	      || update->top_undo_no != temp->top_undo_no);
-
-	if (UNIV_LIKELY_NULL(insert)
-	    && !insert->empty() && limit <= insert->top_undo_no) {
-		undo = insert;
-	}
 
 	if (update && !update->empty() && update->top_undo_no >= limit) {
 		if (!undo) {
@@ -309,10 +301,9 @@ static bool row_undo_rec_get(undo_node_t* node)
 	}
 
 	if (temp && !temp->empty() && temp->top_undo_no >= limit) {
-		if (!undo) {
+		if (!undo || undo->top_undo_no < temp->top_undo_no) {
 			undo = temp;
-		} else if (undo->top_undo_no < temp->top_undo_no) {
-			undo = temp;
+			is_temp = true;
 		}
 	}
 
@@ -330,7 +321,8 @@ static bool row_undo_rec_get(undo_node_t* node)
 	ut_ad(limit <= undo->top_undo_no);
 
 	node->roll_ptr = trx_undo_build_roll_ptr(
-		false, undo->rseg->id, undo->top_page_no, undo->top_offset);
+		false, trx_sys.rseg_id(undo->rseg, !is_temp),
+		undo->top_page_no, undo->top_offset);
 
 	mtr_t	mtr;
 	mtr.start();
@@ -362,32 +354,23 @@ static bool row_undo_rec_get(undo_node_t* node)
 	mtr.commit();
 
 	switch (trx_undo_rec_get_type(node->undo_rec)) {
-	case TRX_UNDO_EMPTY:
-		/* This record type was introduced in MDEV-515 bulk insert,
-		which was implemented after MDEV-12288 removed the
-		insert_undo log. */
-		ut_ad(undo == update || undo == temp);
-		goto insert_like;
 	case TRX_UNDO_INSERT_METADATA:
 		/* This record type was introduced in MDEV-11369
 		instant ADD COLUMN, which was implemented after
 		MDEV-12288 removed the insert_undo log. There is no
 		instant ADD COLUMN for temporary tables. Therefore,
 		this record can only be present in the main undo log. */
-		ut_ad(undo == update);
 		/* fall through */
 	case TRX_UNDO_RENAME_TABLE:
-		ut_ad(undo == insert || undo == update);
+		ut_ad(undo == update);
 		/* fall through */
 	case TRX_UNDO_INSERT_REC:
-	insert_like:
-		ut_ad(undo == insert || undo == update || undo == temp);
+	case TRX_UNDO_EMPTY:
 		node->roll_ptr |= 1ULL << ROLL_PTR_INSERT_FLAG_POS;
 		node->state = undo == temp
 			? UNDO_INSERT_TEMPORARY : UNDO_INSERT_PERSISTENT;
 		break;
 	default:
-		ut_ad(undo == update || undo == temp);
 		node->state = undo == temp
 			? UNDO_UPDATE_TEMPORARY : UNDO_UPDATE_PERSISTENT;
 		break;
@@ -479,7 +462,7 @@ row_undo_step(
 
 	ut_ad(que_node_get_type(node) == QUE_NODE_UNDO);
 
-	if (UNIV_UNLIKELY(trx_get_dict_operation(trx) == TRX_DICT_OP_NONE
+	if (UNIV_UNLIKELY(!trx->dict_operation
 			  && !srv_undo_sources
 			  && srv_shutdown_state != SRV_SHUTDOWN_NONE)
 	    && (srv_fast_shutdown == 3 || trx == trx_roll_crash_recv_trx)) {

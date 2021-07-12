@@ -33,6 +33,8 @@
 #include <malloc.h>
 #elif defined(HAVE_MALLINFO) && defined(HAVE_SYS_MALLOC_H)
 #include <sys/malloc.h>
+#elif defined(HAVE_MALLOC_ZONE)
+#include <malloc/malloc.h>
 #endif
 
 #ifdef HAVE_EVENT_SCHEDULER
@@ -49,11 +51,13 @@ static const char *lock_descriptions[] =
   /* TL_READ_WITH_SHARED_LOCKS  */  "Shared read lock",
   /* TL_READ_HIGH_PRIORITY      */  "High priority read lock",
   /* TL_READ_NO_INSERT          */  "Read lock without concurrent inserts",
+  /* TL_READ_SKIP_LOCKED        */  "Read lock without blocking if row is locked",
   /* TL_WRITE_ALLOW_WRITE       */  "Write lock that allows other writers",
   /* TL_WRITE_CONCURRENT_INSERT */  "Concurrent insert lock",
   /* TL_WRITE_DELAYED           */  "Lock used by delayed insert",
   /* TL_WRITE_DEFAULT           */  NULL,
   /* TL_WRITE_LOW_PRIORITY      */  "Low priority write lock",
+  /* TL_WRITE_SKIP_LOCKED       */  "Write lock but skip existing locked rows",
   /* TL_WRITE                   */  "High priority write lock",
   /* TL_WRITE_ONLY              */  "Highest priority write lock"
 };
@@ -123,25 +127,26 @@ void TEST_filesort(SORT_FIELD *sortorder,uint s_length)
   char buff[256],buff2[256];
   String str(buff,sizeof(buff),system_charset_info);
   String out(buff2,sizeof(buff2),system_charset_info);
-  const char *sep;
+  DBUG_ASSERT(s_length > 0);
   DBUG_ENTER("TEST_filesort");
 
   out.length(0);
-  for (sep=""; s_length-- ; sortorder++, sep=" ")
+  for (; s_length-- ; sortorder++)
   {
-    out.append(sep);
     if (sortorder->reverse)
       out.append('-');
     if (sortorder->field)
     {
       if (sortorder->field->table_name)
       {
-	out.append(*sortorder->field->table_name);
+        const char *table_name= *sortorder->field->table_name;
+	out.append(table_name, strlen(table_name));
 	out.append('.');
       }
-      out.append(sortorder->field->field_name.str ?
-                 sortorder->field->field_name.str :
-		 "tmp_table_column");
+      const char *name= sortorder->field->field_name.str;
+      if (!name)
+        name= "tmp_table_column";
+      out.append(name, strlen(name));
     }
     else
     {
@@ -149,7 +154,9 @@ void TEST_filesort(SORT_FIELD *sortorder,uint s_length)
       sortorder->item->print(&str, QT_ORDINARY);
       out.append(str);
     }
+    out.append(' ');
   }
+  out.chop();                                  // Remove last space
   DBUG_LOCK_FILE;
   (void) fputs("\nInfo about FILESORT\n",DBUG_FILE);
   fprintf(DBUG_FILE,"Sortorder: %s\n",out.c_ptr_safe());
@@ -182,8 +189,8 @@ TEST_join(JOIN *join)
       JOIN_TAB *tab= jt_range->start + i;
       for (ref= 0; ref < tab->ref.key_parts; ref++)
       {
-        ref_key_parts[i].append(tab->ref.items[ref]->full_name());
-        ref_key_parts[i].append("  ");
+        ref_key_parts[i].append(tab->ref.items[ref]->full_name_cstring());
+        ref_key_parts[i].append(STRING_WITH_LEN("  "));
       }
     }
 
@@ -293,7 +300,6 @@ print_plan(JOIN* join, uint idx, double record_count, double read_time,
            double current_read_time, const char *info)
 {
   uint i;
-  POSITION pos;
   JOIN_TAB *join_table;
   JOIN_TAB **plan_nodes;
   TABLE*   table;
@@ -320,8 +326,8 @@ print_plan(JOIN* join, uint idx, double record_count, double read_time,
   fputs("     POSITIONS: ", DBUG_FILE);
   for (i= 0; i < idx ; i++)
   {
-    pos = join->positions[i];
-    table= pos.table->table;
+    POSITION *pos= join->positions + i;
+    table= pos->table->table;
     if (table)
       fputs(table->s->table_name.str, DBUG_FILE);
     fputc(' ', DBUG_FILE);
@@ -337,8 +343,8 @@ print_plan(JOIN* join, uint idx, double record_count, double read_time,
     fputs("BEST_POSITIONS: ", DBUG_FILE);
     for (i= 0; i < idx ; i++)
     {
-      pos= join->best_positions[i];
-      table= pos.table->table;
+      POSITION *pos= join->best_positions + i;
+      table= pos->table->table;
       if (table)
         fputs(table->s->table_name.str, DBUG_FILE);
       fputc(' ', DBUG_FILE);
@@ -565,6 +571,7 @@ void mysql_print_status()
   STATUS_VAR tmp;
   uint count;
 
+  tmp= global_status_var;
   count= calc_sum_of_all_status(&tmp);
   printf("\nStatus information:\n\n");
   (void) my_getwd(current_dir, sizeof(current_dir),MYF(0));
@@ -616,8 +623,12 @@ Next alarm time: %lu\n",
 	(ulong)alarm_info.next_alarm_time);
 #endif
   display_table_locks();
-#ifdef HAVE_MALLINFO
+#if defined(HAVE_MALLINFO2)
+  struct mallinfo2 info = mallinfo2();
+#elif defined(HAVE_MALLINFO)
   struct mallinfo info= mallinfo();
+#endif
+#if defined(HAVE_MALLINFO) || defined(HAVE_MALLINFO2)
   char llbuff[10][22];
   printf("\nMemory status:\n\
 Non-mmapped space allocated from system: %s\n\
@@ -648,6 +659,20 @@ Memory allocated by threads:             %s\n",
          llstr(tmp.global_memory_used, llbuff[8]),
          llstr(tmp.local_memory_used, llbuff[9]));
 
+#elif defined(HAVE_MALLOC_ZONE)
+  malloc_statistics_t info;
+  char llbuff[4][22];
+
+  malloc_zone_statistics(nullptr, &info);
+  printf("\nMemory status:\n\
+Total allocated space:                   %s\n\
+Total free space:                        %s\n\
+Global memory allocated by server:       %s\n\
+Memory allocated by threads:             %s\n",
+         llstr(info.size_allocated, llbuff[0]),
+         llstr((info.size_allocated - info.size_in_use), llbuff[1]),
+         llstr(tmp.global_memory_used, llbuff[2]),
+         llstr(tmp.local_memory_used, llbuff[3]));
 #endif
 
 #ifdef HAVE_EVENT_SCHEDULER

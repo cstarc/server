@@ -884,12 +884,33 @@ CREATE TABLE t1 (t INT, u INT, KEY(t));
 INSERT INTO t1 VALUES(10, 10), (11, 11), (12, 12), (12, 13),(14, 15), (15, 16),
                      (16, 17), (17, 17);
 ANALYZE TABLE t1;
-SELECT t, next_seq_value() r FROM t1 FORCE INDEX(t)
-       GROUP BY t HAVING r = 1  ORDER BY t1.u;
+explain SELECT t, next_seq_value() r FROM t1 FORCE INDEX(t) GROUP BY t HAVING r = 1  ORDER BY t1.u;
+SELECT t, next_seq_value() r FROM t1 FORCE INDEX(t) GROUP BY t HAVING r = 1  ORDER BY t1.u;
 
 DROP TABLE t1;
 DROP FUNCTION next_seq_value;
 DROP TABLE series;
+
+
+--echo #
+--echo # MDEV-24958 Server crashes in my_strtod /
+--echo # Value_source::Converter_strntod::Converter_strntod with DEFAULT(blob)
+--echo #
+--echo # MDEV-24942 Server crashes in _ma_rec_pack / _ma_write_blob_record with
+--echo # DEFAULT() on BLOB
+--echo #
+
+CREATE TABLE t1 (id INT, f MEDIUMTEXT NOT NULL DEFAULT 'A');
+INSERT INTO t1 VALUES (1,'foo'),(2,'bar');
+SELECT f FROM t1 GROUP BY id ORDER BY DEFAULT(f);
+SELECT DEFAULT(f) AS h FROM t1 HAVING h > 5;
+SELECT DEFAULT(f) AS h FROM t1 HAVING h >= 0;
+SELECT DEFAULT(f) AS h FROM t1 HAVING h >= 'A';
+
+alter table t1 add column b int default (rand()+1+3);
+--replace_column 1 #
+select default(b) AS h FROM t1 HAVING h > "2";
+drop table t1;
 
 --echo # End of 10.3 tests
 

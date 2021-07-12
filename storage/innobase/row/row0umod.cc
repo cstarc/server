@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1997, 2017, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2017, 2020, MariaDB Corporation.
+Copyright (c) 2017, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -110,7 +110,8 @@ row_undo_mod_clust_low(
 	ut_ad(success);
 	ut_ad(rec_get_trx_id(btr_cur_get_rec(btr_cur),
 			     btr_cur_get_index(btr_cur))
-	      == thr_get_trx(thr)->id);
+	      == thr_get_trx(thr)->id
+	      || btr_cur_get_index(btr_cur)->table->is_temporary());
 	ut_ad(node->ref != &trx_undo_metadata
 	      || node->update->info_bits == REC_INFO_METADATA_ADD
 	      || node->update->info_bits == REC_INFO_METADATA_ALTER);
@@ -157,21 +158,43 @@ row_undo_mod_clust_low(
 		}
 	}
 
-	if (err == DB_SUCCESS
-	    && btr_cur_get_index(btr_cur)->table->id == DICT_COLUMNS_ID) {
+	if (err != DB_SUCCESS) {
+		return err;
+	}
+
+	switch (const auto id = btr_cur_get_index(btr_cur)->table->id) {
+		unsigned c;
+	case DICT_TABLES_ID:
+		if (node->trx != trx_roll_crash_recv_trx) {
+			break;
+		}
+		c = DICT_COL__SYS_TABLES__ID;
+		goto evict;
+	case DICT_INDEXES_ID:
+		if (node->trx != trx_roll_crash_recv_trx) {
+			break;
+		}
+		/* fall through */
+	case DICT_COLUMNS_ID:
+		static_assert(!DICT_COL__SYS_INDEXES__TABLE_ID, "");
+		static_assert(!DICT_COL__SYS_COLUMNS__TABLE_ID, "");
+		c = DICT_COL__SYS_COLUMNS__TABLE_ID;
 		/* This is rolling back an UPDATE or DELETE on SYS_COLUMNS.
 		If it was part of an instant ALTER TABLE operation, we
 		must evict the table definition, so that it can be
 		reloaded after the dictionary operation has been
 		completed. At this point, any corresponding operation
 		to the metadata record will have been rolled back. */
-		const dfield_t& table_id = *dtuple_get_nth_field(node->row, 0);
+	evict:
+		const dfield_t& table_id = *dtuple_get_nth_field(node->row, c);
 		ut_ad(dfield_get_len(&table_id) == 8);
-		node->trx->evict_table(mach_read_from_8(static_cast<byte*>(
-					table_id.data)));
+		node->trx->evict_table(mach_read_from_8(
+					       static_cast<byte*>(
+						       table_id.data)),
+				       id == DICT_COLUMNS_ID);
 	}
 
-	return(err);
+	return DB_SUCCESS;
 }
 
 /** Get the byte offset of the DB_TRX_ID column
@@ -189,8 +212,9 @@ static ulint row_trx_id_offset(const rec_t* rec, const dict_index_t* index)
 		rec_offs_init(offsets_);
 		mem_heap_t* heap = NULL;
 		const ulint trx_id_pos = index->n_uniq ? index->n_uniq : 1;
-		rec_offs* offsets = rec_get_offsets(rec, index, offsets_, true,
-						 trx_id_pos + 1, &heap);
+		rec_offs* offsets = rec_get_offsets(rec, index, offsets_,
+						    index->n_core_fields,
+						    trx_id_pos + 1, &heap);
 		ut_ad(!heap);
 		ulint len;
 		trx_id_offset = rec_get_nth_field_offs(
@@ -461,9 +485,9 @@ row_undo_mod_clust(
 		} else {
 			ut_ad(index->n_uniq <= MAX_REF_PARTS);
 			rec_offs_init(offsets_);
-			offsets = rec_get_offsets(
-				rec, index, offsets_, true, trx_id_pos + 2,
-				&heap);
+			offsets = rec_get_offsets(rec, index, offsets_,
+						  index->n_core_fields,
+						  trx_id_pos + 2, &heap);
 			ulint len;
 			trx_id_offset = rec_get_nth_field_offs(
 				offsets, trx_id_pos, &len);
@@ -853,7 +877,8 @@ try_again:
 		offsets_heap = NULL;
 		offsets = rec_get_offsets(
 			btr_cur_get_rec(btr_cur),
-			index, NULL, true, ULINT_UNDEFINED, &offsets_heap);
+			index, nullptr, index->n_core_fields, ULINT_UNDEFINED,
+			&offsets_heap);
 		update = row_upd_build_sec_rec_difference_binary(
 			btr_cur_get_rec(btr_cur), index, offsets, entry, heap);
 		if (upd_get_n_fields(update) == 0) {
@@ -1231,10 +1256,10 @@ static bool row_undo_mod_parse_undo_rec(undo_node_t* node, bool dict_locked)
 						    DICT_TABLE_OP_NORMAL);
 	} else if (!dict_locked) {
 		dict_sys.mutex_lock();
-		node->table = dict_sys.get_temporary_table(table_id);
+		node->table = dict_sys.acquire_temporary_table(table_id);
 		dict_sys.mutex_unlock();
 	} else {
-		node->table = dict_sys.get_temporary_table(table_id);
+		node->table = dict_sys.acquire_temporary_table(table_id);
 	}
 
 	if (!node->table) {

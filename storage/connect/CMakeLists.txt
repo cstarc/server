@@ -13,6 +13,10 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1335 USA
 
+IF(WITHOUT_DYNAMIC_PLUGINS OR WITH_NONE OR ("${PLUGIN_CONNECT}" STREQUAL "NO"))
+  RETURN()
+ENDIF()
+
 SET(CONNECT_PLUGIN_STATIC  "connect")
 SET(CONNECT_PLUGIN_DYNAMIC "connect")
 
@@ -78,7 +82,21 @@ ELSE(NOT UNIX)
     # Connect does not work with clang-cl
     RETURN()
   ENDIF()
+  add_definitions(-D__WIN__)
 ENDIF(UNIX)
+
+
+#
+# BSON: the new handling of JSON data included temporarily for testing
+#
+
+OPTION(CONNECT_WITH_BSON "Compile CONNECT storage engine with BSON support" ON)
+
+IF(CONNECT_WITH_BSON)
+  SET(CONNECT_SOURCES ${CONNECT_SOURCES}
+ bson.cpp bsonudf.cpp tabbson.cpp bson.h bsonudf.h tabbson.h)
+  add_definitions(-DBSON_SUPPORT)
+ENDIF(CONNECT_WITH_BSON)
 
 
 #
@@ -255,9 +273,12 @@ IF(CONNECT_WITH_JDBC)
     JdbcInterface.java ApacheInterface.java MariadbInterface.java
     MysqlInterface.java OracleInterface.java PostgresqlInterface.java
     Mongo2Interface.java Mongo3Interface.java
-    JavaWrappers.jar)
+    mysql-test/connect/std_data/JavaWrappers.jar)
     add_definitions(-DJAVA_SUPPORT)
     IF(CONNECT_WITH_MONGO)
+      SET(CONNECT_SOURCES ${CONNECT_SOURCES}
+        mysql-test/connect/std_data/Mongo2.jar
+        mysql-test/connect/std_data/Mongo3.jar)
       add_definitions(-DMONGO_SUPPORT)
     ENDIF()
   ELSE()
@@ -314,29 +335,29 @@ ENDIF(CONNECT_WITH_MONGO)
 OPTION(CONNECT_WITH_REST "Compile CONNECT storage engine with REST support" ON)
 
 IF(CONNECT_WITH_REST)
-  MESSAGE_ONCE(CONNECT_WITH_REST "REST support is ON")
+# MESSAGE(STATUS "=====> REST support is ON")
   SET(CONNECT_SOURCES ${CONNECT_SOURCES} tabrest.cpp tabrest.h)
   add_definitions(-DREST_SUPPORT)
-  FIND_PACKAGE(cpprestsdk QUIET)
-  IF (cpprestsdk_FOUND)
-	IF(UNIX)
-#     INCLUDE_DIRECTORIES(${CPPRESTSDK_INCLUDE_DIR})
-#     If needed edit next line to set the path to libcpprest.so
-      SET(REST_LIBRARY -lcpprest)
-      MESSAGE (STATUS ${REST_LIBRARY})
-	ELSE(NOT UNIX)
-#     Next line sets debug compile mode matching cpprest_2_10d.dll
-#     when it was binary installed (can be change later in Visual Studio)
-#     Comment it out if not needed depending on your cpprestsdk installation.
-	  SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MDd")
-	ENDIF(UNIX)
-#   IF(REST_LIBRARY)     why this? how about Windows
-    SET(CONNECT_SOURCES ${CONNECT_SOURCES} restget.cpp)
-    add_definitions(-DREST_SOURCE)
-#   ENDIF()
-  ELSE(NOT cpprestsdk_FOUND)
-#    MESSAGE(STATUS "=====> cpprestsdk package not found")
-  ENDIF (cpprestsdk_FOUND)
+# FIND_PACKAGE(cpprestsdk QUIET)
+# IF (cpprestsdk_FOUND)
+#	IF(UNIX)
+##    INCLUDE_DIRECTORIES(${CPPRESTSDK_INCLUDE_DIR})
+##    If needed edit next line to set the path to libcpprest.so
+#     SET(REST_LIBRARY -lcpprest)
+#     MESSAGE (STATUS ${REST_LIBRARY})
+#	ELSE(NOT UNIX)
+##    Next line sets debug compile mode matching cpprest_2_10d.dll
+##    when it was binary installed (can be change later in Visual Studio)
+##    Comment it out if not needed depending on your cpprestsdk installation.
+#	  SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MDd")
+#	ENDIF(UNIX)
+##  IF(REST_LIBRARY)     why this? how about Windows
+#   SET(CONNECT_SOURCES ${CONNECT_SOURCES} restget.cpp)
+#   add_definitions(-DREST_SOURCE)
+##  ENDIF()
+##ELSE(NOT cpprestsdk_FOUND)
+##  MESSAGE(STATUS "=====> cpprestsdk package not found")
+# ENDIF (cpprestsdk_FOUND)
 ENDIF(CONNECT_WITH_REST)
 
 #
@@ -405,8 +426,13 @@ IF(CONNECT_WITH_JDBC AND JAVA_FOUND AND JNI_FOUND)
   SET (JAVA_SOURCES JdbcInterface.java)
   add_jar(JdbcInterface ${JAVA_SOURCES})
   INSTALL(FILES
-    ${CMAKE_CURRENT_SOURCE_DIR}/JavaWrappers.jar
+    ${CMAKE_CURRENT_SOURCE_DIR}/mysql-test/connect/std_data/JavaWrappers.jar
     ${CMAKE_CURRENT_BINARY_DIR}/JdbcInterface.jar
-    DESTINATION ${INSTALL_PLUGINDIR} COMPONENT connect-engine)
+    DESTINATION ${INSTALL_MYSQLSHAREDIR} COMPONENT connect-engine)
+  IF(CONNECT_WITH_MONGO)
+    INSTALL(FILES
+      ${CMAKE_CURRENT_SOURCE_DIR}/mysql-test/connect/std_data/Mongo2.jar
+      ${CMAKE_CURRENT_SOURCE_DIR}/mysql-test/connect/std_data/Mongo3.jar
+      DESTINATION ${INSTALL_MYSQLSHAREDIR} COMPONENT connect-engine)
+  ENDIF()
 ENDIF()
-

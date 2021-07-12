@@ -81,10 +81,9 @@ class Type_handler_hybrid_field_type;
 class Sort_param;
 class Arg_comparator;
 class Spvar_definition;
-struct st_value;
+class st_value;
 class Protocol;
 class handler;
-struct Schema_specification_st;
 struct TABLE;
 struct SORT_FIELD_ATTR;
 struct SORT_FIELD;
@@ -250,6 +249,53 @@ public:
 };
 
 
+/*
+  A helper class to store column attributes that are inherited
+  by columns (from the table level) when not specified explicitly.
+*/
+class Column_derived_attributes
+{
+  /*
+    Table level CHARACTER SET and COLLATE value:
+
+      CREATE TABLE t1 (a VARCHAR(1), b CHAR(2)) CHARACTER SET latin1;
+
+    All character string columns (CHAR, VARCHAR, TEXT)
+    inherit CHARACTER SET from the table level.
+  */
+  CHARSET_INFO *m_charset;
+public:
+  explicit Column_derived_attributes(CHARSET_INFO *cs)
+   :m_charset(cs)
+  { }
+  CHARSET_INFO *charset() const { return m_charset; }
+};
+
+
+/*
+  A helper class to store requests for changes
+  in multiple column data types during ALTER.
+*/
+class Column_bulk_alter_attributes
+{
+  /*
+    Target CHARACTER SET specification in ALTER .. CONVERT, e.g.
+
+      ALTER TABLE t1 CONVERT TO CHARACTER SET utf8;
+
+    All character string columns (CHAR, VARCHAR, TEXT)
+    get converted to the "CONVERT TO CHARACTER SET".
+  */
+  CHARSET_INFO *m_alter_table_convert_to_charset;
+public:
+  explicit Column_bulk_alter_attributes(CHARSET_INFO *convert)
+   :m_alter_table_convert_to_charset(convert)
+  { }
+  CHARSET_INFO *alter_table_convert_to_charset() const
+  { return m_alter_table_convert_to_charset; }
+};
+
+
 class Native: public Binary_string
 {
 public:
@@ -351,7 +397,7 @@ public:
   {
     return m_ptr ? m_ptr->to_string(to, prec, dec, filler) : NULL;
   }
-  int to_binary(uchar *bin, int prec, int scale) const
+  int to_binary(uchar *bin, int prec, decimal_digits_t scale) const
   {
     return (m_ptr ? m_ptr : &decimal_zero)->to_binary(bin, prec, scale);
   }
@@ -374,12 +420,13 @@ class Dec_ptr_and_buffer: public Dec_ptr
 protected:
   my_decimal m_buffer;
 public:
+  /* scale is int as it can be negative here */
   int round_to(my_decimal *to, int scale, decimal_round_mode mode)
   {
     DBUG_ASSERT(m_ptr);
     return m_ptr->round_to(to, scale, mode);
   }
-  int round_self(uint scale, decimal_round_mode mode)
+  int round_self(decimal_digits_t scale, decimal_round_mode mode)
   {
     return round_to(&m_buffer, scale, mode);
   }
@@ -391,7 +438,7 @@ public:
     m_ptr= &m_buffer;
     return res;
   }
-  String *to_string_round(String *to, uint dec)
+  String *to_string_round(String *to, decimal_digits_t dec)
   {
     /*
       decimal_round() allows from==to
@@ -3002,28 +3049,27 @@ char_to_byte_length_safe(size_t char_length_arg, uint32 mbmaxlen_arg)
   return tmp > UINT_MAX32 ? (uint32) UINT_MAX32 : static_cast<uint32>(tmp);
 }
 
-
 class Type_numeric_attributes
 {
 public:
   static uint count_unsigned(Item **item, uint nitems);
   static uint32 find_max_char_length(Item **item, uint nitems);
   static uint32 find_max_octet_length(Item **item, uint nitems);
-  static int find_max_decimal_int_part(Item **item, uint nitems);
-  static uint find_max_decimals(Item **item, uint nitems);
+  static decimal_digits_t find_max_decimal_int_part(Item **item, uint nitems);
+  static decimal_digits_t find_max_decimals(Item **item, uint nitems);
 public:
   /*
     The maximum value length in characters multiplied by collation->mbmaxlen.
     Almost always it's the maximum value length in bytes.
   */
   uint32 max_length;
-  uint decimals;
+  decimal_digits_t decimals;
   bool unsigned_flag;
 public:
   Type_numeric_attributes()
    :max_length(0), decimals(0), unsigned_flag(false)
   { }
-  Type_numeric_attributes(uint32 max_length_arg, uint decimals_arg,
+  Type_numeric_attributes(uint32 max_length_arg, decimal_digits_t decimals_arg,
                           bool unsigned_flag_arg)
    :max_length(max_length_arg),
     decimals(decimals_arg),
@@ -3040,9 +3086,10 @@ protected:
 class Type_temporal_attributes: public Type_numeric_attributes
 {
 public:
-  Type_temporal_attributes(uint int_part_length, uint dec, bool unsigned_arg)
+  Type_temporal_attributes(uint32 int_part_length, decimal_digits_t dec, bool unsigned_arg)
    :Type_numeric_attributes(int_part_length + (dec ? 1 : 0),
-                            MY_MIN(dec, TIME_SECOND_PART_DIGITS),
+                            MY_MIN(dec,
+                                   (decimal_digits_t) TIME_SECOND_PART_DIGITS),
                             unsigned_arg)
   {
     max_length+= decimals;
@@ -3053,7 +3100,7 @@ public:
 class Type_temporal_attributes_not_fixed_dec: public Type_numeric_attributes
 {
 public:
-  Type_temporal_attributes_not_fixed_dec(uint32 int_part_length, uint dec,
+  Type_temporal_attributes_not_fixed_dec(uint32 int_part_length, decimal_digits_t dec,
                                          bool unsigned_flag)
    :Type_numeric_attributes(int_part_length, dec, unsigned_flag)
   {
@@ -3108,7 +3155,7 @@ public:
     max_length= char_to_byte_length_safe(max_char_length_arg,
                                          collation.collation->mbmaxlen);
   }
-  void fix_attributes_temporal(uint32 int_part_length, uint dec)
+  void fix_attributes_temporal(uint32 int_part_length, decimal_digits_t dec)
   {
     *this= Type_std_attributes(
              Type_temporal_attributes(int_part_length, dec, false),
@@ -3118,11 +3165,11 @@ public:
   {
     fix_attributes_temporal(MAX_DATE_WIDTH, 0);
   }
-  void fix_attributes_time(uint dec)
+  void fix_attributes_time(decimal_digits_t dec)
   {
     fix_attributes_temporal(MIN_TIME_WIDTH, dec);
   }
-  void fix_attributes_datetime(uint dec)
+  void fix_attributes_datetime(decimal_digits_t dec)
   {
     fix_attributes_temporal(MAX_DATETIME_WIDTH, dec);
   }
@@ -3146,7 +3193,7 @@ public:
     aggregate_numeric_attributes_decimal(items, nitems,
                                          (unsigned_flag= unsigned_arg));
   }
-  bool aggregate_attributes_string(const char *func_name,
+  bool aggregate_attributes_string(const LEX_CSTRING &func_name,
                                    Item **item, uint nitems);
   void aggregate_attributes_temporal(uint int_part_length,
                                      Item **item, uint nitems)
@@ -3154,10 +3201,11 @@ public:
     fix_attributes_temporal(int_part_length, find_max_decimals(item, nitems));
   }
 
-  bool agg_item_collations(DTCollation &c, const char *name,
+  bool agg_item_collations(DTCollation &c, const LEX_CSTRING &name,
                            Item **items, uint nitems,
                            uint flags, int item_sep);
-  bool agg_item_set_converter(const DTCollation &coll, const char *fname,
+  bool agg_item_set_converter(const DTCollation &coll,
+                              const LEX_CSTRING &name,
                               Item **args, uint nargs,
                               uint flags, int item_sep);
 
@@ -3189,7 +3237,7 @@ public:
 
       agg_item_charsets(coll, fname, &args[2], 2, flags, 3)
   */
-  bool agg_arg_charsets(DTCollation &c, const char *func_name,
+  bool agg_arg_charsets(DTCollation &c, const LEX_CSTRING &func_name,
                         Item **items, uint nitems,
                         uint flags, int item_sep)
   {
@@ -3202,7 +3250,8 @@ public:
     - convert to @@character_set_connection if all arguments are numbers
     - allow DERIVATION_NONE
   */
-  bool agg_arg_charsets_for_string_result(DTCollation &c, const char *func_name,
+  bool agg_arg_charsets_for_string_result(DTCollation &c,
+                                          const LEX_CSTRING &func_name,
                                           Item **items, uint nitems,
                                           int item_sep)
   {
@@ -3218,7 +3267,7 @@ public:
     - disallow DERIVATION_NONE
   */
   bool agg_arg_charsets_for_string_result_with_comparison(DTCollation &c,
-                                                          const char *func_name,
+                                                          const LEX_CSTRING &func_name,
                                                           Item **items,
                                                           uint nitems,
                                                           int item_sep)
@@ -3236,7 +3285,7 @@ public:
     - don't allow DERIVATION_NONE
   */
   bool agg_arg_charsets_for_comparison(DTCollation &c,
-                                       const char *func_name,
+                                       const LEX_CSTRING &func_name,
                                        Item **items, uint nitems,
                                        int item_sep)
   {
@@ -3259,9 +3308,9 @@ public:
    :Type_std_attributes(other)
   { }
   virtual ~Type_all_attributes() {}
-  virtual void set_maybe_null(bool maybe_null_arg)= 0;
+  virtual void set_type_maybe_null(bool maybe_null_arg)= 0;
   // Returns total number of decimal digits
-  virtual uint decimal_precision() const= 0;
+  virtual decimal_digits_t decimal_precision() const= 0;
   virtual const TYPELIB *get_typelib() const= 0;
   virtual void set_typelib(const TYPELIB *typelib)= 0;
 };
@@ -3412,7 +3461,7 @@ class Information_schema_numeric_attributes
     ATTR_PRECISION_AND_SCALE= (ATTR_PRECISION|ATTR_SCALE)
   };
   uint m_precision;
-  uint m_scale;
+  decimal_digits_t m_scale;
   enum_attr m_available_attributes;
 public:
   Information_schema_numeric_attributes()
@@ -3423,7 +3472,7 @@ public:
    :m_precision(precision), m_scale(0),
     m_available_attributes(ATTR_PRECISION)
   { }
-  Information_schema_numeric_attributes(uint precision, uint scale)
+  Information_schema_numeric_attributes(uint precision, decimal_digits_t scale)
    :m_precision(precision), m_scale(scale),
     m_available_attributes(ATTR_PRECISION_AND_SCALE)
   { }
@@ -3434,10 +3483,10 @@ public:
     DBUG_ASSERT(has_precision());
     return (uint) m_precision;
   }
-  uint scale() const
+  decimal_digits_t scale() const
   {
     DBUG_ASSERT(has_scale());
-    return (uint) m_scale;
+    return m_scale;
   }
 };
 
@@ -3542,7 +3591,7 @@ protected:
                                      longlong value,
                                      const SORT_FIELD_ATTR *sort_field) const;
 
-  bool Item_func_or_sum_illegal_param(const char *name) const;
+  bool Item_func_or_sum_illegal_param(const LEX_CSTRING &name) const;
   bool Item_func_or_sum_illegal_param(const Item_func_or_sum *) const;
   bool check_null(const Item *item, st_value *value) const;
   bool Item_send_str(Item *item, Protocol *protocol, st_value *buf) const;
@@ -3784,15 +3833,15 @@ public:
   virtual bool can_return_extract_source(interval_type type) const;
   virtual bool is_bool_type() const { return false; }
   virtual bool is_general_purpose_string_type() const { return false; }
-  virtual uint Item_time_precision(THD *thd, Item *item) const;
-  virtual uint Item_datetime_precision(THD *thd, Item *item) const;
-  virtual uint Item_decimal_scale(const Item *item) const;
-  virtual uint Item_decimal_precision(const Item *item) const= 0;
+  virtual decimal_digits_t Item_time_precision(THD *thd, Item *item) const;
+  virtual decimal_digits_t Item_datetime_precision(THD *thd, Item *item) const;
+  virtual decimal_digits_t Item_decimal_scale(const Item *item) const;
+  virtual decimal_digits_t Item_decimal_precision(const Item *item) const= 0;
   /*
     Returns how many digits a divisor adds into a division result.
     See Item::divisor_precision_increment() in item.h for more comments.
   */
-  virtual uint Item_divisor_precision_increment(const Item *) const;
+  virtual decimal_digits_t Item_divisor_precision_increment(const Item *) const;
   /**
     Makes a temporary table Field to handle numeric aggregate functions,
     e.g. SUM(DISTINCT expr), AVG(DISTINCT expr), etc.
@@ -3883,7 +3932,17 @@ public:
                                                 MEM_ROOT *mem_root,
                                                 Column_definition *c,
                                                 handler *file,
-                                                ulonglong table_flags) const;
+                                                ulonglong table_flags,
+                                                const Column_derived_attributes
+                                                      *derived_attr)
+                                                const;
+  virtual bool Column_definition_bulk_alter(Column_definition *c,
+                                            const Column_derived_attributes
+                                                  *derived_attr,
+                                            const Column_bulk_alter_attributes
+                                                  *bulk_alter_attr)
+                                            const
+  { return false; }
   /*
     This method is called on queries like:
       CREATE TABLE t2 (a INT) AS SELECT a FROM t1;
@@ -3902,9 +3961,7 @@ public:
   */
   virtual bool Column_definition_redefine_stage1(Column_definition *def,
                                                  const Column_definition *dup,
-                                                 const handler *file,
-                                                 const Schema_specification_st *
-                                                       schema)
+                                                 const handler *file)
                                                  const;
   virtual bool Column_definition_prepare_stage2(Column_definition *c,
                                                 handler *file,
@@ -4126,7 +4183,7 @@ public:
     DBUG_ASSERT(0);
     return 0;
   }
-  virtual bool set_comparator_func(Arg_comparator *cmp) const= 0;
+  virtual bool set_comparator_func(THD *thd, Arg_comparator *cmp) const= 0;
   virtual bool Item_const_eq(const Item_const *a, const Item_const *b,
                              bool binary_cmp) const
   {
@@ -4135,7 +4192,7 @@ public:
   virtual bool Item_eq_value(THD *thd, const Type_cmp_attributes *attr,
                              Item *a, Item *b) const= 0;
   virtual bool Item_hybrid_func_fix_attributes(THD *thd,
-                                               const char *name,
+                                               const LEX_CSTRING &name,
                                                Type_handler_hybrid_field_type *,
                                                Type_all_attributes *atrr,
                                                Item **items,
@@ -4357,11 +4414,13 @@ public:
                                         MEM_ROOT *mem_root,
                                         Column_definition *c,
                                         handler *file,
-                                        ulonglong table_flags) const override;
+                                        ulonglong table_flags,
+                                        const Column_derived_attributes
+                                              *derived_attr)
+                                        const override;
   bool Column_definition_redefine_stage1(Column_definition *def,
                                          const Column_definition *dup,
-                                         const handler *file,
-                                         const Schema_specification_st *schema)
+                                         const handler *file)
                                          const override
   {
     DBUG_ASSERT(0);
@@ -4424,7 +4483,7 @@ public:
   }
   bool Item_eq_value(THD *thd, const Type_cmp_attributes *attr,
                      Item *a, Item *b) const override;
-  uint Item_decimal_precision(const Item *item) const override
+  decimal_digits_t Item_decimal_precision(const Item *item) const override
   {
     DBUG_ASSERT(0);
     return DECIMAL_MAX_PRECISION;
@@ -4464,9 +4523,9 @@ public:
     DBUG_ASSERT(0);
     return NULL;
   }
-  bool set_comparator_func(Arg_comparator *cmp) const override;
+  bool set_comparator_func(THD *thd, Arg_comparator *cmp) const override;
   bool Item_hybrid_func_fix_attributes(THD *thd,
-                                       const char *name,
+                                       const LEX_CSTRING &name,
                                        Type_handler_hybrid_field_type *,
                                        Type_all_attributes *atrr,
                                        Item **items, uint nitems)
@@ -4675,6 +4734,14 @@ public:
   String *print_item_value(THD *thd, Item *item, String *str) const override;
   double Item_func_min_max_val_real(Item_func_min_max *) const override;
   longlong Item_func_min_max_val_int(Item_func_min_max *) const override;
+  bool Column_definition_prepare_stage1(THD *thd,
+                                        MEM_ROOT *mem_root,
+                                        Column_definition *c,
+                                        handler *file,
+                                        ulonglong table_flags,
+                                        const Column_derived_attributes
+                                              *derived_attr)
+                                        const override;
   my_decimal *Item_func_min_max_val_decimal(Item_func_min_max *,
                                             my_decimal *) const override;
   bool Item_func_min_max_get_date(THD *thd, Item_func_min_max*,
@@ -4742,7 +4809,7 @@ public:
                      bool binary_cmp) const override;
   bool Item_eq_value(THD *thd, const Type_cmp_attributes *attr,
                      Item *a, Item *b) const override;
-  uint Item_decimal_precision(const Item *item) const override;
+  decimal_digits_t Item_decimal_precision(const Item *item) const override;
   bool Item_save_in_value(THD *thd, Item *item, st_value *value) const override;
   bool Item_param_set_from_value(THD *thd,
                                  Item_param *param,
@@ -4753,9 +4820,9 @@ public:
                          const override;
   Item *make_const_item_for_comparison(THD *, Item *src, const Item *cmp)
                                        const override;
-  bool set_comparator_func(Arg_comparator *cmp) const override;
+  bool set_comparator_func(THD *thd, Arg_comparator *cmp) const override;
   bool Item_hybrid_func_fix_attributes(THD *thd,
-                                       const char *name,
+                                       const LEX_CSTRING &name,
                                        Type_handler_hybrid_field_type *,
                                        Type_all_attributes *atrr,
                                        Item **items, uint nitems)
@@ -4871,7 +4938,7 @@ public:
     VDec va(a), vb(b);
     return va.ptr() && vb.ptr() && !va.cmp(vb);
   }
-  uint Item_decimal_precision(const Item *item) const override;
+  decimal_digits_t Item_decimal_precision(const Item *item) const override;
   bool Item_save_in_value(THD *thd, Item *item, st_value *value) const override;
   void Item_param_set_param_func(Item_param *param,
                                  uchar **pos, ulong len) const override;
@@ -4889,9 +4956,9 @@ public:
   Item *make_const_item_for_comparison(THD *, Item *src, const Item *cmp) const
     override;
   Item_cache *Item_get_cache(THD *thd, const Item *item) const override;
-  bool set_comparator_func(Arg_comparator *cmp) const override;
+  bool set_comparator_func(THD *thd, Arg_comparator *cmp) const override;
   bool Item_hybrid_func_fix_attributes(THD *thd,
-                                       const char *name,
+                                       const LEX_CSTRING &name,
                                        Type_handler_hybrid_field_type *,
                                        Type_all_attributes *atrr,
                                        Item **items, uint nitems)
@@ -5113,7 +5180,7 @@ public:
                      bool binary_cmp) const override;
   bool Item_eq_value(THD *thd, const Type_cmp_attributes *attr,
                      Item *a, Item *b) const override;
-  uint Item_decimal_precision(const Item *item) const override;
+  decimal_digits_t Item_decimal_precision(const Item *item) const override;
   bool Item_save_in_value(THD *thd, Item *item, st_value *value) const override;
   bool Item_param_set_from_value(THD *thd,
                                  Item_param *param,
@@ -5123,9 +5190,9 @@ public:
   int Item_save_in_field(Item *item, Field *field, bool no_conversions) const override;
   Item *make_const_item_for_comparison(THD *, Item *src, const Item *cmp) const override;
   Item_cache *Item_get_cache(THD *thd, const Item *item) const override;
-  bool set_comparator_func(Arg_comparator *cmp) const override;
+  bool set_comparator_func(THD *thd, Arg_comparator *cmp) const override;
   bool Item_hybrid_func_fix_attributes(THD *thd,
-                                       const char *name,
+                                       const LEX_CSTRING &name,
                                        Type_handler_hybrid_field_type *,
                                        Type_all_attributes *atrr,
                                        Item **items, uint nitems) const override;
@@ -5199,8 +5266,8 @@ public:
 class Type_handler_temporal_result: public Type_handler
 {
 protected:
-  uint Item_decimal_scale_with_seconds(const Item *item) const;
-  uint Item_divisor_precision_increment_with_seconds(const Item *) const;
+  decimal_digits_t Item_decimal_scale_with_seconds(const Item *item) const;
+  decimal_digits_t Item_divisor_precision_increment_with_seconds(const Item *) const;
 public:
   Item_result result_type() const override { return STRING_RESULT; }
   Item_result cmp_type() const override { return TIME_RESULT; }
@@ -5217,6 +5284,14 @@ public:
   void sort_length(THD *thd,
                    const Type_std_attributes *item,
                    SORT_FIELD_ATTR *attr) const override;
+  bool Column_definition_prepare_stage1(THD *thd,
+                                        MEM_ROOT *mem_root,
+                                        Column_definition *c,
+                                        handler *file,
+                                        ulonglong table_flags,
+                                        const Column_derived_attributes
+                                              *derived_attr)
+                                        const override;
   bool Item_const_eq(const Item_const *a, const Item_const *b,
                      bool binary_cmp) const override;
   bool Item_param_set_from_value(THD *thd,
@@ -5279,7 +5354,7 @@ public:
 
 class Type_handler_string_result: public Type_handler
 {
-  uint Item_temporal_precision(THD *thd, Item *item, bool is_time) const;
+  decimal_digits_t Item_temporal_precision(THD *thd, Item *item, bool is_time) const;
 public:
   const Name &default_value() const override;
   protocol_send_type_t protocol_send_type() const override
@@ -5317,11 +5392,13 @@ public:
                                         MEM_ROOT *mem_root,
                                         Column_definition *c,
                                         handler *file,
-                                        ulonglong table_flags) const override;
+                                        ulonglong table_flags,
+                                        const Column_derived_attributes
+                                              *derived_attr)
+                                        const override;
   bool Column_definition_redefine_stage1(Column_definition *def,
                                          const Column_definition *dup,
-                                         const handler *file,
-                                         const Schema_specification_st *schema)
+                                         const handler *file)
                                          const override;
   void
   Column_definition_attributes_frm_pack(const Column_definition_attributes *at,
@@ -5337,15 +5414,15 @@ public:
                      bool binary_cmp) const override;
   bool Item_eq_value(THD *thd, const Type_cmp_attributes *attr,
                      Item *a, Item *b) const override;
-  uint Item_time_precision(THD *thd, Item *item) const override
+  decimal_digits_t Item_time_precision(THD *thd, Item *item) const override
   {
     return Item_temporal_precision(thd, item, true);
   }
-  uint Item_datetime_precision(THD *thd, Item *item) const override
+  decimal_digits_t Item_datetime_precision(THD *thd, Item *item) const override
   {
     return Item_temporal_precision(thd, item, false);
   }
-  uint Item_decimal_precision(const Item *item) const override;
+  decimal_digits_t Item_decimal_precision(const Item *item) const override;
   void Item_update_null_value(Item *item) const override;
   bool Item_save_in_value(THD *thd, Item *item, st_value *value) const override;
   void Item_param_setup_conversion(THD *thd, Item_param *) const override;
@@ -5377,9 +5454,9 @@ public:
   Item *make_const_item_for_comparison(THD *, Item *src, const Item *cmp) const
     override;
   Item_cache *Item_get_cache(THD *thd, const Item *item) const override;
-  bool set_comparator_func(Arg_comparator *cmp) const override;
+  bool set_comparator_func(THD *thd, Arg_comparator *cmp) const override;
   bool Item_hybrid_func_fix_attributes(THD *thd,
-                                       const char *name,
+                                       const LEX_CSTRING &name,
                                        Type_handler_hybrid_field_type *,
                                        Type_all_attributes *atrr,
                                        Item **items, uint nitems) const
@@ -5450,6 +5527,12 @@ class Type_handler_general_purpose_string: public Type_handler_string_result
 {
 public:
   bool is_general_purpose_string_type() const override { return true; }
+  bool Column_definition_bulk_alter(Column_definition *c,
+                                    const Column_derived_attributes
+                                          *derived_attr,
+                                    const Column_bulk_alter_attributes
+                                          *bulk_alter_attr)
+                                    const override;
 };
 
 
@@ -5842,11 +5925,13 @@ public:
                                         MEM_ROOT *mem_root,
                                         Column_definition *c,
                                         handler *file,
-                                        ulonglong table_flags) const override;
+                                        ulonglong table_flags,
+                                        const Column_derived_attributes
+                                              *derived_attr)
+                                        const override;
   bool Column_definition_redefine_stage1(Column_definition *def,
                                          const Column_definition *dup,
-                                         const handler *file,
-                                         const Schema_specification_st *schema)
+                                         const handler *file)
                                          const override;
   bool Column_definition_prepare_stage2(Column_definition *c,
                                         handler *file,
@@ -6020,12 +6105,12 @@ public:
                              const override;
   bool Item_eq_value(THD *thd, const Type_cmp_attributes *attr,
                      Item *a, Item *b) const override;
-  uint Item_decimal_scale(const Item *item) const override
+  decimal_digits_t Item_decimal_scale(const Item *item) const override
   {
     return Item_decimal_scale_with_seconds(item);
   }
-  uint Item_decimal_precision(const Item *item) const override;
-  uint Item_divisor_precision_increment(const Item *item) const override
+  decimal_digits_t Item_decimal_precision(const Item *item) const override;
+  decimal_digits_t Item_divisor_precision_increment(const Item *item) const override
   {
     return Item_divisor_precision_increment_with_seconds(item);
   }
@@ -6052,7 +6137,7 @@ public:
   Item_cache *Item_get_cache(THD *thd, const Item *item) const override;
   longlong Item_val_int_unsigned_typecast(Item *item) const override;
   bool Item_hybrid_func_fix_attributes(THD *thd,
-                                       const char *name,
+                                       const LEX_CSTRING &name,
                                        Type_handler_hybrid_field_type *,
                                        Type_all_attributes *atrr,
                                        Item **items, uint nitems)
@@ -6085,7 +6170,7 @@ public:
   bool Item_func_int_val_fix_length_and_dec(Item_func_int_val*) const override;
   Item *make_const_item_for_comparison(THD *, Item *src, const Item *cmp)
                                        const override;
-  bool set_comparator_func(Arg_comparator *cmp) const override;
+  bool set_comparator_func(THD *thd, Arg_comparator *cmp) const override;
   cmp_item *make_cmp_item(THD *thd, CHARSET_INFO *cs) const override;
   in_vector *make_in_vector(THD *, const Item_func_in *, uint nargs)
                             const override;
@@ -6179,7 +6264,7 @@ public:
                          const override;
   Item *make_const_item_for_comparison(THD *, Item *src, const Item *cmp)
                                        const override;
-  bool set_comparator_func(Arg_comparator *cmp) const override;
+  bool set_comparator_func(THD *thd, Arg_comparator *cmp) const override;
   cmp_item *make_cmp_item(THD *thd, CHARSET_INFO *cs) const override;
   in_vector *make_in_vector(THD *, const Item_func_in *, uint nargs)
                             const override;
@@ -6235,7 +6320,7 @@ public:
   void
   Column_definition_attributes_frm_pack(const Column_definition_attributes *at,
                                         uchar *buff) const override;
-  uint Item_decimal_precision(const Item *item) const override;
+  decimal_digits_t Item_decimal_precision(const Item *item) const override;
   String *print_item_value(THD *thd, Item *item, String *str) const override;
   Item_cache *Item_get_cache(THD *thd, const Item *item) const override;
   String *Item_func_min_max_val_str(Item_func_min_max *, String *) const override;
@@ -6246,7 +6331,7 @@ public:
   bool Item_func_round_fix_length_and_dec(Item_func_round *) const override;
   bool Item_func_int_val_fix_length_and_dec(Item_func_int_val*) const override;
   bool Item_hybrid_func_fix_attributes(THD *thd,
-                                       const char *name,
+                                       const LEX_CSTRING &name,
                                        Type_handler_hybrid_field_type *,
                                        Type_all_attributes *atrr,
                                        Item **items, uint nitems) const
@@ -6364,12 +6449,12 @@ public:
                                           const uchar *buffer,
                                           LEX_CUSTRING *gis_options)
                                           const override;
-  uint Item_decimal_scale(const Item *item) const override
+  decimal_digits_t Item_decimal_scale(const Item *item) const override
   {
     return Item_decimal_scale_with_seconds(item);
   }
-  uint Item_decimal_precision(const Item *item) const override;
-  uint Item_divisor_precision_increment(const Item *item) const override
+  decimal_digits_t Item_decimal_precision(const Item *item) const override;
+  decimal_digits_t Item_divisor_precision_increment(const Item *item) const override
   {
     return Item_divisor_precision_increment_with_seconds(item);
   }
@@ -6387,7 +6472,7 @@ public:
                                             const override;
   bool Item_func_round_fix_length_and_dec(Item_func_round *) const override;
   bool Item_hybrid_func_fix_attributes(THD *thd,
-                                       const char *name,
+                                       const LEX_CSTRING &name,
                                        Type_handler_hybrid_field_type *,
                                        Type_all_attributes *atrr,
                                        Item **items, uint nitems)
@@ -6526,12 +6611,12 @@ public:
                    const Type_std_attributes *item,
                    SORT_FIELD_ATTR *attr) const override;
   bool Column_definition_fix_attributes(Column_definition *c) const override;
-  uint Item_decimal_scale(const Item *item) const override
+  decimal_digits_t Item_decimal_scale(const Item *item) const override
   {
     return Item_decimal_scale_with_seconds(item);
   }
-  uint Item_decimal_precision(const Item *item) const override;
-  uint Item_divisor_precision_increment(const Item *item) const override
+  decimal_digits_t Item_decimal_precision(const Item *item) const override;
+  decimal_digits_t Item_divisor_precision_increment(const Item *item) const override
   {
     return Item_divisor_precision_increment_with_seconds(item);
   }
@@ -6549,9 +6634,9 @@ public:
   longlong Item_func_min_max_val_int(Item_func_min_max *) const override;
   my_decimal *Item_func_min_max_val_decimal(Item_func_min_max *,
                                             my_decimal *) const override;
-  bool set_comparator_func(Arg_comparator *cmp) const override;
+  bool set_comparator_func(THD *thd, Arg_comparator *cmp) const override;
   bool Item_hybrid_func_fix_attributes(THD *thd,
-                                       const char *name,
+                                       const LEX_CSTRING &name,
                                        Type_handler_hybrid_field_type *,
                                        Type_all_attributes *atrr,
                                        Item **items, uint nitems)
@@ -6690,11 +6775,13 @@ public:
                                         MEM_ROOT *mem_root,
                                         Column_definition *c,
                                         handler *file,
-                                        ulonglong table_flags) const override;
+                                        ulonglong table_flags,
+                                        const Column_derived_attributes
+                                              *derived_attr)
+                                        const override;
   bool Column_definition_redefine_stage1(Column_definition *def,
                                          const Column_definition *dup,
-                                         const handler *file,
-                                         const Schema_specification_st *schema)
+                                         const handler *file)
                                          const override;
   bool Column_definition_prepare_stage2(Column_definition *c,
                                         handler *file,
@@ -6745,11 +6832,13 @@ public:
                                         MEM_ROOT *mem_root,
                                         Column_definition *c,
                                         handler *file,
-                                        ulonglong table_flags) const override;
+                                        ulonglong table_flags,
+                                        const Column_derived_attributes
+                                              *derived_attr)
+                                        const override;
   bool Column_definition_redefine_stage1(Column_definition *def,
                                          const Column_definition *dup,
-                                         const handler *file,
-                                         const Schema_specification_st *schema)
+                                         const handler *file)
                                          const override;
   bool Column_definition_prepare_stage2(Column_definition *c,
                                         handler *file,
@@ -7034,7 +7123,7 @@ public:
                                   const Column_definition &def,
                                   const handler *file) const override;
   bool Item_hybrid_func_fix_attributes(THD *thd,
-                                       const char *name,
+                                       const LEX_CSTRING &name,
                                        Type_handler_hybrid_field_type *,
                                        Type_all_attributes *atrr,
                                        Item **items, uint nitems) const
@@ -7166,7 +7255,7 @@ public:
   bool Item_func_int_val_fix_length_and_dec(Item_func_int_val*) const override;
   uint32 max_display_length_for_field(const Conv_source &src) const override;
   bool Item_hybrid_func_fix_attributes(THD *thd,
-                                       const char *name,
+                                       const LEX_CSTRING &name,
                                        Type_handler_hybrid_field_type *,
                                        Type_all_attributes *atrr,
                                        Item **items, uint nitems)
@@ -7179,12 +7268,13 @@ public:
                                         MEM_ROOT *mem_root,
                                         Column_definition *c,
                                         handler *file,
-                                        ulonglong table_flags)
+                                        ulonglong table_flags,
+                                        const Column_derived_attributes
+                                              *derived_attr)
                                         const override;
   bool Column_definition_redefine_stage1(Column_definition *def,
                                          const Column_definition *dup,
-                                         const handler *file,
-                                         const Schema_specification_st *schema)
+                                         const handler *file)
                                          const override;
   void Item_param_set_param_func(Item_param *param,
                                  uchar **pos, ulong len) const override;
@@ -7368,13 +7458,14 @@ public:
     return (m_type_handler= Type_handler::get_handler_by_real_type(type));
   }
   bool aggregate_for_comparison(const Type_handler *other);
-  bool aggregate_for_comparison(const char *funcname,
+  bool aggregate_for_comparison(const LEX_CSTRING &funcname,
                                 Item **items, uint nitems,
                                 bool treat_int_to_uint_as_decimal);
   bool aggregate_for_result(const Type_handler *other);
-  bool aggregate_for_result(const char *funcname,
+  bool aggregate_for_result(const LEX_CSTRING &funcname,
                             Item **item, uint nitems, bool treat_bit_as_number);
-  bool aggregate_for_min_max(const char *funcname, Item **item, uint nitems);
+  bool aggregate_for_min_max(const LEX_CSTRING &funcname, Item **item,
+                             uint nitems);
 
   bool aggregate_for_num_op(const class Type_aggregator *aggregator,
                             const Type_handler *h0, const Type_handler *h1);

@@ -175,10 +175,10 @@ Table	Op	Msg_type	Msg_text
 test.t1	optimize	note	Table does not support optimize, doing recreate + analyze instead
 test.t1	optimize	status	OK
 show keys from t1;
-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
-t1	0	PRIMARY	1	id	A	#	NULL	NULL		BTREE		
-t1	1	parent_id	1	parent_id	A	#	NULL	NULL		BTREE		
-t1	1	level	1	level	A	#	NULL	NULL		BTREE		
+Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+t1	0	PRIMARY	1	id	A	#	NULL	NULL		BTREE			NO
+t1	1	parent_id	1	parent_id	A	#	NULL	NULL		BTREE			NO
+t1	1	level	1	level	A	#	NULL	NULL		BTREE			NO
 drop table t1;
 CREATE TABLE t1 (
 gesuchnr int(11) DEFAULT '0' NOT NULL,
@@ -220,8 +220,8 @@ Table	Op	Msg_type	Msg_text
 test.t1	analyze	status	Engine-independent statistics collected
 test.t1	analyze	status	OK
 show keys from t1;
-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
-t1	1	skr	1	a	A	#	NULL	NULL	YES	BTREE		
+Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+t1	1	skr	1	a	A	#	NULL	NULL	YES	BTREE			NO
 drop table t1;
 create table t1 (a int,b varchar(20),key(a)) engine=innodb;
 insert into t1 values (1,""), (2,"testing");
@@ -410,13 +410,13 @@ key(a),primary key(a,b), unique(c),key(a),unique(b));
 Warnings:
 Note	1831	Duplicate index `a_2`. This is deprecated and will be disallowed in a future release
 show index from t1;
-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
-t1	0	PRIMARY	1	a	A	#	NULL	NULL		BTREE		
-t1	0	PRIMARY	2	b	A	#	NULL	NULL		BTREE		
-t1	0	c	1	c	A	#	NULL	NULL		BTREE		
-t1	0	b	1	b	A	#	NULL	NULL		BTREE		
-t1	1	a	1	a	A	#	NULL	NULL		BTREE		
-t1	1	a_2	1	a	A	#	NULL	NULL		BTREE		
+Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+t1	0	PRIMARY	1	a	A	#	NULL	NULL		BTREE			NO
+t1	0	PRIMARY	2	b	A	#	NULL	NULL		BTREE			NO
+t1	0	c	1	c	A	#	NULL	NULL		BTREE			NO
+t1	0	b	1	b	A	#	NULL	NULL		BTREE			NO
+t1	1	a	1	a	A	#	NULL	NULL		BTREE			NO
+t1	1	a_2	1	a	A	#	NULL	NULL		BTREE			NO
 drop table t1;
 create table t1 (col1 int not null, col2 char(4) not null, primary key(col1));
 alter table t1 engine=innodb;
@@ -753,8 +753,8 @@ Table	Op	Msg_type	Msg_text
 test.t1	optimize	note	Table does not support optimize, doing recreate + analyze instead
 test.t1	optimize	status	OK
 show keys from t1;
-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
-t1	0	PRIMARY	1	a	A	#	NULL	NULL		BTREE		
+Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+t1	0	PRIMARY	1	a	A	#	NULL	NULL		BTREE			NO
 drop table t1;
 create table t1 (i int, j int ) ENGINE=innodb;
 insert into t1 values (1,2);
@@ -2264,7 +2264,7 @@ create table t1 (v char(10) character set utf8);
 show create table t1;
 Table	Create Table
 t1	CREATE TABLE `t1` (
-  `v` char(10) CHARACTER SET utf8 DEFAULT NULL
+  `v` char(10) CHARACTER SET utf8mb3 DEFAULT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=latin1
 drop table t1;
 create table t1 (v varchar(10), c char(10)) row_format=fixed;
@@ -2300,7 +2300,7 @@ drop table t1;
 SET sql_mode = 'NO_ENGINE_SUBSTITUTION';
 create table t1 (v varchar(65530), key(v));
 Warnings:
-Warning	1071	Specified key was too long; max key length is 3072 bytes
+Note	1071	Specified key was too long; max key length is 3072 bytes
 drop table t1;
 create table t1 (v varchar(65536));
 Warnings:
@@ -2317,7 +2317,7 @@ Note	1246	Converting column 'v' from VARCHAR to TEXT
 show create table t1;
 Table	Create Table
 t1	CREATE TABLE `t1` (
-  `v` mediumtext CHARACTER SET utf8 DEFAULT NULL
+  `v` mediumtext CHARACTER SET utf8mb3 DEFAULT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=latin1
 drop table t1;
 SET sql_mode = default;
@@ -3318,3 +3318,20 @@ c1	c2
 9	3
 DROP TABLE t1;
 DROP TABLE t2;
+#
+# MDEV-24748 Extern field check missing
+#	in btr_index_rec_validate()
+#
+CREATE TABLE t1 (pk INT, c1 char(255),
+c2 char(255), c3 char(255), c4 char(255),
+c5 char(255), c6 char(255), c7 char(255),
+c8 char(255), primary key (pk)
+) CHARACTER SET utf32 ENGINE=InnoDB;
+INSERT INTO t1 VALUES
+(1, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'),
+(2, 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p');
+CHECK TABLE t1;
+Table	Op	Msg_type	Msg_text
+test.t1	check	status	OK
+ALTER TABLE t1 FORCE;
+DROP TABLE t1;

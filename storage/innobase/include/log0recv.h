@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1997, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2017, 2020, MariaDB Corporation.
+Copyright (c) 2017, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -32,6 +32,7 @@ Created 9/20/1997 Heikki Tuuri
 #include "mtr0types.h"
 
 #include <deque>
+#include <map>
 
 /** @return whether recovery is currently running. */
 #define recv_recovery_is_on() UNIV_UNLIKELY(recv_sys.recovery_on)
@@ -212,7 +213,7 @@ struct recv_sys_t
 private:
   /** condition variable for
   !apply_batch_on || pages.empty() || found_corrupt_log || found_corrupt_fs */
-  mysql_cond_t cond;
+  pthread_cond_t cond;
   /** whether recv_apply_hashed_log_recs() is running */
   bool apply_batch_on;
   /** set when finding a corrupt log block or record, or there is a
@@ -404,6 +405,15 @@ public:
   {
     return UNIV_UNLIKELY(recovery_on) ? recover_low(page_id) : nullptr;
   }
+
+  /** Try to recover a tablespace that was not readable earlier
+  @param p          iterator, initially pointing to page_id_t{space_id,0};
+                    the records will be freed and the iterator advanced
+  @param name       tablespace file name
+  @param free_block spare buffer block
+  @return whether recovery failed */
+  bool recover_deferred(map::iterator &p, const std::string &name,
+                        buf_block_t *&free_block);
 };
 
 /** The recovery system */

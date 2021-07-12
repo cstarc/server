@@ -1492,12 +1492,12 @@ void Rdb_key_def::pack_with_make_sort_key(
   DBUG_ASSERT(*dst != nullptr);
 
   const int max_len = fpi->m_max_image_len;
-  my_bitmap_map *old_map;
+  MY_BITMAP*old_map;
 
   old_map= dbug_tmp_use_all_columns(field->table,
-                                    field->table->read_set);
+                                    &field->table->read_set);
   field->sort_string(*dst, max_len);
-  dbug_tmp_restore_column_map(field->table->read_set, old_map);
+  dbug_tmp_restore_column_map(&field->table->read_set, old_map);
   *dst += max_len;
 }
 
@@ -3417,7 +3417,7 @@ bool Rdb_field_packing::setup(const Rdb_key_def *const key_descr,
           sql_print_warning(
               "RocksDB: you're trying to create an index "
               "with a multi-level collation %s",
-              cs->name);
+              cs->cs_name.str);
           //  NO_LINT_DEBUG
           sql_print_warning(
               "MyRocks will handle this collation internally "
@@ -3780,10 +3780,10 @@ bool Rdb_validate_tbls::check_frm_file(const std::string &fullpath,
                                        const std::string &tablename,
                                        bool *has_errors) {
   /* Check this .frm file to see what engine it uses */
-  String fullfilename(fullpath.c_str(), &my_charset_bin);
-  fullfilename.append(FN_DIRSEP);
-  fullfilename.append(tablename.c_str());
-  fullfilename.append(".frm");
+  String fullfilename(fullpath.data(), fullpath.length(), &my_charset_bin);
+  fullfilename.append(STRING_WITH_LEN(FN_DIRSEP));
+  fullfilename.append(tablename.data(), tablename.length());
+  fullfilename.append(STRING_WITH_LEN(".frm"));
 
   /*
     This function will return the legacy_db_type of the table.  Currently
@@ -3793,7 +3793,8 @@ bool Rdb_validate_tbls::check_frm_file(const std::string &fullpath,
   */
   char eng_type_buf[NAME_CHAR_LEN+1];
   LEX_CSTRING eng_type_str = {eng_type_buf, 0}; 
-  enum Table_type type = dd_frm_type(nullptr, fullfilename.c_ptr(), &eng_type_str);
+  enum Table_type type = dd_frm_type(nullptr, fullfilename.c_ptr(),
+                                     &eng_type_str, nullptr, nullptr);
   if (type == TABLE_TYPE_UNKNOWN) {
     // NO_LINT_DEBUG
     sql_print_warning("RocksDB: Failed to open/read .from file: %s",

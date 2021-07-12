@@ -20,8 +20,7 @@
 # along with this program; if not, write to the Free Software Foundation,
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
-INCLUDE_DIRECTORIES(${CMAKE_SOURCE_DIR}
-                    ${CMAKE_SOURCE_DIR}/include
+INCLUDE_DIRECTORIES(${CMAKE_SOURCE_DIR}/include
                     ${CMAKE_SOURCE_DIR}/sql
                     ${CMAKE_BINARY_DIR}/sql
                     ${CMAKE_CURRENT_BINARY_DIR}
@@ -276,7 +275,7 @@ table_replication_connection_configuration.cc
 table_replication_applier_configuration.cc
 table_replication_applier_status.cc
 table_replication_applier_status_by_coordinator.cc
-#table_replication_applier_status_by_worker.cc
+table_replication_applier_status_by_worker.cc
 #table_replication_group_member_stats.cc
 )
 
@@ -290,6 +289,9 @@ int main(int ac, char **av)
   return (tid64 != 0 ? 0 : 1);
 }"
 HAVE_PTHREAD_THREADID_NP)
+
+# gettid() library function (glibc-2.30+)
+CHECK_SYMBOL_EXISTS(gettid unistd.h HAVE_GETTID)
 
 # Check for gettid() system call
 CHECK_C_SOURCE_COMPILES("

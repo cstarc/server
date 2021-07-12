@@ -356,7 +356,7 @@ static void usage(void)
   -?, --help          Display this help and exit.\n\
   -t, --tmpdir=path   Path for temporary files. Multiple paths can be\n\
                       specified, separated by ");
-#if defined( __WIN__)
+#if defined( _WIN32)
    printf("semicolon (;)");
 #else
    printf("colon (:)");
@@ -429,7 +429,7 @@ static void usage(void)
   -q, --quick         Faster repair by not modifying the data file.\n\
                       One can give a second '-q' to force myisamchk to\n\
 		      modify the original datafile in case of duplicate keys.\n\
-		      NOTE: Tables where the data file is currupted can't be\n\
+		      NOTE: Tables where the data file is corrupted can't be\n\
 		      fixed with this option.\n\
   -u, --unpack        Unpack file packed with myisampack.\n\
 ");
@@ -471,7 +471,7 @@ TYPELIB myisam_stats_method_typelib= {
 
 static my_bool
 get_one_option(const struct my_option *opt,
-	       char *argument, const char *filename __attribute__((unused)))
+	       const char *argument, const char *filename __attribute__((unused)))
 {
   switch (opt->id) {
   case 'a':
@@ -794,7 +794,7 @@ static void get_options(register int *argc,register char ***argv)
 
   if (set_collation_name)
     if (!(set_collation= get_charset_by_name(set_collation_name,
-                                             MYF(MY_WME))))
+                                             MYF(MY_UTF8_IS_UTF8MB3 | MY_WME))))
       exit(1);
 
   myisam_block_size=(uint) 1 << my_bit_log2_uint64(opt_myisam_block_size);

@@ -47,7 +47,7 @@ static int table_to_string(TABLE *table, String *result)
 
   res= table->file->ha_rnd_init(1);
 
-  dbug_tmp_use_all_columns(table, table->read_set);
+  dbug_tmp_use_all_columns(table, &table->read_set);
 
   while(!res && !table->file->ha_rnd_next(table->record[0]))
   {
@@ -183,15 +183,15 @@ static void send_report(const char *when)
     str.length(0);
     str.append(STRING_WITH_LEN("FEEDBACK_SERVER_UID"));
     str.append('\t');
-    str.append(server_uid_buf);
+    str.append(server_uid_buf, sizeof(server_uid_buf)-1);
     str.append('\n');
     str.append(STRING_WITH_LEN("FEEDBACK_WHEN"));
     str.append('\t');
-    str.append(when);
+    str.append(when, strlen(when));
     str.append('\n');
     str.append(STRING_WITH_LEN("FEEDBACK_USER_INFO"));
     str.append('\t');
-    str.append(user_info);
+    str.append(user_info, strlen(user_info));
     str.append('\n');
     str.append('\n');
   }

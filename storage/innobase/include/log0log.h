@@ -2,7 +2,7 @@
 
 Copyright (c) 1995, 2017, Oracle and/or its affiliates. All rights reserved.
 Copyright (c) 2009, Google Inc.
-Copyright (c) 2017, 2020, MariaDB Corporation.
+Copyright (c) 2017, 2021, MariaDB Corporation.
 
 Portions of this file contain modifications contributed and copyrighted by
 Google, Inc. Those modifications are gratefully acknowledged and are described
@@ -87,12 +87,6 @@ log_free_check(void);
 @param[in]	len	requested minimum size in bytes */
 void log_buffer_extend(ulong len);
 
-/** Read the current LSN. */
-#define log_get_lsn() log_sys.get_lsn()
-
-/** Read the durable LSN */
-#define log_get_flush_lsn() log_sys.get_flushed_lsn()
-
 /** Calculate the recommended highest values for lsn - last_checkpoint_lsn
 and lsn - buf_pool.get_oldest_modification().
 @param[in]	file_size	requested innodb_log_file_size
@@ -103,15 +97,21 @@ bool
 log_set_capacity(ulonglong file_size)
 	MY_ATTRIBUTE((warn_unused_result));
 
-/** Ensure that the log has been written to the log file up to a given
+/**
+Ensure that the log has been written to the log file up to a given
 log entry (such as that of a transaction commit). Start a new write, or
 wait and check if an already running write is covering the request.
 @param[in]	lsn		log sequence number that should be
 included in the redo log file write
 @param[in]	flush_to_disk	whether the written log should also
 be flushed to the file system
-@param[in]	rotate_key	whether to rotate the encryption key */
-void log_write_up_to(lsn_t lsn, bool flush_to_disk, bool rotate_key = false);
+@param[in]	rotate_key	whether to rotate the encryption key
+@param[in]  cb completion callback. If not NULL, the callback will be called
+  whenever lsn is written or flushed.
+*/
+struct completion_callback;
+void log_write_up_to(lsn_t lsn, bool flush_to_disk, bool rotate_key = false,
+  const completion_callback* cb=nullptr);
 
 /** write to the log file up to the last log entry.
 @param[in]	sync	whether we want the written log
@@ -646,13 +646,14 @@ public:
 
   bool is_initialised() const { return m_initialised; }
 
-  lsn_t get_lsn() const { return lsn.load(std::memory_order_relaxed); }
-  void set_lsn(lsn_t lsn) { this->lsn.store(lsn, std::memory_order_relaxed); }
+  lsn_t get_lsn(std::memory_order order= std::memory_order_relaxed) const
+  { return lsn.load(order); }
+  void set_lsn(lsn_t lsn) { this->lsn.store(lsn, std::memory_order_release); }
 
   lsn_t get_flushed_lsn() const
-  { return flushed_to_disk_lsn.load(std::memory_order_relaxed); }
+  { return flushed_to_disk_lsn.load(std::memory_order_acquire); }
   void set_flushed_lsn(lsn_t lsn)
-  { flushed_to_disk_lsn.store(lsn, std::memory_order_relaxed); }
+  { flushed_to_disk_lsn.store(lsn, std::memory_order_release); }
 
   bool check_flush_or_checkpoint() const
   {

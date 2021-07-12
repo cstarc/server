@@ -45,6 +45,7 @@ C_MODE_END
 #include "key.h"
 #include "log.h"
 #include "sql_parse.h"
+#include "debug.h"
 
 /*
   Note that in future versions, only *transactional* Maria tables can
@@ -61,8 +62,7 @@ C_MODE_END
 ulong pagecache_division_limit, pagecache_age_threshold, pagecache_file_hash_size;
 ulonglong pagecache_buffer_size;
 const char *zerofill_error_msg=
-  "Table is from another system and must be zerofilled or repaired to be "
-  "usable on this system";
+  "Table is probably from another system and must be zerofilled or repaired ('REPAIR TABLE table_name') to be usable on this system";
 
 /**
    As the auto-repair is initiated when opened from the SQL layer
@@ -187,11 +187,10 @@ static MYSQL_SYSVAR_BOOL(page_checksum, maria_page_checksums, 0,
        "with PAGE_CHECKSUM clause in CREATE TABLE)", 0, 0, 1);
 
 /* It is only command line argument */
-static MYSQL_SYSVAR_STR(log_dir_path, maria_data_root,
+static MYSQL_SYSVAR_CONST_STR(log_dir_path, maria_data_root,
        PLUGIN_VAR_NOSYSVAR | PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
        "Path to the directory where to store transactional log",
        NULL, NULL, mysql_real_data_home);
-
 
 static MYSQL_SYSVAR_ULONG(log_file_size, log_file_size,
        PLUGIN_VAR_RQCMDARG,
@@ -268,8 +267,9 @@ static MYSQL_THDVAR_ULONG(repair_threads, PLUGIN_VAR_RQCMDARG,
 
 static MYSQL_THDVAR_ULONGLONG(sort_buffer_size, PLUGIN_VAR_RQCMDARG,
        "The buffer that is allocated when sorting the index when doing a "
-       "REPAIR or when creating indexes with CREATE INDEX or ALTER TABLE.", NULL, NULL,
-       SORT_BUFFER_INIT, MIN_SORT_BUFFER, SIZE_T_MAX, 1);
+       "REPAIR or when creating indexes with CREATE INDEX or ALTER TABLE.",
+       NULL, NULL,
+       SORT_BUFFER_INIT, MIN_SORT_BUFFER, SIZE_T_MAX/2, 1);
 
 static MYSQL_THDVAR_ENUM(stats_method, PLUGIN_VAR_RQCMDARG,
        "Specifies how Aria index statistics collection code should treat "
@@ -391,9 +391,9 @@ static void init_aria_psi_keys(void)
 #define init_aria_psi_keys() /* no-op */
 #endif /* HAVE_PSI_INTERFACE */
 
-const char *MA_CHECK_INFO= "info";
-const char *MA_CHECK_WARNING= "warning";
-const char *MA_CHECK_ERROR= "error";
+const LEX_CSTRING MA_CHECK_INFO= { STRING_WITH_LEN("info") };
+const LEX_CSTRING MA_CHECK_WARNING= { STRING_WITH_LEN("warning") };
+const LEX_CSTRING MA_CHECK_ERROR= { STRING_WITH_LEN("error") };
 
 /*****************************************************************************
 ** MARIA tables
@@ -407,13 +407,13 @@ static handler *maria_create_handler(handlerton *hton,
 }
 
 
-static void _ma_check_print(HA_CHECK *param, const char* msg_type,
+static void _ma_check_print(HA_CHECK *param, const LEX_CSTRING *msg_type,
                             const char *msgbuf)
 {
-  if (msg_type == MA_CHECK_INFO)
+  if (msg_type == &MA_CHECK_INFO)
     sql_print_information("%s.%s: %s", param->db_name, param->table_name,
                           msgbuf);
-  else if (msg_type == MA_CHECK_WARNING)
+  else if (msg_type == &MA_CHECK_WARNING)
     sql_print_warning("%s.%s: %s", param->db_name, param->table_name,
                       msgbuf);
   else
@@ -423,7 +423,7 @@ static void _ma_check_print(HA_CHECK *param, const char* msg_type,
 
 // collect errors printed by maria_check routines
 
-static void _ma_check_print_msg(HA_CHECK *param, const char *msg_type,
+static void _ma_check_print_msg(HA_CHECK *param, const LEX_CSTRING *msg_type,
                                 const char *fmt, va_list args)
 {
   THD *thd= (THD *) param->thd;
@@ -438,7 +438,7 @@ static void _ma_check_print_msg(HA_CHECK *param, const char *msg_type,
   msg_length= my_vsnprintf(msgbuf, sizeof(msgbuf), fmt, args);
   msgbuf[sizeof(msgbuf) - 1]= 0;                // healthy paranoia
 
-  DBUG_PRINT(msg_type, ("message: %s", msgbuf));
+  DBUG_PRINT(msg_type->str, ("message: %s", msgbuf));
 
   if (!thd->vio_ok())
   {
@@ -450,9 +450,9 @@ static void _ma_check_print_msg(HA_CHECK *param, const char *msg_type,
       (T_CREATE_MISSING_KEYS | T_SAFE_REPAIR | T_AUTO_REPAIR))
   {
     myf flag= 0;
-    if (msg_type == MA_CHECK_INFO)
+    if (msg_type == &MA_CHECK_INFO)
       flag= ME_NOTE;
-    else if (msg_type == MA_CHECK_WARNING)
+    else if (msg_type == &MA_CHECK_WARNING)
       flag= ME_WARNING;
     my_message(ER_NOT_KEYFILE, msgbuf, MYF(flag));
     if (thd->variables.log_warnings > 2)
@@ -471,9 +471,9 @@ static void _ma_check_print_msg(HA_CHECK *param, const char *msg_type,
   */
   protocol->prepare_for_resend();
   protocol->store(name, (uint)length, system_charset_info);
-  protocol->store(param->op_name, system_charset_info);
+  protocol->store(param->op_name, strlen(param->op_name), system_charset_info);
   protocol->store(msg_type, system_charset_info);
-  protocol->store(msgbuf, (uint)msg_length, system_charset_info);
+  protocol->store(msgbuf, msg_length, system_charset_info);
   if (protocol->write())
     sql_print_error("Failed on my_net_write, writing to stderr instead: %s.%s: %s\n",
                     param->db_name, param->table_name, msgbuf);
@@ -906,12 +906,12 @@ void _ma_check_print_error(HA_CHECK *param, const char *fmt, ...)
 {
   va_list args;
   DBUG_ENTER("_ma_check_print_error");
-  param->error_printed |= 1;
+  param->error_printed++;
   param->out_flag |= O_DATA_LOST;
   if (param->testflag & T_SUPPRESS_ERR_HANDLING)
     DBUG_VOID_RETURN;
   va_start(args, fmt);
-  _ma_check_print_msg(param, MA_CHECK_ERROR, fmt, args);
+  _ma_check_print_msg(param, &MA_CHECK_ERROR, fmt, args);
   va_end(args);
   DBUG_VOID_RETURN;
 }
@@ -922,7 +922,7 @@ void _ma_check_print_info(HA_CHECK *param, const char *fmt, ...)
   va_list args;
   DBUG_ENTER("_ma_check_print_info");
   va_start(args, fmt);
-  _ma_check_print_msg(param, MA_CHECK_INFO, fmt, args);
+  _ma_check_print_msg(param, &MA_CHECK_INFO, fmt, args);
   va_end(args);
   DBUG_VOID_RETURN;
 }
@@ -932,10 +932,10 @@ void _ma_check_print_warning(HA_CHECK *param, const char *fmt, ...)
 {
   va_list args;
   DBUG_ENTER("_ma_check_print_warning");
-  param->warning_printed= 1;
+  param->warning_printed++;
   param->out_flag |= O_DATA_LOST;
   va_start(args, fmt);
-  _ma_check_print_msg(param, MA_CHECK_WARNING, fmt, args);
+  _ma_check_print_msg(param, &MA_CHECK_WARNING, fmt, args);
   va_end(args);
   DBUG_VOID_RETURN;
 }
@@ -995,6 +995,13 @@ static int maria_create_trn_for_mysql(MARIA_HA *info)
 my_bool ma_killed_in_mariadb(MARIA_HA *info)
 {
   return (((TABLE*) (info->external_ref))->in_use->killed != 0);
+}
+
+void maria_debug_crash_here(const char *keyword)
+{
+#ifndef DBUG_OFF
+  debug_crash_here(keyword);
+#endif /* DBUG_OFF */
 }
 
 } /* extern "C" */
@@ -1262,7 +1269,7 @@ int ha_maria::write_row(const uchar * buf)
 
 int ha_maria::check(THD * thd, HA_CHECK_OPT * check_opt)
 {
-  int error;
+  int error, fatal_error;
   HA_CHECK *param= (HA_CHECK*) thd->alloc(sizeof *param);
   MARIA_SHARE *share= file->s;
   const char *old_proc_info;
@@ -1294,6 +1301,7 @@ int ha_maria::check(THD * thd, HA_CHECK_OPT * check_opt)
     return HA_ADMIN_ALREADY_DONE;
 
   maria_chk_init_for_check(param, file);
+  param->max_allowed_lsn= translog_get_horizon();
 
   if ((file->s->state.changed & (STATE_CRASHED_FLAGS | STATE_MOVED)) ==
       STATE_MOVED)
@@ -1336,22 +1344,38 @@ int ha_maria::check(THD * thd, HA_CHECK_OPT * check_opt)
       param->testflag= old_testflag;
     }
   }
-  if (!error)
+  fatal_error= error;
+  if (param->error_printed &&
+      param->error_printed == (param->skip_lsn_error_count +
+                               param->not_visible_rows_found) &&
+      !(share->state.changed & (STATE_CRASHED_FLAGS | STATE_IN_REPAIR)))
   {
-    if ((share->state.changed & (STATE_CHANGED |
+    _ma_check_print_error(param, "%s", zerofill_error_msg);
+    /* This ensures that a future REPAIR TABLE will only do a zerofill */
+    file->update|= STATE_MOVED;
+    share->state.changed|= STATE_MOVED;
+    fatal_error= 0;
+  }
+  if (!fatal_error)
+  {
+    if ((share->state.changed & (STATE_CHANGED | STATE_MOVED |
                                  STATE_CRASHED_FLAGS |
                                  STATE_IN_REPAIR | STATE_NOT_ANALYZED)) ||
         (param->testflag & T_STATISTICS) || maria_is_crashed(file))
     {
       file->update |= HA_STATE_CHANGED | HA_STATE_ROW_CHANGED;
       mysql_mutex_lock(&share->intern_lock);
-      DBUG_PRINT("info", ("Reseting crashed state"));
+      DBUG_PRINT("info", ("Resetting crashed state"));
       share->state.changed&= ~(STATE_CHANGED | STATE_CRASHED_FLAGS |
                                STATE_IN_REPAIR);
       if (!(table->db_stat & HA_READ_ONLY))
-        error= maria_update_state_info(param, file,
-                                       UPDATE_TIME | UPDATE_OPEN_COUNT |
-                                       UPDATE_STAT);
+      {
+        int tmp;
+        if ((tmp= maria_update_state_info(param, file,
+                                          UPDATE_TIME | UPDATE_OPEN_COUNT |
+                                          UPDATE_STAT)))
+          error= tmp;
+      }
       mysql_mutex_unlock(&share->intern_lock);
       info(HA_STATUS_NO_LOCK | HA_STATUS_TIME | HA_STATUS_VARIABLE |
            HA_STATUS_CONST);
@@ -1443,6 +1467,20 @@ int ha_maria::repair(THD * thd, HA_CHECK_OPT *check_opt)
   maria_chk_init(param);
   param->thd= thd;
   param->op_name= "repair";
+
+  /*
+    The following can only be true if the table was marked as STATE_MOVED
+    during a CHECK TABLE and the table has not been used since then
+  */
+  if ((file->s->state.changed & STATE_MOVED) &&
+      !(file->s->state.changed & STATE_CRASHED_FLAGS))
+  {
+    param->db_name= table->s->db.str;
+    param->table_name= table->alias.c_ptr();
+    _ma_check_print_info(param, "Running zerofill on moved table");
+    return zerofill(thd, check_opt);
+  }
+
   param->testflag= ((check_opt->flags & ~(T_EXTEND)) |
                    T_SILENT | T_FORCE_CREATE | T_CALC_CHECKSUM |
                    (check_opt->flags & T_EXTEND ? T_REP : T_REP_BY_SORT));
@@ -1518,6 +1556,9 @@ int ha_maria::zerofill(THD * thd, HA_CHECK_OPT *check_opt)
   param->op_name= "zerofill";
   param->testflag= check_opt->flags | T_SILENT | T_ZEROFILL;
   param->sort_buffer_length= THDVAR(thd, sort_buffer_size);
+  param->db_name= table->s->db.str;
+  param->table_name= table->alias.c_ptr();
+
   error=maria_zerofill(param, file, share->open_file_name.str);
 
   /* Reset trn, that may have been set by repair */
@@ -1722,7 +1763,7 @@ int ha_maria::repair(THD *thd, HA_CHECK *param, bool do_optimize)
   {
     if ((share->state.changed & STATE_CHANGED) || maria_is_crashed(file))
     {
-      DBUG_PRINT("info", ("Reseting crashed state"));
+      DBUG_PRINT("info", ("Resetting crashed state"));
       share->state.changed&= ~(STATE_CHANGED | STATE_CRASHED_FLAGS |
                                STATE_IN_REPAIR | STATE_MOVED);
       file->update |= HA_STATE_CHANGED | HA_STATE_ROW_CHANGED;
@@ -2273,6 +2314,7 @@ int ha_maria::end_bulk_insert()
                                                BULK_INSERT_SINGLE_UNDO_AND_NO_REPAIR)))
       first_error= first_error ? first_error : error;
     bulk_insert_single_undo= BULK_INSERT_NONE;  // Safety
+    log_not_redoable_operation("BULK_INSERT");
   }
   can_enable_indexes= 0;
   DBUG_RETURN(first_error);
@@ -3761,6 +3803,7 @@ static int ha_maria_init(void *p)
                       HTON_TRANSACTIONAL_AND_NON_TRANSACTIONAL);
   bzero(maria_log_pagecache, sizeof(*maria_log_pagecache));
   maria_tmpdir= &mysql_tmpdir_list;             /* For REDO */
+  ma_debug_crash_here= maria_debug_crash_here;
 
   if (!aria_readonly)
     res= maria_upgrade();
@@ -4164,6 +4207,26 @@ int ha_maria::find_unique_row(uchar *record, uint constrain_no)
   }
   return rc;
 }
+
+
+/**
+   Check if a table needs to be repaired
+*/
+
+int ha_maria::check_for_upgrade(HA_CHECK_OPT *check)
+{
+  if (table->s->mysql_version && table->s->mysql_version <= 100509 &&
+      (file->s->base.extra_options & MA_EXTRA_OPTIONS_ENCRYPTED))
+  {
+    /*
+      Encrypted tables before 10.5.9 had a bug where LSN was not
+      stored on the pages. These must be repaired!
+    */
+    return HA_ADMIN_NEEDS_ALTER;
+  }
+  return HA_ADMIN_OK;
+}
+
 
 struct st_mysql_storage_engine maria_storage_engine=
 { MYSQL_HANDLERTON_INTERFACE_VERSION };

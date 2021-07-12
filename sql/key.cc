@@ -245,14 +245,13 @@ void key_restore(uchar *to_record, const uchar *from_key, KEY *key_info,
     else if (key_part->key_part_flag & HA_VAR_LENGTH_PART)
     {
       Field *field= key_part->field;
-      my_bitmap_map *old_map;
       my_ptrdiff_t ptrdiff= to_record - field->table->record[0];
       field->move_field_offset(ptrdiff);
       key_length-= HA_KEY_BLOB_LENGTH;
       length= MY_MIN(key_length, key_part->length);
-      old_map= dbug_tmp_use_all_columns(field->table, field->table->write_set);
+      MY_BITMAP *old_map= dbug_tmp_use_all_columns(field->table, &field->table->write_set);
       field->set_key_image(from_key, length);
-      dbug_tmp_restore_column_map(field->table->write_set, old_map);
+      dbug_tmp_restore_column_map(&field->table->write_set, old_map);
       from_key+= HA_KEY_BLOB_LENGTH;
       field->move_field_offset(-ptrdiff);
     }
@@ -361,7 +360,7 @@ void field_unpack(String *to, Field *field, const uchar *rec, uint max_length,
   {
     if (field->is_null())
     {
-      to->append(STRING_WITH_LEN("NULL"));
+      to->append(NULL_clex_str);
       DBUG_VOID_RETURN;
     }
     CHARSET_INFO *cs= field->charset();
@@ -394,7 +393,7 @@ void field_unpack(String *to, Field *field, const uchar *rec, uint max_length,
     if (max_length < field->pack_length())
       tmp.length(MY_MIN(tmp.length(),max_length));
     ErrConvString err(&tmp);
-    to->append(err.ptr());
+    to->append(err.lex_cstring());
   }
   else
     to->append(STRING_WITH_LEN("???"));
@@ -418,7 +417,7 @@ void field_unpack(String *to, Field *field, const uchar *rec, uint max_length,
 
 void key_unpack(String *to, TABLE *table, KEY *key)
 {
-  my_bitmap_map *old_map= dbug_tmp_use_all_columns(table, table->read_set);
+  MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->read_set);
   DBUG_ENTER("key_unpack");
 
   to->length(0);
@@ -435,14 +434,14 @@ void key_unpack(String *to, TABLE *table, KEY *key)
     {
       if (table->record[0][key_part->null_offset] & key_part->null_bit)
       {
-	to->append(STRING_WITH_LEN("NULL"));
+	to->append(NULL_clex_str);
 	continue;
       }
     }
     field_unpack(to, key_part->field, table->record[0], key_part->length,
                  MY_TEST(key_part->key_part_flag & HA_PART_KEY_SEG));
  }
-  dbug_tmp_restore_column_map(table->read_set, old_map);
+  dbug_tmp_restore_column_map(&table->read_set, old_map);
   DBUG_VOID_RETURN;
 }
 

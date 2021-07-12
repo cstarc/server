@@ -63,7 +63,7 @@ my $cmd;
 if ($opt_purge)
 {
   $cmd= "find . -name '*.da' -o -name '*.gcda' -o -name '*.gcov' -o ".
-               "-name '*.dgcov' | grep -v 'README\.gcov' | xargs rm -f ''";
+               "-name '*.dgcov' | xargs rm -f ''";
   logv "Running: $cmd";
   system($cmd)==0 or die "system($cmd): $? $!";
   exit 0;
@@ -161,8 +161,13 @@ sub gcov_one_file {
     system($cmd)==0 or die "system($cmd): $? $!";
   }
 
-  # now, read the generated file
-  open FH, '<', "$_.gcov" or die "open(<$_.gcov): $!";
+  (my $filename = $_)=~ s/\.[^.]+$//; # remove extension
+  my $gcov_file_path= $File::Find::dir."/$filename.gcov";
+  if (! -f $gcov_file_path)
+  {
+    return;
+  }
+  open FH, '<', "$gcov_file_path" or die "open(<$gcov_file_path): $!";
   my $fname;
   while (<FH>) {
     chomp;

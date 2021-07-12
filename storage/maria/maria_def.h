@@ -511,7 +511,7 @@ typedef struct st_maria_state_info
 #define MARIA_FILE_CREATE_RENAME_LSN_OFFSET 4
 #define MARIA_FILE_CREATE_TRID_OFFSET (4 + LSN_STORE_SIZE*3 + 11*8)
 
-#define MARIA_MAX_KEY_LENGTH    2000
+#define MARIA_MAX_KEY_LENGTH    2300
 #define MARIA_MAX_KEY_BUFF      (MARIA_MAX_KEY_LENGTH+HA_MAX_KEY_SEG*6+8+8 + \
                                  MARIA_MAX_PACK_TRANSID_SIZE)
 #define MARIA_MAX_POSSIBLE_KEY_BUFF  (MARIA_MAX_KEY_LENGTH + 24+ 6+6)
@@ -1238,7 +1238,7 @@ extern uchar maria_file_magic[], maria_pack_file_magic[];
 extern uchar maria_uuid[MY_UUID_SIZE];
 extern uint32 maria_read_vec[], maria_readnext_vec[];
 extern uint maria_quick_table_bits;
-extern char *maria_data_root;
+extern const char *maria_data_root;
 extern uchar maria_zero_string[];
 extern my_bool maria_inited, maria_in_ha_maria, maria_recovery_changed_data;
 extern my_bool maria_recovery_verbose, maria_checkpoint_disabled;
@@ -1247,6 +1247,7 @@ extern ulong maria_checkpoint_min_log_activity;
 extern HASH maria_stored_state;
 extern int (*maria_create_trn_hook)(MARIA_HA *);
 extern my_bool (*ma_killed)(MARIA_HA *);
+extern void (*ma_debug_crash_here)(const char *keyword);
 
 #ifdef HAVE_PSI_INTERFACE
 extern PSI_mutex_key key_SHARE_BITMAP_lock, key_SORT_INFO_mutex,
@@ -1511,7 +1512,7 @@ extern my_bool _ma_read_cache(MARIA_HA *, IO_CACHE *info, uchar *buff,
                               uint re_read_if_possibly);
 extern ulonglong ma_retrieve_auto_increment(const uchar *key, uint8 key_type);
 extern my_bool _ma_alloc_buffer(uchar **old_addr, size_t *old_size,
-                                size_t new_size);
+                                size_t new_size, myf flag);
 extern size_t _ma_rec_unpack(MARIA_HA *info, uchar *to, uchar *from,
                             size_t reclength);
 extern my_bool _ma_rec_check(MARIA_HA *info, const uchar *record,

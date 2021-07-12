@@ -61,7 +61,7 @@ Relay_log_info::Relay_log_info(bool is_slave_recovery, const char* thread_name)
    gtid_skip_flag(GTID_SKIP_NOT), inited(0), abort_slave(0), stop_for_until(0),
    slave_running(MYSQL_SLAVE_NOT_RUN), until_condition(UNTIL_NONE),
    until_log_pos(0), retried_trans(0), executed_entries(0),
-   sql_delay(0), sql_delay_end(0),
+   last_trans_retry_count(0), sql_delay(0), sql_delay_end(0),
    until_relay_log_names_defer(false),
    m_flags(0)
 {
@@ -87,6 +87,7 @@ Relay_log_info::Relay_log_info(bool is_slave_recovery, const char* thread_name)
   max_relay_log_size= global_system_variables.max_relay_log_size;
   bzero((char*) &info_file, sizeof(info_file));
   bzero((char*) &cache_buf, sizeof(cache_buf));
+  bzero(&last_seen_gtid, sizeof(last_seen_gtid));
   mysql_mutex_init(key_relay_log_info_run_lock, &run_lock, MY_MUTEX_INIT_FAST);
   mysql_mutex_init(key_relay_log_info_data_lock,
                    &data_lock, MY_MUTEX_INIT_FAST);
@@ -209,8 +210,8 @@ a file name for --relay-log-index option", opt_relaylog_index_name);
       */
       sql_print_warning("Neither --relay-log nor --relay-log-index were used;"
                         " so replication "
-                        "may break when this MySQL server acts as a "
-                        "slave and has his hostname changed!! Please "
+                        "may break when this MariaDB server acts as a "
+                        "replica and has its hostname changed. Please "
                         "use '--log-basename=#' or '--relay-log=%s' to avoid "
                         "this problem.", ln);
       name_warning_sent= 1;
@@ -993,7 +994,7 @@ void Relay_log_info::inc_group_relay_log_pos(ulonglong log_pos,
   if (rgi->is_parallel_exec)
   {
     /* In case of parallel replication, do not update the position backwards. */
-    int cmp= strcmp(group_relay_log_name, rgi->event_relay_log_name);
+    int cmp= compare_log_name(group_relay_log_name, rgi->event_relay_log_name);
     if (cmp < 0)
     {
       group_relay_log_pos= rgi->future_event_relay_log_pos;
@@ -1005,7 +1006,7 @@ void Relay_log_info::inc_group_relay_log_pos(ulonglong log_pos,
       In the parallel case we need to update the master_log_name here, rather
       than in Rotate_log_event::do_update_pos().
     */
-    cmp= strcmp(group_master_log_name, rgi->future_event_master_log_name);
+    cmp= compare_log_name(group_master_log_name, rgi->future_event_master_log_name);
     if (cmp <= 0)
     {
       if (cmp < 0)
@@ -1710,7 +1711,8 @@ scan_all_gtid_slave_pos_table(THD *thd, int (*cb)(THD *, LEX_CSTRING *, void *),
   else
   {
     size_t i;
-    Dynamic_array<LEX_CSTRING*> files(dirp->number_of_files);
+    Dynamic_array<LEX_CSTRING*> files(PSI_INSTRUMENT_MEM,
+                                      dirp->number_of_files);
     Discovered_table_list tl(thd, &files);
     int err;
 

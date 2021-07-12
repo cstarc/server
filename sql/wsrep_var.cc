@@ -25,6 +25,7 @@
 #include <my_dir.h>
 #include <cstdio>
 #include <cstdlib>
+#include "wsrep_trans_observer.h"
 
 ulong   wsrep_reject_queries;
 
@@ -91,15 +92,19 @@ static bool refresh_provider_options()
   }
 }
 
-static void wsrep_set_wsrep_on()
+void wsrep_set_wsrep_on(THD* thd)
 {
-  WSREP_ON_= global_system_variables.wsrep_on && wsrep_provider &&
-    strcmp(wsrep_provider, WSREP_NONE);
+  if (thd)
+    thd->wsrep_was_on= WSREP_ON_;
+  WSREP_PROVIDER_EXISTS_= wsrep_provider &&
+    strncasecmp(wsrep_provider, WSREP_NONE, FN_REFLEN);
+  WSREP_ON_= global_system_variables.wsrep_on && WSREP_PROVIDER_EXISTS_;
 }
 
 bool wsrep_on_update (sys_var *self, THD* thd, enum_var_type var_type)
 {
-  if (var_type == OPT_GLOBAL) {
+  if (var_type == OPT_GLOBAL)
+  {
     my_bool saved_wsrep_on= global_system_variables.wsrep_on;
 
     thd->variables.wsrep_on= global_system_variables.wsrep_on;
@@ -107,15 +112,15 @@ bool wsrep_on_update (sys_var *self, THD* thd, enum_var_type var_type)
     // If wsrep has not been inited we need to do it now
     if (global_system_variables.wsrep_on && wsrep_provider && !wsrep_inited)
     {
-      char* tmp= strdup(wsrep_provider); // wsrep_init() rewrites provider
-                                         //when fails
-
+      // wsrep_init() rewrites provide if it fails
+      char* tmp= strdup(wsrep_provider);
       mysql_mutex_unlock(&LOCK_global_system_variables);
 
       if (wsrep_init())
       {
         my_error(ER_CANT_OPEN_LIBRARY, MYF(0), tmp, my_error, "wsrep_init failed");
         //rcode= true;
+        saved_wsrep_on= false;
       }
 
       free(tmp);
@@ -125,14 +130,72 @@ bool wsrep_on_update (sys_var *self, THD* thd, enum_var_type var_type)
     thd->variables.wsrep_on= global_system_variables.wsrep_on= saved_wsrep_on;
   }
 
-  wsrep_set_wsrep_on();
+  wsrep_set_wsrep_on(thd);
+
+  if (var_type == OPT_GLOBAL)
+  {
+    if (thd->variables.wsrep_on &&
+        thd->wsrep_cs().state() == wsrep::client_state::s_none)
+    {
+      wsrep_open(thd);
+      wsrep_before_command(thd);
+    }
+  }
 
   return false;
 }
 
 bool wsrep_on_check(sys_var *self, THD* thd, set_var* var)
 {
-  return check_has_super(self, thd, var);
+  bool new_wsrep_on= (bool)var->save_result.ulonglong_value;
+
+  if (check_has_super(self, thd, var))
+    return true;
+
+  if (new_wsrep_on)
+  {
+    if (!WSREP_PROVIDER_EXISTS)
+    {
+      my_message(ER_WRONG_ARGUMENTS, "WSREP (galera) can't be enabled "
+                 "if the wsrep_provider is unset or set to 'none'", MYF(0));
+      return true;
+    }
+
+    if (var->type == OPT_SESSION &&
+        !global_system_variables.wsrep_on)
+    {
+      my_message(ER_WRONG_ARGUMENTS,
+                 "Can't enable @@session.wsrep_on, "
+                 "while @@global.wsrep_on is disabled", MYF(0));
+      return true;
+    }
+  }
+
+  if (thd->in_active_multi_stmt_transaction())
+  {
+    my_error(ER_CANT_DO_THIS_DURING_AN_TRANSACTION, MYF(0));
+    return true;
+  }
+
+  if (var->type == OPT_GLOBAL)
+  {
+    /*
+      The global value is about to change. Cleanup
+      the transaction state and close the client
+      state. wsrep_on_update() will take care of
+      reopening it should wsrep_on be re-enabled.
+     */
+    if (global_system_variables.wsrep_on && !new_wsrep_on)
+    {
+      wsrep_commit_empty(thd, true);
+      wsrep_after_statement(thd);
+      wsrep_after_command_ignore_result(thd);
+      wsrep_close(thd);
+      wsrep_cleanup(thd);
+    }
+  }
+
+  return false;
 }
 
 bool wsrep_causal_reads_update (sys_var *self, THD* thd, enum_var_type var_type)
@@ -445,7 +508,7 @@ bool wsrep_provider_update (sys_var *self, THD* thd, enum_var_type type)
   if (!rcode)
     refresh_provider_options();
 
-  wsrep_set_wsrep_on();
+  wsrep_set_wsrep_on(thd);
   mysql_mutex_lock(&LOCK_global_system_variables);
 
   return rcode;
@@ -465,7 +528,7 @@ void wsrep_provider_init (const char* value)
 
   if (wsrep_provider) my_free((void *)wsrep_provider);
   wsrep_provider= my_strdup(PSI_INSTRUMENT_MEM, value, MYF(0));
-  wsrep_set_wsrep_on();
+  wsrep_set_wsrep_on(NULL);
 }
 
 bool wsrep_provider_options_check(sys_var *self, THD* thd, set_var* var)
@@ -480,15 +543,21 @@ bool wsrep_provider_options_check(sys_var *self, THD* thd, set_var* var)
 
 bool wsrep_provider_options_update(sys_var *self, THD* thd, enum_var_type type)
 {
-  enum wsrep::provider::status ret=
-    Wsrep_server_state::instance().provider().options(wsrep_provider_options);
-  if (ret)
+  if (wsrep_provider_options)
   {
-    WSREP_ERROR("Set options returned %d", ret);
-    refresh_provider_options();
-    return true;
+    enum wsrep::provider::status ret=
+      Wsrep_server_state::instance().provider().options(wsrep_provider_options);
+    if (ret)
+    {
+      WSREP_ERROR("Set options returned %d", ret);
+      goto err;
+    }
+
+    return refresh_provider_options();
   }
-  return refresh_provider_options();
+err:
+  refresh_provider_options();
+  return true;
 }
 
 void wsrep_provider_options_init(const char* value)
@@ -586,30 +655,31 @@ bool wsrep_cluster_address_update (sys_var *self, THD* thd, enum_var_type type)
   /* stop replication is heavy operation, and includes closing all client
      connections. Closing clients may need to get LOCK_global_system_variables
      at least in MariaDB.
-
-     Note: releasing LOCK_global_system_variables may cause race condition, if
-     there can be several concurrent clients changing wsrep_provider
   */
+  char *tmp= my_strdup(PSI_INSTRUMENT_ME, wsrep_cluster_address, MYF(MY_WME));
   WSREP_DEBUG("wsrep_cluster_address_update: %s", wsrep_cluster_address);
   mysql_mutex_unlock(&LOCK_global_system_variables);
+
+  mysql_mutex_lock(&LOCK_wsrep_cluster_config);
   wsrep_stop_replication(thd);
 
-  if (wsrep_start_replication())
+  if (*tmp && wsrep_start_replication(tmp))
   {
     wsrep_create_rollbacker();
     WSREP_DEBUG("Cluster address update creating %ld applier threads running %lu",
 	    wsrep_slave_threads, wsrep_running_applier_threads);
     wsrep_create_appliers(wsrep_slave_threads);
   }
-  /* locking order to be enforced is:
-     1. LOCK_global_system_variables
-     2. LOCK_wsrep_cluster_config
-     => have to juggle mutexes to comply with this
-  */
-
   mysql_mutex_unlock(&LOCK_wsrep_cluster_config);
+
   mysql_mutex_lock(&LOCK_global_system_variables);
-  mysql_mutex_lock(&LOCK_wsrep_cluster_config);
+  if (strcmp(tmp, wsrep_cluster_address))
+  {
+    my_free((void*)wsrep_cluster_address);
+    wsrep_cluster_address= tmp;
+  }
+  else
+    my_free(tmp);
 
   return false;
 }
@@ -706,7 +776,12 @@ static void wsrep_slave_count_change_update ()
 
 bool wsrep_slave_threads_update (sys_var *self, THD* thd, enum_var_type type)
 {
+  if (!wsrep_cluster_address_exists())
+    return false;
+
+  mysql_mutex_unlock(&LOCK_global_system_variables);
   mysql_mutex_lock(&LOCK_wsrep_slave_threads);
+  mysql_mutex_lock(&LOCK_global_system_variables);
   bool res= false;
 
   wsrep_slave_count_change_update();
@@ -1033,5 +1108,16 @@ bool wsrep_strict_ddl_update(sys_var *self, THD* thd, enum_var_type var_type)
     wsrep_mode|= WSREP_MODE_STRICT_REPLICATION;
   else
     wsrep_mode&= (~WSREP_MODE_STRICT_REPLICATION);
+  return false;
+}
+
+bool wsrep_replicate_myisam_update(sys_var *self, THD* thd, enum_var_type var_type)
+{
+  // In case user still sets wsrep_replicate_myisam we set new
+  // option to wsrep_mode
+  if (wsrep_replicate_myisam)
+    wsrep_mode|= WSREP_MODE_REPLICATE_MYISAM;
+  else
+    wsrep_mode&= (~WSREP_MODE_REPLICATE_MYISAM);
   return false;
 }

@@ -1,6 +1,6 @@
 /*
    Copyright (c) 2000, 2011, Oracle and/or its affiliates
-   Copyright (c) 2010, 2020, MariaDB
+   Copyright (c) 2010, 2021, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -153,7 +153,7 @@ init_functions(IO_CACHE* info)
 int init_io_cache_ext(IO_CACHE *info, File file, size_t cachesize,
                       enum cache_type type, my_off_t seek_offset,
                       pbool use_async_io, myf cache_myflags,
-                      PSI_file_key file_key)
+                      PSI_file_key file_key __attribute__((unused)))
 {
   size_t min_cache;
   my_off_t pos;
@@ -1349,7 +1349,7 @@ static void copy_to_read_buffer(IO_CACHE *write_cache,
 
 static int _my_b_seq_read(IO_CACHE *info, uchar *Buffer, size_t Count)
 {
-  size_t length, diff_length, left_length= 0, save_count, max_length;
+  size_t length, diff_length, save_count, max_length;
   my_off_t pos_in_file;
   save_count=Count;
 
@@ -1400,7 +1400,6 @@ static int _my_b_seq_read(IO_CACHE *info, uchar *Buffer, size_t Count)
       */
       goto read_append_buffer;
     }
-    left_length+=length;
     diff_length=0;
   }
 

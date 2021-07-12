@@ -48,7 +48,7 @@ SYM_GROUP sym_group_rtree= {"RTree keys", "HAVE_RTREE_KEYS"};
   the perfschema.start_server_low_digest_sql_length test!
 */
 
-static SYMBOL symbols[] = {
+SYMBOL symbols[] = {
   { "&&",		SYM(AND_AND_SYM)},
   { "<=",		SYM(LE)},
   { "<>",		SYM(NE)},
@@ -211,6 +211,7 @@ static SYMBOL symbols[] = {
   { "ELSE",             SYM(ELSE)},
   { "ELSEIF",           SYM(ELSEIF_MARIADB_SYM)},
   { "ELSIF",            SYM(ELSIF_MARIADB_SYM)},
+  { "EMPTY",		SYM(EMPTY_SYM)},
   { "ENABLE",		SYM(ENABLE_SYM)},
   { "ENCLOSED",		SYM(ENCLOSED)},
   { "END",		SYM(END)},
@@ -289,6 +290,7 @@ static SYMBOL symbols[] = {
   { "IDENTIFIED",	SYM(IDENTIFIED_SYM)},
   { "IF",		SYM(IF_SYM)},
   { "IGNORE",		SYM(IGNORE_SYM)},
+  { "IGNORED",		SYM(IGNORED_SYM)},
   { "IGNORE_DOMAIN_IDS", SYM(IGNORE_DOMAIN_IDS_SYM)},
   { "IGNORE_SERVER_IDS", SYM(IGNORE_SERVER_IDS_SYM)},
   { "IMMEDIATE",	SYM(IMMEDIATE_SYM)},
@@ -327,6 +329,7 @@ static SYMBOL symbols[] = {
   { "INVOKER",          SYM(INVOKER_SYM)},
   { "JOIN",		SYM(JOIN_SYM)},
   { "JSON",		SYM(JSON_SYM)},
+  { "JSON_TABLE",	SYM(JSON_TABLE_SYM)},
   { "KEY",		SYM(KEY_SYM)},
   { "KEYS",		SYM(KEYS)},
   { "KEY_BLOCK_SIZE",	SYM(KEY_BLOCK_SIZE)},
@@ -351,6 +354,7 @@ static SYMBOL symbols[] = {
   { "LOCALTIME",	SYM(NOW_SYM)},
   { "LOCALTIMESTAMP",	SYM(NOW_SYM)},
   { "LOCK",		SYM(LOCK_SYM)},
+  { "LOCKED",		SYM(LOCKED_SYM)},
   { "LOCKS",		SYM(LOCKS_SYM)},
   { "LOGFILE",		SYM(LOGFILE_SYM)},
   { "LOGS",		SYM(LOGS_SYM)},
@@ -400,6 +404,7 @@ static SYMBOL symbols[] = {
   { "MICROSECOND",	SYM(MICROSECOND_SYM)},
   { "MIDDLEINT",	SYM(MEDIUMINT)},	/* For powerbuilder */
   { "MIGRATE",          SYM(MIGRATE_SYM)},
+  { "MINUS",            SYM(MINUS_ORACLE_SYM)},
   { "MINUTE",		SYM(MINUTE_SYM)},
   { "MINUTE_MICROSECOND", SYM(MINUTE_MICROSECOND_SYM)},
   { "MINUTE_SECOND",	SYM(MINUTE_SECOND_SYM)},
@@ -419,6 +424,7 @@ static SYMBOL symbols[] = {
   { "NATIONAL",		SYM(NATIONAL_SYM)},
   { "NATURAL",		SYM(NATURAL)},
   { "NCHAR",		SYM(NCHAR_SYM)},
+  { "NESTED",		SYM(NESTED_SYM)},
   { "NEVER",		SYM(NEVER_SYM)},
   { "NEW",              SYM(NEW_SYM)},
   { "NEXT",		SYM(NEXT_SYM)},
@@ -453,6 +459,7 @@ static SYMBOL symbols[] = {
   { "OPTIONALLY",	SYM(OPTIONALLY)},
   { "OR",		SYM(OR_SYM)},
   { "ORDER",		SYM(ORDER_SYM)},
+  { "ORDINALITY",	SYM(ORDINALITY_SYM)},
   { "OTHERS",           SYM(OTHERS_MARIADB_SYM)},
   { "OUT",              SYM(OUT_SYM)},
   { "OUTER",		SYM(OUTER)},
@@ -466,6 +473,7 @@ static SYMBOL symbols[] = {
   { "PAGE_CHECKSUM",	SYM(PAGE_CHECKSUM_SYM)},
   { "PARSER",           SYM(PARSER_SYM)},
   { "PARSE_VCOL_EXPR",  SYM(PARSE_VCOL_EXPR_SYM)},
+  { "PATH",		SYM(PATH_SYM)},
   { "PERIOD",		SYM(PERIOD_SYM)},
   { "PARTIAL",		SYM(PARTIAL)},
   { "PARTITION",        SYM(PARTITION_SYM)},
@@ -554,6 +562,7 @@ static SYMBOL symbols[] = {
   { "ROUTINE",		SYM(ROUTINE_SYM)},
   { "ROW",		SYM(ROW_SYM)},
   { "ROWCOUNT",         SYM(ROWCOUNT_SYM)}, /* Oracle-N */
+  { "ROWNUM",           SYM(ROWNUM_SYM)}, /* Oracle-R */
   { "ROWS",		SYM(ROWS_SYM)},
   { "ROWTYPE",          SYM(ROWTYPE_MARIADB_SYM)},
   { "ROW_COUNT",        SYM(ROW_COUNT_SYM)},
@@ -583,6 +592,7 @@ static SYMBOL symbols[] = {
   { "SIGNAL",           SYM(SIGNAL_SYM)},
   { "SIGNED",		SYM(SIGNED_SYM)},
   { "SIMPLE",		SYM(SIMPLE_SYM)},
+  { "SKIP",             SYM(SKIP_SYM)},
   { "SLAVE",            SYM(SLAVE)},
   { "SLAVES",           SYM(SLAVES)},
   { "SLAVE_POS",        SYM(SLAVE_POS_SYM)},
@@ -640,6 +650,7 @@ static SYMBOL symbols[] = {
   { "SUSPEND",          SYM(SUSPEND_SYM)},
   { "SWAPS",      SYM(SWAPS_SYM)},
   { "SWITCHES",   SYM(SWITCHES_SYM)},
+  { "SYSDATE",		SYM(SYSDATE)},
   { "SYSTEM",     SYM(SYSTEM)},
   { "SYSTEM_TIME",      SYM(SYSTEM_TIME_SYM)},
   { "TABLE",		SYM(TABLE_SYM)},
@@ -735,8 +746,9 @@ static SYMBOL symbols[] = {
 };
 
 
-static SYMBOL sql_functions[] = {
+SYMBOL sql_functions[] = {
   { "ADDDATE",		SYM(ADDDATE_SYM)},
+  { "ADD_MONTHS",	SYM(ADD_MONTHS_SYM)},
   { "BIT_AND",		SYM(BIT_AND)},
   { "BIT_OR",		SYM(BIT_OR)},
   { "BIT_XOR",		SYM(BIT_XOR)},
@@ -779,7 +791,6 @@ static SYMBOL sql_functions[] = {
   { "SUBSTR",		SYM(SUBSTRING)},
   { "SUBSTRING",	SYM(SUBSTRING)},
   { "SUM",		SYM(SUM_SYM)},
-  { "SYSDATE",		SYM(SYSDATE)},
   { "SYSTEM_USER",      SYM(USER_SYM)},
   { "TRIM",		SYM(TRIM)},
   { "TRIM_ORACLE",	SYM(TRIM_ORACLE)},
@@ -787,5 +798,8 @@ static SYMBOL sql_functions[] = {
   { "VAR_POP",		SYM(VARIANCE_SYM)},
   { "VAR_SAMP",		SYM(VAR_SAMP_SYM)},
 };
+
+size_t symbols_length= sizeof(symbols) / sizeof(SYMBOL);
+size_t sql_functions_length= sizeof(sql_functions) / sizeof(SYMBOL);
 
 #endif /* LEX_INCLUDED */

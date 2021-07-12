@@ -32,6 +32,7 @@
 #include "semisync_slave.h"
 #include "mysys_err.h"
 
+
 enum enum_gtid_until_state {
   GTID_UNTIL_NOT_DONE,
   GTID_UNTIL_STOP_AFTER_STANDALONE,
@@ -816,7 +817,7 @@ get_slave_until_gtid(THD *thd, String *out_str)
   @param event_coordinates  binlog file name and position of the last
                             real event master sent from binlog
 
-  @note 
+  @note
     Among three essential pieces of heartbeat data Log_event::when
     is computed locally.
     The  error to send is serious and should force terminating
@@ -830,6 +831,8 @@ static int send_heartbeat_event(binlog_send_info *info,
   DBUG_ENTER("send_heartbeat_event");
 
   ulong ev_offset;
+  char sub_header_buf[HB_SUB_HEADER_LEN];
+  bool sub_header_in_use=false;
   if (reset_transmit_packet(info, info->flags, &ev_offset, &info->errmsg))
     DBUG_RETURN(1);
 
@@ -850,18 +853,38 @@ static int send_heartbeat_event(binlog_send_info *info,
   size_t event_len = ident_len + LOG_EVENT_HEADER_LEN +
     (do_checksum ? BINLOG_CHECKSUM_LEN : 0);
   int4store(header + SERVER_ID_OFFSET, global_system_variables.server_id);
+  DBUG_EXECUTE_IF("simulate_pos_4G",
+  {
+    const_cast<event_coordinates *>(coord)->pos= (UINT_MAX32 + (ulong)1);
+    DBUG_SET("-d, simulate_pos_4G");
+  };);
+  if (coord->pos <= UINT_MAX32)
+  {
+    int4store(header + LOG_POS_OFFSET, coord->pos);  // log_pos
+  }
+  else
+  {
+    // Set common_header.log_pos=0 to indicate its overflow
+    int4store(header + LOG_POS_OFFSET, 0);
+    sub_header_in_use= true;
+    int8store(sub_header_buf, coord->pos);
+    event_len+= HB_SUB_HEADER_LEN;
+  }
+
   int4store(header + EVENT_LEN_OFFSET, event_len);
   int2store(header + FLAGS_OFFSET, 0);
 
-  int4store(header + LOG_POS_OFFSET, coord->pos);  // log_pos
-
   packet->append(header, sizeof(header));
-  packet->append(p, ident_len);             // log_file_name
+  if (sub_header_in_use)
+    packet->append(sub_header_buf, sizeof(sub_header_buf));
+  packet->append(p, ident_len);                    // log_file_name
 
   if (do_checksum)
   {
     char b[BINLOG_CHECKSUM_LEN];
     ha_checksum crc= my_checksum(0, (uchar*) header, sizeof(header));
+    if (sub_header_in_use)
+      crc= my_checksum(crc, (uchar*) sub_header_buf, sizeof(sub_header_buf));
     crc= my_checksum(crc, (uchar*) p, ident_len);
     int4store(b, crc);
     packet->append(b, sizeof(b));
@@ -1496,9 +1519,10 @@ gtid_state_from_pos(const char *name, uint32 offset,
         goto end;
       }
 
-      current_checksum_alg= get_checksum_alg(packet.ptr(), packet.length());
+      current_checksum_alg= get_checksum_alg((uchar*) packet.ptr(),
+                                             packet.length());
       found_format_description_event= true;
-      if (unlikely(!(tmp= new Format_description_log_event(packet.ptr(),
+      if (unlikely(!(tmp= new Format_description_log_event((uchar*) packet.ptr(),
                                                            packet.length(),
                                                            fdev))))
       {
@@ -1516,7 +1540,7 @@ gtid_state_from_pos(const char *name, uint32 offset,
       {
         sele_len -= BINLOG_CHECKSUM_LEN;
       }
-      Start_encryption_log_event sele(packet.ptr(), sele_len, fdev);
+      Start_encryption_log_event sele((uchar*) packet.ptr(), sele_len, fdev);
       if (fdev->start_decryption(&sele))
       {
         errormsg= "Could not start decryption of binlog.";
@@ -1573,7 +1597,7 @@ gtid_state_from_pos(const char *name, uint32 offset,
     {
       rpl_gtid gtid;
       uchar flags2;
-      if (unlikely(Gtid_log_event::peek(packet.ptr(), packet.length(),
+      if (unlikely(Gtid_log_event::peek((uchar*) packet.ptr(), packet.length(),
                                         current_checksum_alg, &gtid.domain_id,
                                         &gtid.server_id, &gtid.seq_no, &flags2,
                                         fdev)))
@@ -1659,9 +1683,9 @@ is_until_reached(binlog_send_info *info, ulong *ev_offset,
     if (event_type != XID_EVENT && event_type != XA_PREPARE_LOG_EVENT &&
         (event_type != QUERY_EVENT ||    /* QUERY_COMPRESSED_EVENT would never be commmit or rollback */
          !Query_log_event::peek_is_commit_rollback
-               (info->packet->ptr()+*ev_offset,
-                info->packet->length()-*ev_offset,
-                info->current_checksum_alg)))
+         ((uchar*) info->packet->ptr() + *ev_offset,
+          info->packet->length() - *ev_offset,
+          info->current_checksum_alg)))
       return false;
     break;
   }
@@ -1739,7 +1763,7 @@ send_event_to_slave(binlog_send_info *info, Log_event_type event_type,
       rpl_gtid event_gtid;
 
       if (ev_offset > len ||
-          Gtid_log_event::peek(packet->ptr()+ev_offset, len - ev_offset,
+          Gtid_log_event::peek((uchar*) packet->ptr()+ev_offset, len - ev_offset,
                                current_checksum_alg,
                                &event_gtid.domain_id, &event_gtid.server_id,
                                &event_gtid.seq_no, &flags2, info->fdev))
@@ -1893,7 +1917,8 @@ send_event_to_slave(binlog_send_info *info, Log_event_type event_type,
   case GTID_SKIP_TRANSACTION:
     if (event_type == XID_EVENT || event_type == XA_PREPARE_LOG_EVENT ||
         (event_type == QUERY_EVENT && /* QUERY_COMPRESSED_EVENT would never be commmit or rollback */
-         Query_log_event::peek_is_commit_rollback(packet->ptr() + ev_offset,
+         Query_log_event::peek_is_commit_rollback((uchar*) packet->ptr() +
+                                                  ev_offset,
                                                   len - ev_offset,
                                                   current_checksum_alg)))
       info->gtid_skip_group= GTID_SKIP_NOT;
@@ -1958,7 +1983,7 @@ send_event_to_slave(binlog_send_info *info, Log_event_type event_type,
     {
       info->error= ER_MASTER_FATAL_ERROR_READING_BINLOG;
       return "Failed to replace GTID event with backwards-compatible event: "
-             "currupt event.";
+             "corrupt event.";
     }
     if (!need_dummy)
       return NULL;
@@ -2130,7 +2155,7 @@ static int init_binlog_sender(binlog_send_info *info,
         "Start binlog_dump to slave_server(%lu), pos(%s, %lu), "
         "using_gtid(%d), gtid('%s')", thd->variables.server_id,
         log_ident, (ulong)*pos, info->using_gtid_state,
-        connect_gtid_state.c_ptr_quick());
+        connect_gtid_state.c_ptr_safe());
   }
 
 #ifndef DBUG_OFF
@@ -2153,7 +2178,7 @@ static int init_binlog_sender(binlog_send_info *info,
   const char *name=search_file_name;
   if (info->using_gtid_state)
   {
-    if (info->gtid_state.load(connect_gtid_state.c_ptr_quick(),
+    if (info->gtid_state.load(connect_gtid_state.ptr(),
                              connect_gtid_state.length()))
     {
       info->errmsg= "Out of memory or malformed slave request when obtaining "
@@ -2162,7 +2187,7 @@ static int init_binlog_sender(binlog_send_info *info,
       return 1;
     }
     if (info->until_gtid_state &&
-        info->until_gtid_state->load(slave_until_gtid_str.c_ptr_quick(),
+        info->until_gtid_state->load(slave_until_gtid_str.ptr(),
                                     slave_until_gtid_str.length()))
     {
       info->errmsg= "Out of memory or malformed slave request when "
@@ -2297,7 +2322,8 @@ static int send_format_descriptor_event(binlog_send_info *info, IO_CACHE *log,
     DBUG_RETURN(1);
   }
 
-  info->current_checksum_alg= get_checksum_alg(packet->ptr() + ev_offset,
+  info->current_checksum_alg= get_checksum_alg((uchar*) packet->ptr() +
+                                               ev_offset,
                                                packet->length() - ev_offset);
 
   DBUG_ASSERT(info->current_checksum_alg == BINLOG_CHECKSUM_ALG_OFF ||
@@ -2322,7 +2348,7 @@ static int send_format_descriptor_event(binlog_send_info *info, IO_CACHE *log,
     ev_len-= BINLOG_CHECKSUM_LEN;
 
   Format_description_log_event *tmp;
-  if (!(tmp= new Format_description_log_event(packet->ptr() + ev_offset,
+  if (!(tmp= new Format_description_log_event((uchar*) packet->ptr() + ev_offset,
                                               ev_len, info->fdev)))
   {
     info->error= ER_MASTER_FATAL_ERROR_READING_BINLOG;
@@ -2414,7 +2440,8 @@ static int send_format_descriptor_event(binlog_send_info *info, IO_CACHE *log,
   if (event_type == START_ENCRYPTION_EVENT)
   {
     Start_encryption_log_event *sele= (Start_encryption_log_event *)
-      Log_event::read_log_event(packet->ptr() + ev_offset, packet->length()
+      Log_event::read_log_event((uchar*) packet->ptr() + ev_offset,
+                                packet->length()
                                 - ev_offset, &info->errmsg, info->fdev,
                                 BINLOG_CHECKSUM_ALG_OFF);
     if (!sele)
@@ -3475,8 +3502,8 @@ static my_bool kill_callback(THD *thd, kill_callback_arg *arg)
       thd->variables.server_id == arg->slave_server_id)
   {
     arg->thd= thd;
-    if (WSREP(thd)) mysql_mutex_lock(&thd->LOCK_thd_data);
     mysql_mutex_lock(&thd->LOCK_thd_kill);    // Lock from delete
+    mysql_mutex_lock(&thd->LOCK_thd_data);
     return 1;
   }
   return 0;
@@ -3497,7 +3524,7 @@ void kill_zombie_dump_threads(uint32 slave_server_id)
     */
     arg.thd->awake_no_mutex(KILL_SLAVE_SAME_ID);
     mysql_mutex_unlock(&arg.thd->LOCK_thd_kill);
-    if (WSREP(arg.thd)) mysql_mutex_unlock(&arg.thd->LOCK_thd_data);
+    mysql_mutex_unlock(&arg.thd->LOCK_thd_data);
   }
 }
 
@@ -3966,6 +3993,8 @@ int reset_master(THD* thd, rpl_gtid *init_state, uint32 init_state_len,
   ret= mysql_bin_log.reset_logs(thd, 1, init_state, init_state_len,
                                 next_log_number);
   repl_semisync_master.after_reset_master();
+  DBUG_EXECUTE_IF("crash_after_reset_master", DBUG_SUICIDE(););
+
   return ret;
 }
 
@@ -4298,7 +4327,9 @@ bool show_binlog_info(THD* thd)
     LOG_INFO li;
     mysql_bin_log.get_current_log(&li);
     size_t dir_len = dirname_length(li.log_file_name);
-    protocol->store(li.log_file_name + dir_len, &my_charset_bin);
+    const char *base= li.log_file_name + dir_len;
+
+    protocol->store(base, strlen(base), &my_charset_bin);
     protocol->store((ulonglong) li.pos);
     protocol->store(binlog_filter->get_do_db());
     protocol->store(binlog_filter->get_ignore_db());
@@ -4683,5 +4714,22 @@ rpl_gtid_pos_update(THD *thd, char *str, size_t len)
     return false;
 }
 
+int compare_log_name(const char *log_1, const char *log_2) {
+  int res= 1;
+  const char *ext1_str= strrchr(log_1, '.');
+  const char *ext2_str= strrchr(log_2, '.');
+  char file_name_1[255], file_name_2[255];
+  strmake(file_name_1, log_1, (ext1_str - log_1));
+  strmake(file_name_2, log_2, (ext2_str - log_2));
+  char *endptr = NULL;
+  res= strcmp(file_name_1, file_name_2);
+  if (!res)
+  {
+    ulong ext1= strtoul(++ext1_str, &endptr, 10);
+    ulong ext2= strtoul(++ext2_str, &endptr, 10);
+    res= (ext1 > ext2 ? 1 : ((ext1 == ext2) ? 0 : -1));
+  }
+  return res;
+}
 
 #endif /* HAVE_REPLICATION */

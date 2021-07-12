@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1996, 2015, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2018, 2020, MariaDB Corporation.
+Copyright (c) 2018, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -145,14 +145,14 @@ operator<<(std::ostream& out, const lock_rec_t& lock)
 #endif
 /* @} */
 
-/** Lock struct; protected by lock_sys.mutex */
+/** Lock struct; protected by lock_sys.latch */
 struct ib_lock_t
 {
-	trx_t*		trx;		/*!< transaction owning the
-					lock */
-	UT_LIST_NODE_T(ib_lock_t)
-			trx_locks;	/*!< list of the locks of the
-					transaction */
+  /** the owner of the lock */
+  trx_t *trx;
+  /** other locks of the transaction; protected by
+  lock_sys.is_writer() and trx->mutex_is_owner(); @see trx_lock_t::trx_locks */
+  UT_LIST_NODE_T(ib_lock_t) trx_locks;
 
 	dict_index_t*	index;		/*!< index for a record lock */
 

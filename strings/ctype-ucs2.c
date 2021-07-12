@@ -1161,9 +1161,12 @@ static size_t
 my_snprintf_mb2(CHARSET_INFO *cs __attribute__((unused)),
                 char* to, size_t n, const char* fmt, ...)
 {
+  size_t ret;
   va_list args;
   va_start(args,fmt);
-  return my_vsnprintf_mb2(to, n, fmt, args);
+  ret= my_vsnprintf_mb2(to, n, fmt, args);
+  va_end(args);
+  return ret;
 }
 
 
@@ -1278,6 +1281,7 @@ my_uni_utf16(CHARSET_INFO *cs __attribute__((unused)),
 #ifdef HAVE_CHARSET_utf16
 
 const char charset_name_utf16le[]= "utf16le";
+#define charset_name_utf16le_length (sizeof(charset_name_utf16le)-1)
 
 static inline void
 my_tolower_utf16(MY_UNICASE_INFO *uni_plane, my_wc_t *wc)
@@ -1599,8 +1603,8 @@ struct charset_info_st my_charset_utf16_general_ci=
 {
   54,0,0,              /* number       */
   MY_CS_COMPILED|MY_CS_PRIMARY|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII,
-  charset_name_utf16,             /* cs name    */
-  "utf16_general_ci",  /* name         */
+  { charset_name_utf16, charset_name_utf16_length }, /* cs name    */
+  { STRING_WITH_LEN("utf16_general_ci") },          /* name         */
   "UTF-16 Unicode",    /* comment      */
   NULL,                /* tailoring    */
   NULL,                /* ctype        */
@@ -1632,8 +1636,8 @@ struct charset_info_st my_charset_utf16_bin=
 {
   55,0,0,              /* number       */
   MY_CS_COMPILED|MY_CS_BINSORT|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII,
-  charset_name_utf16,             /* cs name      */
-  "utf16_bin",         /* name         */
+  { charset_name_utf16, charset_name_utf16_length }, /* cs name    */
+  { STRING_WITH_LEN("utf16_bin") },                  /* name         */
   "UTF-16 Unicode",    /* comment      */
   NULL,                /* tailoring    */
   NULL,                /* ctype        */
@@ -1665,8 +1669,8 @@ struct charset_info_st my_charset_utf16_general_nopad_ci=
 {
   MY_NOPAD_ID(54),0,0, /* number           */
   MY_CS_COMPILED|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII|MY_CS_NOPAD,
-  charset_name_utf16,             /* cs name          */
-  "utf16_general_nopad_ci", /* name        */
+  { charset_name_utf16, charset_name_utf16_length }, /* cs name    */
+  { STRING_WITH_LEN("utf16_general_nopad_ci") }, /* name        */
   "UTF-16 Unicode",    /* comment          */
   NULL,                /* tailoring        */
   NULL,                /* ctype            */
@@ -1699,8 +1703,8 @@ struct charset_info_st my_charset_utf16_nopad_bin=
   MY_NOPAD_ID(55),0,0, /* number           */
   MY_CS_COMPILED|MY_CS_BINSORT|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII|
   MY_CS_NOPAD,
-  charset_name_utf16,             /* cs name          */
-  "utf16_nopad_bin",   /* name             */
+  { charset_name_utf16, charset_name_utf16_length}, /* cs name    */
+  { STRING_WITH_LEN("utf16_nopad_bin") },   /* name             */
   "UTF-16 Unicode",    /* comment          */
   NULL,                /* tailoring        */
   NULL,                /* ctype            */
@@ -1940,8 +1944,8 @@ struct charset_info_st my_charset_utf16le_general_ci=
 {
   56,0,0,              /* number       */
   MY_CS_COMPILED|MY_CS_PRIMARY|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII,
-  charset_name_utf16le,           /* cs name    */
-  "utf16le_general_ci",/* name         */
+  { charset_name_utf16le, charset_name_utf16le_length },
+  { STRING_WITH_LEN("utf16le_general_ci") },/* name         */
   "UTF-16LE Unicode",  /* comment      */
   NULL,                /* tailoring    */
   NULL,                /* ctype        */
@@ -1973,8 +1977,8 @@ struct charset_info_st my_charset_utf16le_bin=
 {
   62,0,0,              /* number       */
   MY_CS_COMPILED|MY_CS_BINSORT|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII,
-  charset_name_utf16le,           /* cs name      */
-  "utf16le_bin",       /* name         */
+  { charset_name_utf16le, charset_name_utf16le_length },
+  { STRING_WITH_LEN("utf16le_bin") },       /* name         */
   "UTF-16LE Unicode",  /* comment      */
   NULL,                /* tailoring    */
   NULL,                /* ctype        */
@@ -2006,8 +2010,8 @@ struct charset_info_st my_charset_utf16le_general_nopad_ci=
 {
   MY_NOPAD_ID(56),0,0, /* number           */
   MY_CS_COMPILED|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII|MY_CS_NOPAD,
-  charset_name_utf16le,           /* cs name          */
-  "utf16le_general_nopad_ci",/* name       */
+  { charset_name_utf16le, charset_name_utf16le_length },
+  { STRING_WITH_LEN("utf16le_general_nopad_ci") },        /* name       */
   "UTF-16LE Unicode",  /* comment          */
   NULL,                /* tailoring        */
   NULL,                /* ctype            */
@@ -2040,8 +2044,8 @@ struct charset_info_st my_charset_utf16le_nopad_bin=
   MY_NOPAD_ID(62),0,0, /* number           */
   MY_CS_COMPILED|MY_CS_BINSORT|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII|
   MY_CS_NOPAD,
-  charset_name_utf16le,           /* cs name          */
-  "utf16le_nopad_bin", /* name             */
+  { charset_name_utf16le, charset_name_utf16le_length },
+  { STRING_WITH_LEN("utf16le_nopad_bin") }, /* name             */
   "UTF-16LE Unicode",  /* comment          */
   NULL,                /* tailoring        */
   NULL,                /* ctype            */
@@ -2393,9 +2397,12 @@ static size_t
 my_snprintf_utf32(CHARSET_INFO *cs __attribute__((unused)),
                   char* to, size_t n, const char* fmt, ...)
 {
+  size_t ret;
   va_list args;
   va_start(args,fmt);
-  return my_vsnprintf_utf32(to, n, fmt, args);
+  ret= my_vsnprintf_utf32(to, n, fmt, args);
+  va_end(args);
+  return ret;
 }
 
 
@@ -2763,8 +2770,8 @@ struct charset_info_st my_charset_utf32_general_ci=
 {
   60,0,0,              /* number       */
   MY_CS_COMPILED|MY_CS_PRIMARY|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII,
-  charset_name_utf32,             /* cs name    */
-  "utf32_general_ci",  /* name         */
+  { charset_name_utf32, charset_name_utf32_length },   /* cs name    */
+  { STRING_WITH_LEN("utf32_general_ci") },             /* name         */
   "UTF-32 Unicode",    /* comment      */
   NULL,                /* tailoring    */
   NULL,                /* ctype        */
@@ -2796,8 +2803,8 @@ struct charset_info_st my_charset_utf32_bin=
 {
   61,0,0,              /* number       */
   MY_CS_COMPILED|MY_CS_BINSORT|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII,
-  charset_name_utf32,             /* cs name    */
-  "utf32_bin",         /* name         */
+  { charset_name_utf32, charset_name_utf32_length },  /* cs name    */
+  { STRING_WITH_LEN("utf32_bin") },                   /* name         */
   "UTF-32 Unicode",    /* comment      */
   NULL,                /* tailoring    */
   NULL,                /* ctype        */
@@ -2829,8 +2836,8 @@ struct charset_info_st my_charset_utf32_general_nopad_ci=
 {
   MY_NOPAD_ID(60),0,0, /* number           */
   MY_CS_COMPILED|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII|MY_CS_NOPAD,
-  charset_name_utf32,             /* cs name          */
-  "utf32_general_nopad_ci", /* name        */
+  { charset_name_utf32, charset_name_utf32_length },  /* cs name    */
+  { STRING_WITH_LEN("utf32_general_nopad_ci") },      /* name        */
   "UTF-32 Unicode",    /* comment          */
   NULL,                /* tailoring        */
   NULL,                /* ctype            */
@@ -2863,8 +2870,8 @@ struct charset_info_st my_charset_utf32_nopad_bin=
   MY_NOPAD_ID(61),0,0, /* number           */
   MY_CS_COMPILED|MY_CS_BINSORT|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII|
   MY_CS_NOPAD,
-  charset_name_utf32,             /* cs name          */
-  "utf32_nopad_bin",   /* name             */
+  { charset_name_utf32, charset_name_utf32_length },  /* cs name    */
+  { STRING_WITH_LEN("utf32_nopad_bin") },   /* name             */
   "UTF-32 Unicode",    /* comment          */
   NULL,                /* tailoring        */
   NULL,                /* ctype            */
@@ -3354,8 +3361,8 @@ struct charset_info_st my_charset_ucs2_general_ci=
 {
     35,0,0,		/* number       */
     MY_CS_COMPILED|MY_CS_PRIMARY|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII,
-    charset_name_ucs2,		/* cs name    */
-    "ucs2_general_ci",	/* name         */
+    { charset_name_ucs2, charset_name_ucs2_length}, /* cs name    */
+    { STRING_WITH_LEN("ucs2_general_ci") },	/* name         */
     "",			/* comment      */
     NULL,		/* tailoring    */
     ctype_ucs2,		/* ctype        */
@@ -3387,8 +3394,8 @@ struct charset_info_st my_charset_ucs2_general_mysql500_ci=
 {
   159, 0, 0,                                       /* number           */
   MY_CS_COMPILED|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII, /* state */
-  charset_name_ucs2,                                          /* cs name          */
-  "ucs2_general_mysql500_ci",                      /* name             */
+  { charset_name_ucs2, charset_name_ucs2_length }, /* cs name    */
+  { STRING_WITH_LEN("ucs2_general_mysql500_ci") }, /* name             */
   "",                                              /* comment          */
   NULL,                                            /* tailoring        */
   ctype_ucs2,                                      /* ctype            */
@@ -3420,8 +3427,8 @@ struct charset_info_st my_charset_ucs2_bin=
 {
     90,0,0,		/* number       */
     MY_CS_COMPILED|MY_CS_BINSORT|MY_CS_UNICODE|MY_CS_NONASCII,
-    charset_name_ucs2,		/* cs name    */
-    "ucs2_bin",		/* name         */
+    { charset_name_ucs2, charset_name_ucs2_length }, /* cs name    */
+    { STRING_WITH_LEN("ucs2_bin") },		/* name         */
     "",			/* comment      */
     NULL,		/* tailoring    */
     ctype_ucs2,		/* ctype        */
@@ -3453,8 +3460,8 @@ struct charset_info_st my_charset_ucs2_general_nopad_ci=
 {
     MY_NOPAD_ID(35),0,0,     /* number           */
     MY_CS_COMPILED|MY_CS_STRNXFRM|MY_CS_UNICODE|MY_CS_NONASCII|MY_CS_NOPAD,
-    charset_name_ucs2,                  /* cs name          */
-    "ucs2_general_nopad_ci", /* name             */
+    { charset_name_ucs2, charset_name_ucs2_length }, /* cs name    */
+    { STRING_WITH_LEN("ucs2_general_nopad_ci") },    /* name       */
     "",                      /* comment          */
     NULL,                    /* tailoring        */
     ctype_ucs2,              /* ctype            */
@@ -3486,8 +3493,8 @@ struct charset_info_st my_charset_ucs2_nopad_bin=
 {
     MY_NOPAD_ID(90),0,0,     /* number           */
     MY_CS_COMPILED|MY_CS_BINSORT|MY_CS_UNICODE|MY_CS_NONASCII|MY_CS_NOPAD,
-    charset_name_ucs2,                  /* cs name          */
-    "ucs2_nopad_bin",        /* name             */
+    { charset_name_ucs2, charset_name_ucs2_length }, /* cs name    */
+    { STRING_WITH_LEN("ucs2_nopad_bin") },           /* name       */
     "",                      /* comment          */
     NULL,                    /* tailoring        */
     ctype_ucs2,              /* ctype            */

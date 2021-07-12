@@ -62,9 +62,12 @@ PAGECACHE *maria_pagecache= &maria_pagecache_var;
 PAGECACHE maria_log_pagecache_var;
 PAGECACHE *maria_log_pagecache= &maria_log_pagecache_var;
 MY_TMPDIR *maria_tmpdir;                        /* Tempdir for redo */
-char *maria_data_root;
+const char *maria_data_root;
 HASH maria_stored_state;
 int (*maria_create_trn_hook)(MARIA_HA *);
+
+void dummy_crash(const char *keyword __attribute__((unused))) {}
+void (*ma_debug_crash_here)(const char *keyword)= dummy_crash;
 
 /**
    @brief when transactionality does not matter we can use this transaction

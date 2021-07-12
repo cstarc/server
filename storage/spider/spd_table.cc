@@ -3890,7 +3890,8 @@ int spider_set_connect_info_default(
     if (!share->tgt_table_names[roop_count] && table_share)
     {
       DBUG_PRINT("info",("spider create default tgt_table_names"));
-      share->tgt_table_names_lengths[roop_count] = share->table_name_length;
+      share->tgt_table_names_lengths[roop_count] =
+        table_share->table_name.length;
       if (
         !(share->tgt_table_names[roop_count] = spider_create_table_name_string(
           table_share->table_name.str,
@@ -8653,7 +8654,7 @@ bool spider_check_hs_pk_update(
           field->type() == MYSQL_TYPE_GEOMETRY
         ) {
           var_len = uint2korr(ptr);
-          tmp_str.set_quick((char *) ptr + HA_KEY_BLOB_LENGTH, var_len,
+          tmp_str.set((char *) ptr + HA_KEY_BLOB_LENGTH, var_len,
             &my_charset_bin);
           str = tmp_str.get_str();
         } else {
@@ -8961,12 +8962,12 @@ void spider_get_select_limit_from_select_lex(
   DBUG_ENTER("spider_get_select_limit_from_select_lex");
   *select_limit = 9223372036854775807LL;
   *offset_limit = 0;
-  if (select_lex && select_lex->explicit_limit)
+  if (select_lex && select_lex->limit_params.explicit_limit)
   {
-    *select_limit = select_lex->select_limit ?
-      select_lex->select_limit->val_int() : 0;
-    *offset_limit = select_lex->offset_limit ?
-      select_lex->offset_limit->val_int() : 0;
+    *select_limit = select_lex->limit_params.select_limit ?
+      select_lex->limit_params.select_limit->val_int() : 0;
+    *offset_limit = select_lex->limit_params.offset_limit ?
+      select_lex->limit_params.offset_limit->val_int() : 0;
   }
   DBUG_VOID_RETURN;
 }
@@ -9158,13 +9159,13 @@ longlong spider_split_read_param(
     result_list->set_split_read = TRUE;
   }
   DBUG_PRINT("info",("spider result_list->semi_split_read=%f", result_list->semi_split_read));
-  DBUG_PRINT("info",("spider select_lex->explicit_limit=%d", select_lex ? select_lex->explicit_limit : 0));
+  DBUG_PRINT("info",("spider select_lex->explicit_limit=%d", select_lex ? select_lex->limit_params.explicit_limit : 0));
   DBUG_PRINT("info",("spider OPTION_FOUND_ROWS=%s", select_lex && (select_lex->options & OPTION_FOUND_ROWS) ? "TRUE" : "FALSE"));
   DBUG_PRINT("info",("spider select_lex->group_list.elements=%u", select_lex ? select_lex->group_list.elements : 0));
   DBUG_PRINT("info",("spider select_lex->with_sum_func=%s", select_lex && select_lex->with_sum_func ? "TRUE" : "FALSE"));
   if (
     result_list->semi_split_read > 0 &&
-    select_lex && select_lex->explicit_limit &&
+    select_lex && select_lex->limit_params.explicit_limit &&
     !(select_lex->options & OPTION_FOUND_ROWS) &&
     !select_lex->group_list.elements &&
     !select_lex->with_sum_func
@@ -9394,7 +9395,7 @@ bool spider_check_direct_order_limit(
         select_lex ? select_lex->order_list.elements : 0));
       if (
         !first_check ||
-        !select_lex->explicit_limit ||
+        !select_lex->limit_params.explicit_limit ||
         (select_lex->options & OPTION_FOUND_ROWS) ||
         (
 #ifdef HANDLER_HAS_DIRECT_AGGREGATE
@@ -9591,10 +9592,10 @@ int spider_set_direct_limit_offset(
     DBUG_RETURN(FALSE);
 
   // ignore condition like 1=1
-#ifdef SPIDER_has_Item_with_subquery
-  if (select_lex->where && select_lex->where->with_subquery())
+#ifdef SPIDER_has_Item_has_subquery
+  if (select_lex->where && select_lex->where->has_subquery())
 #else
-  if (select_lex->where && select_lex->where->with_subselect)
+    if (select_lex->where && select_lex->where->with_subquery())
 #endif
     DBUG_RETURN(FALSE);
 
@@ -10049,8 +10050,8 @@ int spider_discover_table_structure(
   } else {
     table_charset = system_charset_info;
   }
-  uint csnamelen = strlen(table_charset->csname);
-  uint collatelen = strlen(table_charset->name);
+  uint csnamelen = table_charset->cs_name.length;
+  uint collatelen = table_charset->coll_name.length;
   if (str.reserve(SPIDER_SQL_CLOSE_PAREN_LEN + SPIDER_SQL_DEFAULT_CHARSET_LEN +
     csnamelen + SPIDER_SQL_COLLATE_LEN + collatelen +
     SPIDER_SQL_CONNECTION_LEN + SPIDER_SQL_VALUE_QUOTE_LEN +
@@ -10060,9 +10061,9 @@ int spider_discover_table_structure(
   }
   str.q_append(SPIDER_SQL_CLOSE_PAREN_STR, SPIDER_SQL_CLOSE_PAREN_LEN);
   str.q_append(SPIDER_SQL_DEFAULT_CHARSET_STR, SPIDER_SQL_DEFAULT_CHARSET_LEN);
-  str.q_append(table_charset->csname, csnamelen);
+  str.q_append(table_charset->cs_name.str, csnamelen);
   str.q_append(SPIDER_SQL_COLLATE_STR, SPIDER_SQL_COLLATE_LEN);
-  str.q_append(table_charset->name, collatelen);
+  str.q_append(table_charset->coll_name.str, collatelen);
   str.q_append(SPIDER_SQL_COMMENT_STR, SPIDER_SQL_COMMENT_LEN);
   str.q_append(SPIDER_SQL_VALUE_QUOTE_STR, SPIDER_SQL_VALUE_QUOTE_LEN);
   str.append_escape_string(share->comment.str, share->comment.length);

@@ -347,7 +347,8 @@ static int create_sys_files(struct languages *lang_head,
   {
 
     /* setting charset name */
-    if (!(csnum= get_charset_number(tmp_lang->charset, MY_CS_PRIMARY)))
+    if (!(csnum= get_charset_number(tmp_lang->charset, MY_CS_PRIMARY,
+                                    MYF(MY_UTF8_IS_UTF8MB3))))
     {
       fprintf(stderr, "Unknown charset '%s' in '%s'\n", tmp_lang->charset,
 	      TXTFILE);
@@ -1140,7 +1141,7 @@ static void print_version(void)
 
 static my_bool
 get_one_option(const struct my_option *opt,
-	       char *argument __attribute__ ((unused)),
+	       const char *argument __attribute__ ((unused)),
 	       const char *filename __attribute__ ((unused)))
 {
   DBUG_ENTER("get_one_option");

@@ -2,6 +2,11 @@
 # simple test of all group functions
 #
 
+if (`SELECT $PS_PROTOCOL != 0`)
+{
+   --skip Test temporarily disabled for ps-protocol
+}
+
 --disable_warnings
 drop table if exists t1,t2,t3,t4,t5,t6;
 --enable_warnings
@@ -359,7 +364,7 @@ select min(t1.a1), min(t2.a4) from t1,t2 where t1.a1 < 'KKK' and t2.a4 < 'KKK';
 explain 
 select min(a1) from t1 where a1 > 'KKK' or a1 < 'XXX';
 explain 
-select min(a1) from t1 where a1 != 'KKK';
+select min(a1) from t1 where (a1 < 'KKK' or a1 > 'KKK');
 explain
 select max(a3) from t1 where a2 < 2 and a3 < 'SEA';
 explain
@@ -1070,7 +1075,9 @@ DROP TABLE t1;
 --echo #
 --echo # Bug#43668: Wrong comparison and MIN/MAX for YEAR(2)
 --echo #
+--enable_prepare_warnings
 create table t1 (f1 year(2), f2 year(4), f3 date, f4 datetime);
+--disable_prepare_warnings
 insert into t1 values
   (98,1998,19980101,"1998-01-01 00:00:00"),
   (00,2000,20000101,"2000-01-01 00:00:01"),
@@ -1705,7 +1712,33 @@ select count(*)+sleep(0) from t1;
 drop table t1;
 
 --echo #
---echo # Start of 10.3 tests
+--echo # MDEV-25112: MIN/MAX optimization for query containing BETWEEN in WHERE
+--echo #
+
+create table t1 (a int) engine=myisam;
+insert into t1 values (267), (273),  (287), (303), (308);
+
+let $q1=
+select max(a) from t1 where a < 303 and (a between 267 AND 287);
+let $q2=
+select min(a) from t1 where a > 267 and (a between 273 AND 303);
+
+eval $q1;
+eval explain $q1;
+eval $q2;
+eval explain $q2;
+
+create index idx on t1(a);
+
+eval $q1;
+eval explain $q1;
+eval $q2;
+eval explain $q2;
+
+drop table t1;
+
+--echo #
+--echo # End of 10.2 tests
 --echo #
 
 --echo #
@@ -1730,3 +1763,7 @@ DROP TABLE t2;
 
 DROP VIEW v1;
 DROP TABLE t1;
+
+--echo #
+--echo # End of 10.3 tests
+--echo #

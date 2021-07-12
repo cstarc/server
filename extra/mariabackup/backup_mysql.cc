@@ -44,6 +44,7 @@ Street, Fifth Floor, Boston, MA 02110-1335 USA
 #include <mysql.h>
 #include <mysqld.h>
 #include <my_sys.h>
+#include <stdlib.h>
 #include <string.h>
 #include <limits>
 #include "common.h"
@@ -103,10 +104,17 @@ xb_mysql_connect()
 	sprintf(mysql_port_str, "%d", opt_port);
 
 	if (connection == NULL) {
-		msg("Failed to init MySQL struct: %s.",
+		msg("Failed to init MariaDB struct: %s.",
 			mysql_error(connection));
 		return(NULL);
 	}
+
+#if !defined(DONT_USE_MYSQL_PWD)
+	if (!opt_password)
+	{
+		opt_password=getenv("MYSQL_PWD");
+	}
+#endif
 
 	if (!opt_secure_auth) {
 		mysql_options(connection, MYSQL_SECURE_AUTH,
@@ -119,7 +127,7 @@ xb_mysql_connect()
 	mysql_options(connection, MYSQL_OPT_PROTOCOL, &opt_protocol);
 	mysql_options(connection,MYSQL_SET_CHARSET_NAME, "utf8");
 
-	msg("Connecting to MySQL server host: %s, user: %s, password: %s, "
+	msg("Connecting to MariaDB server host: %s, user: %s, password: %s, "
 	       "port: %s, socket: %s", opt_host ? opt_host : "localhost",
 	       opt_user ? opt_user : "not set",
 	       opt_password ? "set" : "not set",
@@ -146,7 +154,7 @@ xb_mysql_connect()
 				opt_password,
 				"" /*database*/, opt_port,
 				opt_socket, 0)) {
-		msg("Failed to connect to MySQL server: %s.", mysql_error(connection));
+		msg("Failed to connect to MariaDB server: %s.", mysql_error(connection));
 		mysql_close(connection);
 		return(NULL);
 	}
@@ -454,7 +462,7 @@ bool get_mysql_vars(MYSQL *connection)
     }
     if (!directory_exists(datadir_var, false))
     {
-      msg("Warning: MySQL variable 'datadir' points to "
+      msg("Warning: MariaDB variable 'datadir' points to "
           "nonexistent directory '%s'",
           datadir_var);
     }
@@ -791,7 +799,7 @@ wait_for_no_updates(MYSQL *connection, uint timeout, uint threshold)
 		if (!have_queries_to_wait_for(connection, threshold)) {
 			return(true);
 		}
-		os_thread_sleep(1000000);
+		std::this_thread::sleep_for(std::chrono::seconds(1));
 	}
 
 	msg("Unable to obtain lock. Please try again later.");
@@ -799,7 +807,7 @@ wait_for_no_updates(MYSQL *connection, uint timeout, uint threshold)
 	return(false);
 }
 
-static os_thread_ret_t DECLARE_THREAD(kill_query_thread)(void*)
+static void kill_query_thread()
 {
   mysql_mutex_lock(&kill_query_thread_mutex);
 
@@ -835,9 +843,6 @@ func_exit:
   kill_query_thread_running= false;
   mysql_cond_signal(&kill_query_thread_stopped);
   mysql_mutex_unlock(&kill_query_thread_mutex);
-
-  os_thread_exit();
-  OS_THREAD_DUMMY_RETURN;
 }
 
 
@@ -849,7 +854,7 @@ static void start_query_killer()
   mysql_mutex_init(0, &kill_query_thread_mutex, nullptr);
   mysql_cond_init(0, &kill_query_thread_stop, nullptr);
   mysql_cond_init(0, &kill_query_thread_stopped, nullptr);
-  os_thread_create(kill_query_thread);
+  std::thread(kill_query_thread).detach();
 }
 
 static void stop_query_killer()
@@ -916,9 +921,11 @@ bool lock_tables(MYSQL *connection)
   }
 
   xb_mysql_query(connection, "BACKUP STAGE START", true);
+  DBUG_MARIABACKUP_EVENT("after_backup_stage_start", {});
   // xb_mysql_query(connection, "BACKUP STAGE FLUSH", true);
   // xb_mysql_query(connection, "BACKUP STAGE BLOCK_DDL", true);
   xb_mysql_query(connection, "BACKUP STAGE BLOCK_COMMIT", true);
+  DBUG_MARIABACKUP_EVENT("after_backup_stage_block_commit", {});
   /* Set the maximum supported session value for
   lock_wait_timeout to prevent unnecessary timeouts when the
   global value is changed from the default */
@@ -963,8 +970,9 @@ unlock_all(MYSQL *connection)
 	if (opt_debug_sleep_before_unlock) {
 		msg("Debug sleep for %u seconds",
 		       opt_debug_sleep_before_unlock);
-		os_thread_sleep(opt_debug_sleep_before_unlock * 1000);
-	}
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(opt_debug_sleep_before_unlock));
+        }
 
 	msg("Executing BACKUP STAGE END");
 	xb_mysql_query(connection, "BACKUP STAGE END", false);
@@ -1042,7 +1050,7 @@ wait_for_safe_slave(MYSQL *connection)
 		       "remaining)...", sleep_time, n_attempts);
 
 		xb_mysql_query(connection, "START SLAVE SQL_THREAD", false);
-		os_thread_sleep(sleep_time * 1000000);
+		std::this_thread::sleep_for(std::chrono::seconds(sleep_time));
 		xb_mysql_query(connection, "STOP SLAVE SQL_THREAD", false);
 
 		open_temp_tables = get_open_temp_tables(connection);

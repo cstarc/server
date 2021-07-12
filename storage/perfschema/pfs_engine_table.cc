@@ -154,7 +154,6 @@ bool PFS_table_context::initialize(void)
       m_map= context->m_map;
       DBUG_ASSERT(m_map_size == context->m_map_size);
       m_map_size= context->m_map_size;
-      m_word_size= context->m_word_size;
     }
   }
   else
@@ -168,7 +167,6 @@ bool PFS_table_context::initialize(void)
     /* Initialize a new context, store in TLS. */
     m_last_version= m_current_version;
     m_map= NULL;
-    m_word_size= sizeof(ulong) * 8;
 
     /* Allocate a bitmap to record which threads are materialized. */
     if (m_map_size > 0)
@@ -190,7 +188,7 @@ bool PFS_table_context::initialize(void)
 /* Constructor for global or single thread tables, map size = 0.  */
 PFS_table_context::PFS_table_context(ulonglong current_version, bool restore, thread_local_key_t key) :
                    m_thr_key(key), m_current_version(current_version), m_last_version(0),
-                   m_map(NULL), m_map_size(0), m_word_size(sizeof(ulong)),
+                   m_map(NULL), m_map_size(0),
                    m_restore(restore), m_initialized(false), m_last_item(0)
 {
   initialize();
@@ -199,7 +197,7 @@ PFS_table_context::PFS_table_context(ulonglong current_version, bool restore, th
 /* Constructor for by-thread or aggregate tables, map size = max thread/user/host/account. */
 PFS_table_context::PFS_table_context(ulonglong current_version, ulong map_size, bool restore, thread_local_key_t key) :
                    m_thr_key(key), m_current_version(current_version), m_last_version(0),
-                   m_map(NULL), m_map_size(map_size), m_word_size(sizeof(ulong)),
+                   m_map(NULL), m_map_size(map_size),
                    m_restore(restore), m_initialized(false), m_last_item(0)
 {
   initialize();
@@ -220,7 +218,7 @@ void PFS_table_context::set_item(ulong n)
     return;
   ulong word= n / m_word_size;
   ulong bit= n % m_word_size;
-  m_map[word] |= (1 << bit);
+  m_map[word] |= (1UL << bit);
   m_last_item= n;
 }
 
@@ -317,7 +315,7 @@ static PFS_engine_table_share *all_shares[]=
   &table_replication_applier_configuration::m_share,
   &table_replication_applier_status::m_share,
   &table_replication_applier_status_by_coordinator::m_share,
-  //&table_replication_applier_status_by_worker::m_share,
+  &table_replication_applier_status_by_worker::m_share,
   //&table_replication_group_member_stats::m_share,
 #endif
 
@@ -364,17 +362,15 @@ ha_rows PFS_engine_table_share::get_row_count(void) const
 int PFS_engine_table_share::write_row(TABLE *table, const unsigned char *buf,
                                       Field **fields) const
 {
-  my_bitmap_map *org_bitmap;
-
   if (m_write_row == NULL)
   {
     return HA_ERR_WRONG_COMMAND;
   }
 
   /* We internally read from Fields to support the write interface */
-  org_bitmap= dbug_tmp_use_all_columns(table, table->read_set);
+  MY_BITMAP *org_bitmap= dbug_tmp_use_all_columns(table, &table->read_set);
   int result= m_write_row(table, buf, fields);
-  dbug_tmp_restore_column_map(table->read_set, org_bitmap);
+  dbug_tmp_restore_column_map(&table->read_set, org_bitmap);
 
   return result;
 }
@@ -432,7 +428,6 @@ int PFS_engine_table::read_row(TABLE *table,
                                unsigned char *buf,
                                Field **fields)
 {
-  my_bitmap_map *org_bitmap;
   Field *f;
   Field **fields_reset;
 
@@ -440,7 +435,7 @@ int PFS_engine_table::read_row(TABLE *table,
   bool read_all= !bitmap_is_clear_all(table->write_set);
 
   /* We internally write to Fields to support the read interface */
-  org_bitmap= dbug_tmp_use_all_columns(table, table->write_set);
+  MY_BITMAP *org_bitmap= dbug_tmp_use_all_columns(table, &table->write_set);
 
   /*
     Some callers of the storage engine interface do not honor the
@@ -452,7 +447,7 @@ int PFS_engine_table::read_row(TABLE *table,
     f->reset();
 
   int result= read_row_values(table, buf, fields, read_all);
-  dbug_tmp_restore_column_map(table->write_set, org_bitmap);
+  dbug_tmp_restore_column_map(&table->write_set, org_bitmap);
 
   return result;
 }
@@ -470,12 +465,10 @@ int PFS_engine_table::update_row(TABLE *table,
                                  const unsigned char *new_buf,
                                  Field **fields)
 {
-  my_bitmap_map *org_bitmap;
-
   /* We internally read from Fields to support the write interface */
-  org_bitmap= dbug_tmp_use_all_columns(table, table->read_set);
+  MY_BITMAP *org_bitmap= dbug_tmp_use_all_columns(table, &table->read_set);
   int result= update_row_values(table, old_buf, new_buf, fields);
-  dbug_tmp_restore_column_map(table->read_set, org_bitmap);
+  dbug_tmp_restore_column_map(&table->read_set, org_bitmap);
 
   return result;
 }
@@ -484,12 +477,10 @@ int PFS_engine_table::delete_row(TABLE *table,
                                  const unsigned char *buf,
                                  Field **fields)
 {
-  my_bitmap_map *org_bitmap;
-
   /* We internally read from Fields to support the delete interface */
-  org_bitmap= dbug_tmp_use_all_columns(table, table->read_set);
+  MY_BITMAP *org_bitmap= dbug_tmp_use_all_columns(table, &table->read_set);
   int result= delete_row_values(table, buf, fields);
-  dbug_tmp_restore_column_map(table->read_set, org_bitmap);
+  dbug_tmp_restore_column_map(&table->read_set, org_bitmap);
 
   return result;
 }
@@ -1543,11 +1534,11 @@ bool pfs_show_status(handlerton *hton, THD *thd,
       break;
     case 147:
       name= "(filename_hash).count";
-      size= filename_hash.count;
+      size= pfs_filename_hash.count;
       break;
     case 148:
       name= "(filename_hash).size";
-      size= filename_hash.size;
+      size= pfs_filename_hash.size;
       break;
     case 149:
       name= "(host_hash).count";

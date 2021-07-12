@@ -19,7 +19,7 @@ extern void translog_example_table_init();
 static const char *load_default_groups[]= { "aria_dump_log",0 };
 static void get_options(int *argc,char * * *argv);
 #ifndef DBUG_OFF
-#if defined(__WIN__)
+#if defined(_WIN32)
 const char *default_dbug_option= "d:t:i:O,\\aria_dump_log.trace";
 #else
 const char *default_dbug_option= "d:t:i:o,/tmp/aria_dump_log.trace";
@@ -88,7 +88,7 @@ static void usage(void)
 
 static my_bool
 get_one_option(const struct my_option *opt,
-               char *argument __attribute__((unused)),
+               const char *argument __attribute__((unused)),
                const char *filename __attribute__((unused)))
 {
   switch (opt->id) {
@@ -143,7 +143,7 @@ int main(int argc, char **argv)
     translog_table_init();
   translog_fill_overhead_table();
 
-  maria_data_root= (char *)".";
+  maria_data_root= ".";
 
   if ((handler= my_open(opt_file, O_RDONLY, MYF(MY_WME))) < 0)
   {

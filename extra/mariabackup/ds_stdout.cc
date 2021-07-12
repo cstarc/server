@@ -40,6 +40,7 @@ datasink_t datasink_stdout = {
 	&stdout_open,
 	&stdout_write,
 	&stdout_close,
+	&dummy_remove,
 	&stdout_deinit
 };
 
@@ -74,7 +75,7 @@ stdout_open(ds_ctxt_t *ctxt __attribute__((unused)),
 	stdout_file = (ds_stdout_file_t *) (file + 1);
 
 
-#ifdef __WIN__
+#ifdef _WIN32
 	setmode(fileno(stdout), _O_BINARY);
 #endif
 

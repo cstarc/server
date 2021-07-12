@@ -326,6 +326,25 @@ row_log_block_free(
 	DBUG_VOID_RETURN;
 }
 
+/** Empty the online log.
+@param index	index log to be cleared */
+static void row_log_empty(dict_index_t *index)
+{
+  ut_ad(index->lock.have_s());
+  row_log_t *log= index->online_log;
+
+  mysql_mutex_lock(&log->mutex);
+  UT_DELETE(log->blobs);
+  log->blobs= nullptr;
+  row_log_block_free(log->tail);
+  row_log_block_free(log->head);
+  row_merge_file_destroy_low(log->fd);
+  log->fd= OS_FILE_CLOSED;
+  log->tail.total= log->tail.blocks= log->tail.bytes= 0;
+  log->head.total= log->head.blocks= log->head.bytes= 0;
+  mysql_mutex_unlock(&log->mutex);
+}
+
 /******************************************************//**
 Logs an operation to a secondary index that is (or was) being created. */
 void
@@ -358,11 +377,12 @@ row_log_online_op(
 	extra_size+1 (and reserve 0 as the end-of-chunk marker). */
 
 	if (!tuple) {
+		row_log_empty(index);
 		mrec_size = 4;
 		extra_size = 0;
 		size = 2;
 	} else {
-		size = rec_get_converted_size_temp(
+		size = rec_get_converted_size_temp<false>(
 			index, tuple->fields, tuple->n_fields, &extra_size);
 		ut_ad(size >= extra_size);
 		ut_ad(size <= sizeof log->tail.buf);
@@ -414,7 +434,7 @@ row_log_online_op(
 	}
 
 	if (tuple) {
-		rec_convert_dtuple_to_temp(
+		rec_convert_dtuple_to_temp<false>(
 			b + extra_size, index, tuple->fields,
 			tuple->n_fields);
 	} else {
@@ -757,7 +777,7 @@ row_log_table_delete(
 		      old_pk, old_pk->n_fields - 2)->len);
 	ut_ad(DATA_ROLL_PTR_LEN == dtuple_get_nth_field(
 		      old_pk, old_pk->n_fields - 1)->len);
-	old_pk_size = rec_get_converted_size_temp(
+	old_pk_size = rec_get_converted_size_temp<false>(
 		new_index, old_pk->fields, old_pk->n_fields,
 		&old_pk_extra_size);
 	ut_ad(old_pk_extra_size < 0x100);
@@ -770,7 +790,7 @@ row_log_table_delete(
 		*b++ = ROW_T_DELETE;
 		*b++ = static_cast<byte>(old_pk_extra_size);
 
-		rec_convert_dtuple_to_temp(
+		rec_convert_dtuple_to_temp<false>(
 			b + old_pk_extra_size, new_index,
 			old_pk->fields, old_pk->n_fields);
 
@@ -870,7 +890,7 @@ row_log_table_low_redundant(
 	rec_comp_status_t status = is_instant
 		? REC_STATUS_INSTANT : REC_STATUS_ORDINARY;
 
-	size = rec_get_converted_size_temp(
+	size = rec_get_converted_size_temp<true>(
 		index, tuple->fields, tuple->n_fields, &extra_size, status);
 	if (is_instant) {
 		size++;
@@ -890,7 +910,7 @@ row_log_table_low_redundant(
 		ut_ad(DATA_ROLL_PTR_LEN == dtuple_get_nth_field(
 			      old_pk, old_pk->n_fields - 1)->len);
 
-		old_pk_size = rec_get_converted_size_temp(
+		old_pk_size = rec_get_converted_size_temp<false>(
 			new_index, old_pk->fields, old_pk->n_fields,
 			&old_pk_extra_size);
 		ut_ad(old_pk_extra_size < 0x100);
@@ -907,7 +927,7 @@ row_log_table_low_redundant(
 			if (old_pk_size) {
 				*b++ = static_cast<byte>(old_pk_extra_size);
 
-				rec_convert_dtuple_to_temp(
+				rec_convert_dtuple_to_temp<false>(
 					b + old_pk_extra_size, new_index,
 					old_pk->fields, old_pk->n_fields);
 				b += old_pk_size;
@@ -930,7 +950,7 @@ row_log_table_low_redundant(
 			*b = status;
 		}
 
-		rec_convert_dtuple_to_temp(
+		rec_convert_dtuple_to_temp<true>(
 			b + extra_size, index, tuple->fields, tuple->n_fields,
 			status);
 		b += size;
@@ -1051,7 +1071,7 @@ row_log_table_low(
 		ut_ad(DATA_ROLL_PTR_LEN == dtuple_get_nth_field(
 			      old_pk, old_pk->n_fields - 1)->len);
 
-		old_pk_size = rec_get_converted_size_temp(
+		old_pk_size = rec_get_converted_size_temp<false>(
 			new_index, old_pk->fields, old_pk->n_fields,
 			&old_pk_extra_size);
 		ut_ad(old_pk_extra_size < 0x100);
@@ -1067,7 +1087,7 @@ row_log_table_low(
 			if (old_pk_size) {
 				*b++ = static_cast<byte>(old_pk_extra_size);
 
-				rec_convert_dtuple_to_temp(
+				rec_convert_dtuple_to_temp<false>(
 					b + old_pk_extra_size, new_index,
 					old_pk->fields, old_pk->n_fields);
 				b += old_pk_size;
@@ -1269,7 +1289,8 @@ row_log_table_get_pk(
 
 				if (!offsets) {
 					offsets = rec_get_offsets(
-						rec, index, NULL, true,
+						rec, index, nullptr,
+						index->n_core_fields,
 						index->db_trx_id() + 1, heap);
 				}
 
@@ -1319,7 +1340,8 @@ row_log_table_get_pk(
 		}
 
 		if (!offsets) {
-			offsets = rec_get_offsets(rec, index, NULL, true,
+			offsets = rec_get_offsets(rec, index, nullptr,
+						  index->n_core_fields,
 						  ULINT_UNDEFINED, heap);
 		}
 
@@ -1991,7 +2013,8 @@ all_done:
 		return(DB_SUCCESS);
 	}
 
-	offsets = rec_get_offsets(btr_pcur_get_rec(&pcur), index, NULL, true,
+	offsets = rec_get_offsets(btr_pcur_get_rec(&pcur), index, nullptr,
+				  index->n_core_fields,
 				  ULINT_UNDEFINED, &offsets_heap);
 #if defined UNIV_DEBUG || defined UNIV_BLOB_LIGHT_DEBUG
 	ut_a(!rec_offs_any_null_extern(btr_pcur_get_rec(&pcur), offsets));
@@ -2188,7 +2211,7 @@ func_exit_committed:
 
 	/* Prepare to update (or delete) the record. */
 	rec_offs*		cur_offsets	= rec_get_offsets(
-		btr_pcur_get_rec(&pcur), index, NULL, true,
+		btr_pcur_get_rec(&pcur), index, nullptr, index->n_core_fields,
 		ULINT_UNDEFINED, &offsets_heap);
 
 	if (!log->same_pk) {
@@ -4058,11 +4081,18 @@ row_log_apply(
 	DBUG_RETURN(error);
 }
 
+unsigned row_log_get_n_core_fields(const dict_index_t *index)
+{
+  ut_ad(index->online_log);
+  return index->online_log->n_core_fields;
+}
+
 /** Notify that the table was emptied by concurrent rollback or purge.
 @param index  clustered index */
 static void row_log_table_empty(dict_index_t *index)
 {
   ut_ad(index->lock.have_s());
+  row_log_empty(index);
   row_log_t* log= index->online_log;
   ulint	avail_size;
   if (byte *b= row_log_table_open(log, 1, &avail_size))

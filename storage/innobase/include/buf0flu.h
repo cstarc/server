@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2014, 2020, MariaDB Corporation.
+Copyright (c) 2014, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -36,6 +36,8 @@ extern ulint buf_flush_page_count;
 /** Number of pages flushed via LRU. Protected by buf_pool.mutex.
 Also included in buf_flush_page_count. */
 extern ulint buf_lru_flush_page_count;
+/** Number of pages freed without flushing. Protected by buf_pool.mutex. */
+extern ulint buf_lru_freed_page_count;
 
 /** Flag indicating if the page_cleaner is in active state. */
 extern bool buf_page_cleaner_is_active;
@@ -53,12 +55,6 @@ The pages still remain a part of LRU and are evicted from
 the list as they age towards the tail of the LRU.
 @param id    tablespace identifier */
 void buf_flush_remove_pages(ulint id);
-
-/** Try to flush all the dirty pages that belong to a given tablespace.
-@param id    tablespace identifier
-@return number dirty pages that there were for this tablespace */
-ulint buf_flush_dirty_pages(ulint id)
-  MY_ATTRIBUTE((warn_unused_result));
 
 /*******************************************************************//**
 Relocates a buffer control block on the flush_list.
@@ -93,10 +89,23 @@ buf_flush_init_for_writing(
 
 /** Write out dirty blocks from buf_pool.flush_list.
 @param max_n    wished maximum mumber of blocks flushed
-@param lsn      buf_pool.get_oldest_modification(LSN_MAX) target (0=LRU flush)
+@param lsn      buf_pool.get_oldest_modification(LSN_MAX) target
 @return the number of processed pages
-@retval 0 if a batch of the same type (lsn==0 or lsn!=0) is already running */
-ulint buf_flush_lists(ulint max_n, lsn_t lsn);
+@retval 0 if a buf_pool.flush_list batch is already running */
+ulint buf_flush_list(ulint max_n= ULINT_UNDEFINED, lsn_t lsn= LSN_MAX);
+
+/** Try to flush dirty pages that belong to a given tablespace.
+@param space       tablespace
+@param n_flushed   number of pages written
+@return whether the flush for some pages might not have been initiated */
+bool buf_flush_list_space(fil_space_t *space, ulint *n_flushed= nullptr)
+  MY_ATTRIBUTE((warn_unused_result));
+
+/** Write out dirty blocks from buf_pool.LRU.
+@param max_n    wished maximum mumber of blocks flushed
+@return the number of processed pages
+@retval 0 if a buf_pool.LRU batch is already running */
+ulint buf_flush_LRU(ulint max_n);
 
 /** Wait until a flush batch ends.
 @param lru    true=buf_pool.LRU; false=buf_pool.flush_list */
@@ -104,9 +113,10 @@ void buf_flush_wait_batch_end(bool lru);
 /** Wait until all persistent pages are flushed up to a limit.
 @param sync_lsn   buf_pool.get_oldest_modification(LSN_MAX) to wait for */
 ATTRIBUTE_COLD void buf_flush_wait_flushed(lsn_t sync_lsn);
-/** If innodb_flush_sync=ON, initiate a furious flush.
-@param lsn buf_pool.get_oldest_modification(LSN_MAX) target */
-void buf_flush_ahead(lsn_t lsn);
+/** Initiate more eager page flushing if the log checkpoint age is too old.
+@param lsn      buf_pool.get_oldest_modification(LSN_MAX) target
+@param furious  true=furious flushing, false=limit to innodb_io_capacity */
+ATTRIBUTE_COLD void buf_flush_ahead(lsn_t lsn, bool furious);
 
 /********************************************************************//**
 This function should be called at a mini-transaction commit, if a page was

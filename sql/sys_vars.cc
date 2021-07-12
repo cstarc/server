@@ -1,5 +1,5 @@
 /* Copyright (c) 2002, 2015, Oracle and/or its affiliates.
-   Copyright (c) 2012, 2020, MariaDB Corporation.
+   Copyright (c) 2012, 2021, MariaDB Corporation.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -759,9 +759,10 @@ static bool check_charset(sys_var *self, THD *thd, set_var *var)
     else
     {
       ErrConvString err(res); /* Get utf8 '\0' terminated string */
+      myf utf8_flag= thd->get_utf8_flag();
       if (!(var->save_result.ptr= get_charset_by_csname(err.ptr(),
-                                                         MY_CS_PRIMARY,
-                                                         MYF(0))) &&
+                                                             MY_CS_PRIMARY,
+                                                             MYF(utf8_flag))) &&
           !(var->save_result.ptr= get_old_charset_by_name(err.ptr())))
       {
         my_error(ER_UNKNOWN_CHARACTER_SET, MYF(0), err.ptr());
@@ -788,12 +789,12 @@ static Sys_var_struct Sys_character_set_system(
        "character_set_system", "The character set used by the server "
        "for storing identifiers",
        READ_ONLY GLOBAL_VAR(system_charset_info), NO_CMD_LINE,
-       offsetof(CHARSET_INFO, csname), DEFAULT(0));
+       offsetof(CHARSET_INFO, cs_name.str), DEFAULT(0));
 
 static Sys_var_struct Sys_character_set_server(
        "character_set_server", "The default character set",
        SESSION_VAR(collation_server), NO_CMD_LINE,
-       offsetof(CHARSET_INFO, csname), DEFAULT(&default_charset_info),
+       offsetof(CHARSET_INFO, cs_name.str), DEFAULT(&default_charset_info),
        NO_MUTEX_GUARD, IN_BINLOG, ON_CHECK(check_charset_not_null));
 
 static bool check_charset_db(sys_var *self, THD *thd, set_var *var)
@@ -808,7 +809,7 @@ static Sys_var_struct Sys_character_set_database(
        "character_set_database",
        "The character set used by the default database",
        SESSION_VAR(collation_database), NO_CMD_LINE,
-       offsetof(CHARSET_INFO, csname), DEFAULT(&default_charset_info),
+       offsetof(CHARSET_INFO, cs_name.str), DEFAULT(&default_charset_info),
        NO_MUTEX_GUARD, IN_BINLOG, ON_CHECK(check_charset_db));
 
 static bool check_cs_client(sys_var *self, THD *thd, set_var *var)
@@ -832,7 +833,7 @@ static Sys_var_struct Sys_character_set_client(
        "character_set_client", "The character set for statements "
        "that arrive from the client",
        NO_SET_STMT SESSION_VAR(character_set_client), NO_CMD_LINE,
-       offsetof(CHARSET_INFO, csname), DEFAULT(&default_charset_info),
+       offsetof(CHARSET_INFO, cs_name.str), DEFAULT(&default_charset_info),
        NO_MUTEX_GUARD, IN_BINLOG, ON_CHECK(check_cs_client),
        ON_UPDATE(fix_thd_charset));
 // for check changing
@@ -843,7 +844,7 @@ static Sys_var_struct Sys_character_set_connection(
        "literals that do not have a character set introducer and for "
        "number-to-string conversion",
        NO_SET_STMT SESSION_VAR(collation_connection), NO_CMD_LINE,
-       offsetof(CHARSET_INFO, csname), DEFAULT(&default_charset_info),
+       offsetof(CHARSET_INFO, cs_name.str), DEFAULT(&default_charset_info),
        NO_MUTEX_GUARD, IN_BINLOG, ON_CHECK(check_charset_not_null),
        ON_UPDATE(fix_thd_charset));
 // for check changing
@@ -853,7 +854,7 @@ static Sys_var_struct Sys_character_set_results(
        "character_set_results", "The character set used for returning "
        "query results to the client",
        SESSION_VAR(character_set_results), NO_CMD_LINE,
-       offsetof(CHARSET_INFO, csname), DEFAULT(&default_charset_info),
+       offsetof(CHARSET_INFO, cs_name.str), DEFAULT(&default_charset_info),
        NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(check_charset));
 // for check changing
 export sys_var *Sys_character_set_results_ptr= &Sys_character_set_results;
@@ -861,7 +862,7 @@ export sys_var *Sys_character_set_results_ptr= &Sys_character_set_results;
 static Sys_var_struct Sys_character_set_filesystem(
        "character_set_filesystem", "The filesystem character set",
        NO_SET_STMT SESSION_VAR(character_set_filesystem), NO_CMD_LINE,
-       offsetof(CHARSET_INFO, csname), DEFAULT(&character_set_filesystem),
+       offsetof(CHARSET_INFO, cs_name.str), DEFAULT(&character_set_filesystem),
        NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(check_charset_not_null),
        ON_UPDATE(fix_thd_charset));
 
@@ -875,7 +876,7 @@ static bool check_collation_not_null(sys_var *self, THD *thd, set_var *var)
 {
   if (!var->value)
     return false;
-
+  myf utf8_flag= thd->get_utf8_flag();
   char buff[STRING_BUFFER_USUAL_SIZE];
   if (var->value->result_type() == STRING_RESULT)
   {
@@ -885,7 +886,7 @@ static bool check_collation_not_null(sys_var *self, THD *thd, set_var *var)
     else
     {
       ErrConvString err(res); /* Get utf8 '\0'-terminated string */
-      if (!(var->save_result.ptr= get_charset_by_name(err.ptr(), MYF(0))))
+      if (!(var->save_result.ptr= get_charset_by_name(err.ptr(), MYF(utf8_flag))))
       {
         my_error(ER_UNKNOWN_COLLATION, MYF(0), err.ptr());
         return true;
@@ -907,7 +908,7 @@ static Sys_var_struct Sys_collation_connection(
        "collation_connection", "The collation of the connection "
        "character set",
        NO_SET_STMT SESSION_VAR(collation_connection), NO_CMD_LINE,
-       offsetof(CHARSET_INFO, name), DEFAULT(&default_charset_info),
+       offsetof(CHARSET_INFO, coll_name.str), DEFAULT(&default_charset_info),
        NO_MUTEX_GUARD, IN_BINLOG, ON_CHECK(check_collation_not_null),
        ON_UPDATE(fix_thd_charset));
 
@@ -923,13 +924,13 @@ static Sys_var_struct Sys_collation_database(
        "collation_database", "The collation of the database "
        "character set",
        SESSION_VAR(collation_database), NO_CMD_LINE,
-       offsetof(CHARSET_INFO, name), DEFAULT(&default_charset_info),
+       offsetof(CHARSET_INFO, coll_name.str), DEFAULT(&default_charset_info),
        NO_MUTEX_GUARD, IN_BINLOG, ON_CHECK(check_collation_db));
 
 static Sys_var_struct Sys_collation_server(
        "collation_server", "The server default collation",
        SESSION_VAR(collation_server), NO_CMD_LINE,
-       offsetof(CHARSET_INFO, name), DEFAULT(&default_charset_info),
+       offsetof(CHARSET_INFO, coll_name.str), DEFAULT(&default_charset_info),
        NO_MUTEX_GUARD, IN_BINLOG, ON_CHECK(check_collation_not_null));
 
 static Sys_var_uint Sys_column_compression_threshold(
@@ -1156,14 +1157,46 @@ static Sys_var_enum Sys_event_scheduler(
        ON_CHECK(event_scheduler_check), ON_UPDATE(event_scheduler_update));
 #endif
 
-static Sys_var_on_access_global<Sys_var_ulong,
+static bool copy_to_expire_logs_days(sys_var *, THD *,
+                                     enum_var_type type)
+{
+  expire_logs_days= binlog_expire_logs_seconds / (double)(24 * 60 * 60);
+  return false;
+}
+
+static bool copy_to_binlog_expire_logs_seconds(sys_var *, THD *,
+                                               enum_var_type type)
+{
+  binlog_expire_logs_seconds= (ulong)(expire_logs_days * 24 * 60 * 60);
+  return false;
+}
+
+static Sys_var_on_access_global<Sys_var_double,
                                 PRIV_SET_SYSTEM_GLOBAL_VAR_EXPIRE_LOGS_DAYS>
 Sys_expire_logs_days(
        "expire_logs_days",
        "If non-zero, binary logs will be purged after expire_logs_days "
-       "days; possible purges happen at startup and at binary log rotation",
+       "days; It and binlog_expire_logs_seconds are linked, such that "
+       "changes in one are converted into the other, presentable as a "
+       "decimal value with 1/1000000 of the day precision; possible "
+       "purges happen at startup and at binary log rotation",
        GLOBAL_VAR(expire_logs_days),
-       CMD_LINE(REQUIRED_ARG), VALID_RANGE(0, 99), DEFAULT(0), BLOCK_SIZE(1));
+       CMD_LINE(REQUIRED_ARG, OPT_EXPIRE_LOGS_DAYS), VALID_RANGE(0, 99),
+       DEFAULT(0), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
+       ON_UPDATE(copy_to_binlog_expire_logs_seconds));
+
+static Sys_var_on_access_global<Sys_var_ulong,
+                                PRIV_SET_SYSTEM_GLOBAL_VAR_EXPIRE_LOGS_DAYS>
+Sys_binlog_expire_logs_seconds(
+       "binlog_expire_logs_seconds",
+       "If non-zero, binary logs will be purged after "
+       "binlog_expire_logs_seconds seconds; It and expire_logs_days are "
+       "linked, such that changes in one are converted into the other. "
+       "Possible purges happen at startup and at binary log rotation.",
+       GLOBAL_VAR(binlog_expire_logs_seconds),
+       CMD_LINE(REQUIRED_ARG, OPT_BINLOG_EXPIRE_LOGS_SECONDS),
+       VALID_RANGE(0, 8553600), DEFAULT(0), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+       NOT_IN_BINLOG, ON_CHECK(0), ON_UPDATE(copy_to_expire_logs_days));
 
 static Sys_var_mybool Sys_flush(
        "flush", "Flush MyISAM tables to disk between SQL commands",
@@ -2457,7 +2490,7 @@ static Sys_var_ulong Sys_max_recursive_iterations(
        "max_recursive_iterations",
        "Maximum number of iterations when executing recursive queries",
        SESSION_VAR(max_recursive_iterations), CMD_LINE(OPT_ARG),
-       VALID_RANGE(0, UINT_MAX), DEFAULT(UINT_MAX), BLOCK_SIZE(1));
+       VALID_RANGE(0, UINT_MAX), DEFAULT(1000), BLOCK_SIZE(1));
 
 static Sys_var_ulong Sys_max_sort_length(
        "max_sort_length",
@@ -2998,7 +3031,7 @@ static Sys_var_ulonglong Sys_thread_stack(
 static Sys_var_charptr_fscs Sys_tmpdir(
        "tmpdir", "Path for temporary files. Several paths may "
        "be specified, separated by a "
-#if defined(__WIN__)
+#if defined(_WIN32)
        "semicolon (;)"
 #else
        "colon (:)"
@@ -3694,6 +3727,7 @@ static const char *old_mode_names[]=
   "NO_DUP_KEY_WARNINGS_WITH_IGNORE",
   "NO_PROGRESS_INFO",
   "ZERO_DATE_TIME_CAST",
+  "UTF8_IS_UTF8MB3",
   0
 };
 
@@ -3705,7 +3739,7 @@ static Sys_var_set Sys_old_behavior(
        "old_mode",
        "Used to emulate old behavior from earlier MariaDB or MySQL versions",
        SESSION_VAR(old_behavior), CMD_LINE(REQUIRED_ARG),
-       old_mode_names, DEFAULT(0));
+       old_mode_names, DEFAULT(OLD_MODE_UTF8_IS_UTF8MB3));
 
 #if defined(HAVE_OPENSSL) && !defined(EMBEDDED_LIBRARY)
 #define SSL_OPT(X) CMD_LINE(REQUIRED_ARG,X)
@@ -5051,15 +5085,23 @@ static Sys_var_have Sys_have_symlink(
        "--skip-symbolic-links option.",
        READ_ONLY GLOBAL_VAR(have_symlink), NO_CMD_LINE);
 
+#if defined(__SANITIZE_ADDRESS__) || defined(WITH_UBSAN)
+
 #ifdef __SANITIZE_ADDRESS__
+#define SANITIZER_MODE "ASAN"
+#else
+#define SANITIZER_MODE "UBSAN"
+#endif /* __SANITIZE_ADDRESS__ */
+
 static char *have_sanitizer;
-static Sys_var_charptr_fscs Sys_have_santitizer(
+static Sys_var_charptr Sys_have_santitizer(
        "have_sanitizer",
-       "If the server is compiled with ASan (Address sanitizer) this will be "
-       "set to ASAN",
-       READ_ONLY GLOBAL_VAR(have_sanitizer), NO_CMD_LINE,
-       DEFAULT("ASAN"));
-#endif
+       "If the server is compiled with sanitize (compiler option), this "
+       "variable is set to the sanitizer mode used. Possible values are "
+       "ASAN (Address sanitizer) or UBSAN (The Undefined Behavior Sanitizer).",
+        READ_ONLY GLOBAL_VAR(have_sanitizer), NO_CMD_LINE,
+       DEFAULT(SANITIZER_MODE));
+#endif /* defined(__SANITIZE_ADDRESS__) || defined(WITH_UBSAN) */
 
 static bool fix_log_state(sys_var *self, THD *thd, enum_var_type type);
 
@@ -5669,7 +5711,7 @@ static Sys_var_tz Sys_time_zone(
 
 static Sys_var_charptr_fscs Sys_wsrep_provider(
        "wsrep_provider", "Path to replication provider library",
-       PREALLOCATED GLOBAL_VAR(wsrep_provider), CMD_LINE(REQUIRED_ARG),
+       PREALLOCATED READ_ONLY GLOBAL_VAR(wsrep_provider), CMD_LINE(REQUIRED_ARG),
        DEFAULT(WSREP_NONE),
        NO_MUTEX_GUARD, NOT_IN_BINLOG,
        ON_CHECK(wsrep_provider_check), ON_UPDATE(wsrep_provider_update));
@@ -5696,13 +5738,12 @@ static Sys_var_charptr Sys_wsrep_cluster_name(
        ON_CHECK(wsrep_cluster_name_check),
        ON_UPDATE(wsrep_cluster_name_update));
 
-static PolyLock_mutex PLock_wsrep_cluster_config(&LOCK_wsrep_cluster_config);
 static Sys_var_charptr Sys_wsrep_cluster_address (
        "wsrep_cluster_address", "Address to initially connect to cluster",
        PREALLOCATED GLOBAL_VAR(wsrep_cluster_address), 
        CMD_LINE(REQUIRED_ARG),
        DEFAULT(""),
-       &PLock_wsrep_cluster_config, NOT_IN_BINLOG,
+       NO_MUTEX_GUARD, NOT_IN_BINLOG,
        ON_CHECK(wsrep_cluster_address_check), 
        ON_UPDATE(wsrep_cluster_address_update));
 
@@ -5733,7 +5774,7 @@ static Sys_var_ulong Sys_wsrep_slave_threads(
        "wsrep_slave_threads", "Number of slave appliers to launch",
        GLOBAL_VAR(wsrep_slave_threads), CMD_LINE(REQUIRED_ARG),
        VALID_RANGE(1, 512), DEFAULT(1), BLOCK_SIZE(1),
-       &PLock_wsrep_cluster_config, NOT_IN_BINLOG,
+       NO_MUTEX_GUARD, NOT_IN_BINLOG,
        ON_CHECK(0),
        ON_UPDATE(wsrep_slave_threads_update));
 
@@ -5886,7 +5927,7 @@ static Sys_var_ulong Sys_wsrep_max_ws_rows (
 
 static Sys_var_charptr Sys_wsrep_notify_cmd(
        "wsrep_notify_cmd", "",
-       GLOBAL_VAR(wsrep_notify_cmd),CMD_LINE(REQUIRED_ARG),
+       READ_ONLY GLOBAL_VAR(wsrep_notify_cmd), CMD_LINE(REQUIRED_ARG),
        DEFAULT(""));
 
 static Sys_var_mybool Sys_wsrep_certify_nonPK(
@@ -5927,11 +5968,14 @@ static Sys_var_uint Sys_wsrep_sync_wait(
        NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
        ON_UPDATE(wsrep_sync_wait_update));
 
-static const char *wsrep_mode_names[]= 
+static const char *wsrep_mode_names[]=
 {
   "STRICT_REPLICATION",
   "BINLOG_ROW_FORMAT_ONLY",
   "REQUIRED_PRIMARY_KEY",
+  "REPLICATE_MYISAM",
+  "REPLICATE_ARIA",
+  "DISALLOW_LOCAL_GTID",
   NullS
 };
 static Sys_var_set Sys_wsrep_mode(
@@ -5990,7 +6034,10 @@ static Sys_var_mybool Sys_wsrep_recover_datadir(
 
 static Sys_var_mybool Sys_wsrep_replicate_myisam(
        "wsrep_replicate_myisam", "To enable myisam replication",
-       GLOBAL_VAR(wsrep_replicate_myisam), CMD_LINE(OPT_ARG), DEFAULT(FALSE));
+       GLOBAL_VAR(wsrep_replicate_myisam), CMD_LINE(OPT_ARG), DEFAULT(FALSE),
+       NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
+       ON_UPDATE(wsrep_replicate_myisam_update),
+       DEPRECATED("'@@wsrep_mode=REPLICATE_MYISAM'")); // since 10.6.0
 
 static Sys_var_mybool Sys_wsrep_log_conflicts(
        "wsrep_log_conflicts", "To log multi-master conflicts",

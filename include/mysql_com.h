@@ -23,7 +23,8 @@
 
 #include "my_decimal_limits.h"
 
-#define HOSTNAME_LENGTH 60
+#define HOSTNAME_LENGTH 255
+#define HOSTNAME_LENGTH_STR STRINGIFY_ARG(HOSTNAME_LENGTH)
 #define SYSTEM_CHARSET_MBMAXLEN 3
 #define NAME_CHAR_LEN	64              /* Field/table name length */
 #define USERNAME_CHAR_LENGTH 128
@@ -95,10 +96,10 @@
 #define LOCAL_HOST_NAMEDPIPE "."
 
 
-#if defined(__WIN__) && !defined( _CUSTOMCONFIG_)
+#if defined(_WIN32) && !defined( _CUSTOMCONFIG_)
 #define MYSQL_NAMEDPIPE "MySQL"
 #define MYSQL_SERVICENAME "MySQL"
-#endif /* __WIN__ */
+#endif
 
 /*
   You should add new commands to the end of this list, otherwise old

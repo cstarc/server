@@ -1,6 +1,6 @@
 
 # Copyright (c) 2006, 2017, Oracle and/or its affiliates. All rights reserved.
-# Copyright (c) 2014, 2020, MariaDB Corporation.
+# Copyright (c) 2014, 2021, MariaDB Corporation.
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -48,6 +48,7 @@ SET(INNOBASE_SOURCES
 	dict/dict0stats.cc
 	dict/dict0stats_bg.cc
 	dict/dict0defrag_bg.cc
+	dict/drop.cc
 	eval/eval0eval.cc
 	eval/eval0proc.cc
 	fil/fil0fil.cc
@@ -115,8 +116,6 @@ SET(INNOBASE_SOURCES
 	include/dict0mem.ic
 	include/dict0pagecompress.h
 	include/dict0pagecompress.ic
-	include/dict0priv.h
-	include/dict0priv.ic
 	include/dict0stats.h
 	include/dict0stats.ic
 	include/dict0stats_bg.h
@@ -278,7 +277,6 @@ SET(INNOBASE_SOURCES
 	lock/lock0iter.cc
 	lock/lock0prdt.cc
 	lock/lock0lock.cc
-	lock/lock0wait.cc
 	log/log0log.cc
 	log/log0recv.cc
 	log/log0crypt.cc
@@ -337,21 +335,33 @@ SET(INNOBASE_SOURCES
 	ut/ut0vec.cc
 	ut/ut0wqueue.cc)
 
+OPTION(WITH_PMEM "Support redo log in persistent memory" OFF)
+FIND_PACKAGE(PMEM)
+IF(PMEM_FOUND)
+  INCLUDE_DIRECTORIES(${PMEM_INCLUDES})
+  ADD_COMPILE_FLAGS(log/log0log.cc COMPILE_FLAGS "-DHAVE_PMEM")
+  SET(PMEM_LIBRARY ${PMEM_LIBRARIES})
+ELSE()
+  IF(WITH_PMEM)
+    MESSAGE(FATAL_ERROR "WITH_PMEM=ON cannot be satisfied")
+  ENDIF()
+ENDIF()
+
 MYSQL_ADD_PLUGIN(innobase ${INNOBASE_SOURCES} STORAGE_ENGINE
   MODULE_OUTPUT_NAME ha_innodb
   DEFAULT RECOMPILE_FOR_EMBEDDED
   LINK_LIBRARIES
 	${ZLIB_LIBRARY}
+	${PMEM_LIBRARY}
 	${NUMA_LIBRARY}
 	${LIBSYSTEMD}
-	${LINKER_SCRIPT}
-	${LIBPMEM})
+	${LINKER_SCRIPT})
 
 IF(NOT TARGET innobase)
   RETURN()
 ENDIF()
 
-ADD_DEFINITIONS(${SSL_DEFINES})
+ADD_DEFINITIONS(${SSL_DEFINES} ${TPOOL_DEFINES})
 
 # A GCC bug causes crash when compiling these files on ARM64 with -O1+
 # Compile them with -O0 as a workaround.
@@ -385,4 +395,8 @@ ENDIF()
 IF(NOT (PLUGIN_INNOBASE STREQUAL DYNAMIC))
   TARGET_LINK_LIBRARIES(innobase tpool mysys)
   ADD_SUBDIRECTORY(${CMAKE_SOURCE_DIR}/extra/mariabackup ${CMAKE_BINARY_DIR}/extra/mariabackup)
+ENDIF()
+
+IF(WITH_UNIT_TESTS)
+  ADD_SUBDIRECTORY(unittest)
 ENDIF()

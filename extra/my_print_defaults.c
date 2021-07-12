@@ -93,7 +93,7 @@ static void usage()
 {
   version();
   puts("This software comes with ABSOLUTELY NO WARRANTY. This is free software,\nand you are welcome to modify and redistribute it under the GPL license\n");
-  puts("Prints all arguments that is give to some program using the default files");
+  puts("Displays the options from option groups of option files, which is useful to see which options a particular tool will use");
   printf("Usage: %s [OPTIONS] [groups]\n", my_progname);
   my_print_help(my_long_options);
   my_print_default_files(config_file);
@@ -105,8 +105,8 @@ static void usage()
 
 static my_bool
 get_one_option(const struct my_option *opt __attribute__((unused)),
-	       char *argument __attribute__((unused)),
-               const char *filename)
+	       const char *argument __attribute__((unused)),
+               const char *filename __attribute__((unused)))
 {
   switch (opt->id) {
     case 'c':

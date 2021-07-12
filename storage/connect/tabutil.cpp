@@ -285,7 +285,7 @@ PQRYRES TabColumns(PGLOBAL g, THD *thd, const char *db,
     crp->Kdata->SetValue((fmt) ? fmt : (char*) "", i);
 
     crp = crp->Next;                       // New (charset)
-    fld = (char *)fp->charset()->name;
+    fld = (char *)fp->charset()->coll_name.str;
     crp->Kdata->SetValue(fld, i);
 
     // Add this item
@@ -708,7 +708,7 @@ bool PRXCOL::Init(PGLOBAL g, PTDB tp)
     MODE mode = To_Tdb->GetMode();
 
     // Needed for MYSQL subtables
-    ((XCOLBLK*)Colp)->Name = Decode(g, Colp->GetName());
+    ((COLBLK*)Colp)->SetName(Decode(g, Colp->GetName()));
 
     // May not have been done elsewhere
     Colp->InitValue(g);        

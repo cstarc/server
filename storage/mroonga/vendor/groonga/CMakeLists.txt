@@ -405,7 +405,7 @@ if(NOT ${GRN_WITH_MECAB} STREQUAL "no")
     set(MECAB_LIBRARIES libmecab)
   else()
     set(GRN_MECAB_CONFIG "mecab-config" CACHE FILEPATH "mecab-config path")
-    if(NOT CMAKE_CROSSCOMPILING)
+    if(NOT CMAKE_CROSSCOMPILING OR DEFINED CMAKE_CROSSCOMPILING_EMULATOR)
       find_program(GRN_MECAB_CONFIG_ABSOLUTE_PATH "${GRN_MECAB_CONFIG}")
     endif()
     if(EXISTS "${GRN_MECAB_CONFIG_ABSOLUTE_PATH}")
@@ -588,14 +588,13 @@ else()
   set(GRN_WITH_MESSAGE_PACK FALSE)
 endif()
 
-find_program(RUBY NAMES
-  "ruby2.3" "ruby23"
-  "ruby2.2" "ruby22"
-  "ruby2.1" "ruby21"
-  "ruby")
-
 option(GRN_WITH_MRUBY "use mruby" OFF)
 if(GRN_WITH_MRUBY)
+  find_program(RUBY NAMES
+    "ruby2.3" "ruby23"
+    "ruby2.2" "ruby22"
+    "ruby2.1" "ruby21"
+    "ruby")
   set(MRUBY_INCLUDE_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/mruby-source/include")
   set(MRUBY_LIBS mruby)

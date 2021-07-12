@@ -707,11 +707,12 @@ row_ins_foreign_trx_print(
 
 	ut_ad(!srv_read_only_mode);
 
-	lock_sys.mutex_lock();
-	n_rec_locks = trx->lock.n_rec_locks;
-	n_trx_locks = UT_LIST_GET_LEN(trx->lock.trx_locks);
-	heap_size = mem_heap_get_size(trx->lock.lock_heap);
-	lock_sys.mutex_unlock();
+	{
+		LockMutexGuard g{SRW_LOCK_CALL};
+		n_rec_locks = trx->lock.n_rec_locks;
+		n_trx_locks = UT_LIST_GET_LEN(trx->lock.trx_locks);
+		heap_size = mem_heap_get_size(trx->lock.lock_heap);
+	}
 
 	mysql_mutex_lock(&dict_foreign_err_mutex);
 	rewind(dict_foreign_err_file);
@@ -884,7 +885,7 @@ row_ins_foreign_fill_virtual(
 	rec_offs	offsets_[REC_OFFS_NORMAL_SIZE];
 	rec_offs_init(offsets_);
 	const rec_offs*	offsets =
-		rec_get_offsets(rec, index, offsets_, true,
+		rec_get_offsets(rec, index, offsets_, index->n_core_fields,
 				ULINT_UNDEFINED, &cascade->heap);
 	TABLE*		mysql_table= NULL;
 	upd_t*		update = cascade->update;
@@ -1018,8 +1019,8 @@ row_ins_foreign_check_on_constraint(
 	/* Since we are going to delete or update a row, we have to invalidate
 	the MySQL query cache for table. A deadlock of threads is not possible
 	here because the caller of this function does not hold any latches with
-	the mutex rank above the lock_sys_t::mutex. The query cache mutex
-	has a rank just above the lock_sys_t::mutex. */
+	the mutex rank above the lock_sys.latch. The query cache mutex
+	has a rank just above the lock_sys.latch. */
 
 	row_ins_invalidate_query_cache(thr, table->name.m_name);
 
@@ -1166,7 +1167,7 @@ row_ins_foreign_check_on_constraint(
 
 	/* Set an X-lock on the row to delete or update in the child table */
 
-	err = lock_table(0, table, LOCK_IX, thr);
+	err = lock_table(table, LOCK_IX, thr);
 
 	if (err == DB_SUCCESS) {
 		/* Here it suffices to use a LOCK_REC_NOT_GAP type lock;
@@ -1198,7 +1199,8 @@ row_ins_foreign_check_on_constraint(
 	if (table->fts) {
 		doc_id = fts_get_doc_id_from_rec(
 			clust_rec, clust_index,
-			rec_get_offsets(clust_rec, clust_index, NULL, true,
+			rec_get_offsets(clust_rec, clust_index, NULL,
+					clust_index->n_core_fields,
 					ULINT_UNDEFINED, &tmp_heap));
 	}
 
@@ -1609,7 +1611,7 @@ row_ins_check_foreign_constraint(
 		/* We already have a LOCK_IX on table, but not necessarily
 		on check_table */
 
-		err = lock_table(0, check_table, LOCK_IS, thr);
+		err = lock_table(check_table, LOCK_IS, thr);
 
 		if (err != DB_SUCCESS) {
 
@@ -1639,7 +1641,8 @@ row_ins_check_foreign_constraint(
 			continue;
 		}
 
-		offsets = rec_get_offsets(rec, check_index, offsets, true,
+		offsets = rec_get_offsets(rec, check_index, offsets,
+					  check_index->n_core_fields,
 					  ULINT_UNDEFINED, &heap);
 
 		if (page_rec_is_supremum(rec)) {
@@ -1827,16 +1830,12 @@ do_possible_lock_wait:
 
 		thr->lock_state = QUE_THR_LOCK_ROW;
 
-		check_table->inc_fk_checks();
-
 		err = lock_wait(thr);
 
 		thr->lock_state = QUE_THR_LOCK_NOLOCK;
 
-		check_table->dec_fk_checks();
-
 		if (err != DB_SUCCESS) {
-		} else if (check_table->to_be_dropped) {
+		} else if (check_table->name.is_temporary()) {
 			err = DB_LOCK_WAIT_TIMEOUT;
 		} else {
 			err = DB_LOCK_WAIT;
@@ -1909,13 +1908,9 @@ row_ins_check_foreign_constraints(
 {
 	dict_foreign_t*	foreign;
 	dberr_t		err = DB_SUCCESS;
-	trx_t*		trx;
-	ibool		got_s_lock	= FALSE;
 	mem_heap_t*	heap = NULL;
 
 	DBUG_ASSERT(index->is_primary() == pk);
-
-	trx = thr_get_trx(thr);
 
 	DEBUG_SYNC_C_IF_THD(thr_get_trx(thr)->mysql_thd,
 			    "foreign_constraint_check_for_ins");
@@ -1962,31 +1957,8 @@ row_ins_check_foreign_constraints(
 					FALSE, FALSE, DICT_ERR_IGNORE_NONE);
 			}
 
-			if (0 == trx->dict_operation_lock_mode) {
-				got_s_lock = TRUE;
-
-				row_mysql_freeze_data_dictionary(trx);
-			}
-
-			if (referenced_table) {
-				foreign->foreign_table->inc_fk_checks();
-			}
-
-			/* NOTE that if the thread ends up waiting for a lock
-			we will release dict_sys.latch temporarily!
-			But the counter on the table protects the referenced
-			table from being dropped while the check is running. */
-
 			err = row_ins_check_foreign_constraint(
 				TRUE, foreign, table, ref_tuple, thr);
-
-			if (referenced_table) {
-				foreign->foreign_table->dec_fk_checks();
-			}
-
-			if (got_s_lock) {
-				row_mysql_unfreeze_data_dictionary(trx);
-			}
 
 			if (ref_table != NULL) {
 				dict_table_close(ref_table, FALSE, FALSE);
@@ -2123,7 +2095,8 @@ row_ins_scan_sec_index_for_duplicate(
 			continue;
 		}
 
-		offsets = rec_get_offsets(rec, index, offsets, true,
+		offsets = rec_get_offsets(rec, index, offsets,
+					  index->n_core_fields,
 					  ULINT_UNDEFINED, &offsets_heap);
 
 		if (flags & BTR_NO_LOCKING_FLAG) {
@@ -2260,7 +2233,8 @@ row_ins_duplicate_error_in_clust_online(
 	ut_ad(!cursor->index->is_instant());
 
 	if (cursor->low_match >= n_uniq && !page_rec_is_infimum(rec)) {
-		*offsets = rec_get_offsets(rec, cursor->index, *offsets, true,
+		*offsets = rec_get_offsets(rec, cursor->index, *offsets,
+					   cursor->index->n_fields,
 					   ULINT_UNDEFINED, heap);
 		err = row_ins_duplicate_online(n_uniq, entry, rec, *offsets);
 		if (err != DB_SUCCESS) {
@@ -2271,7 +2245,8 @@ row_ins_duplicate_error_in_clust_online(
 	rec = page_rec_get_next_const(btr_cur_get_rec(cursor));
 
 	if (cursor->up_match >= n_uniq && !page_rec_is_supremum(rec)) {
-		*offsets = rec_get_offsets(rec, cursor->index, *offsets, true,
+		*offsets = rec_get_offsets(rec, cursor->index, *offsets,
+					   cursor->index->n_fields,
 					   ULINT_UNDEFINED, heap);
 		err = row_ins_duplicate_online(n_uniq, entry, rec, *offsets);
 	}
@@ -2327,7 +2302,7 @@ row_ins_duplicate_error_in_clust(
 
 		if (!page_rec_is_infimum(rec)) {
 			offsets = rec_get_offsets(rec, cursor->index, offsets,
-						  true,
+						  cursor->index->n_core_fields,
 						  ULINT_UNDEFINED, &heap);
 
 			/* We set a lock on the possible duplicate: this
@@ -2393,7 +2368,7 @@ duplicate:
 
 		if (!page_rec_is_supremum(rec)) {
 			offsets = rec_get_offsets(rec, cursor->index, offsets,
-						  true,
+						  cursor->index->n_core_fields,
 						  ULINT_UNDEFINED, &heap);
 
 			if (trx->duplicates) {
@@ -2510,7 +2485,7 @@ row_ins_index_entry_big_rec(
 	btr_pcur_open(index, entry, PAGE_CUR_LE, BTR_MODIFY_TREE,
 		      &pcur, &mtr);
 	rec = btr_pcur_get_rec(&pcur);
-	offsets = rec_get_offsets(rec, index, offsets, true,
+	offsets = rec_get_offsets(rec, index, offsets, index->n_core_fields,
 				  ULINT_UNDEFINED, heap);
 
 	DEBUG_SYNC_C_IF_THD(thd, "before_row_ins_extern");
@@ -2659,19 +2634,25 @@ commit_exit:
 	if (!(flags & BTR_NO_UNDO_LOG_FLAG)
 	    && page_is_empty(block->frame)
 	    && !entry->is_metadata() && !trx->duplicates
-	    && !trx->ddl && !trx->internal
+	    && !trx->check_unique_secondary && !trx->check_foreigns
+	    && !trx->dict_operation
 	    && block->page.id().page_no() == index->page
 	    && !index->table->skip_alter_undo
+	    && !index->table->n_rec_locks
 	    && !trx->is_wsrep() /* FIXME: MDEV-24623 */
 	    && !thd_is_slave(trx->mysql_thd) /* FIXME: MDEV-24622 */) {
 		DEBUG_SYNC_C("empty_root_page_insert");
 
 		if (!index->table->is_temporary()) {
-			err = lock_table(0, index->table, LOCK_X, thr);
+			err = lock_table(index->table, LOCK_X, thr);
 
 			if (err != DB_SUCCESS) {
 				trx->error_state = err;
 				goto commit_exit;
+			}
+
+			if (index->table->n_rec_locks) {
+				goto skip_bulk_insert;
 			}
 
 #ifdef BTR_CUR_HASH_ADAPT
@@ -2687,12 +2668,10 @@ commit_exit:
 #endif /* BTR_CUR_HASH_ADAPT */
 		}
 
-		static_cast<ins_node_t*>(thr->run_node)->bulk_insert = true;
+		trx->bulk_insert = true;
 	}
 
-#ifndef DBUG_OFF
 skip_bulk_insert:
-#endif
 	if (UNIV_UNLIKELY(entry->info_bits != 0)) {
 		ut_ad(entry->is_metadata());
 		ut_ad(flags == BTR_NO_LOCKING_FLAG);
@@ -3115,7 +3094,8 @@ row_ins_sec_index_entry_low(
 		prefix, we must convert the insert into a modify of an
 		existing record */
 		offsets = rec_get_offsets(
-			btr_cur_get_rec(&cursor), index, offsets, true,
+			btr_cur_get_rec(&cursor), index, offsets,
+			index->n_core_fields,
 			ULINT_UNDEFINED, &offsets_heap);
 
 		err = row_ins_sec_index_entry_by_modify(
@@ -3370,7 +3350,8 @@ row_ins_index_entry(
 	dtuple_t*	entry,	/*!< in/out: index entry to insert */
 	que_thr_t*	thr)	/*!< in: query thread */
 {
-	ut_ad(thr_get_trx(thr)->id || index->table->no_rollback());
+	ut_ad(thr_get_trx(thr)->id || index->table->no_rollback()
+	      || index->table->is_temporary());
 
 	DBUG_EXECUTE_IF("row_ins_index_entry_timeout", {
 			DBUG_SET("-d,row_ins_index_entry_timeout");
@@ -3788,6 +3769,10 @@ row_ins_step(
 
 		node->state = INS_NODE_ALLOC_ROW_ID;
 
+		if (node->table->is_temporary()) {
+			node->trx_id = trx->id;
+		}
+
 		/* It may be that the current session has not yet started
 		its transaction, or it has been committed: */
 
@@ -3797,7 +3782,7 @@ row_ins_step(
 			goto same_trx;
 		}
 
-		err = lock_table(0, node->table, LOCK_IX, thr);
+		err = lock_table(node->table, LOCK_IX, thr);
 
 		DBUG_EXECUTE_IF("ib_row_ins_ix_lock_wait",
 				err = DB_LOCK_WAIT;);

@@ -117,7 +117,7 @@ public:
           bool use_explicit_name)
     : Database_qualified_name(db, name), m_explicit_name(use_explicit_name)
   {
-    if (lower_case_table_names && m_db.str)
+    if (lower_case_table_names && m_db.length)
       m_db.length= my_casedn_str(files_charset_info, (char*) m_db.str);
   }
 
@@ -1041,7 +1041,7 @@ public:
     Query_arena(thd->lex->sphead->get_main_mem_root(), STMT_INITIALIZED_FOR_SP)
   { }
   ~sp_lex_cursor() { free_items(); }
-  void cleanup_stmt() { }
+  void cleanup_stmt(bool /*restore_set_statement_vars*/) { }
   Query_arena *query_arena() { return this; }
   bool validate()
   {
@@ -1831,7 +1831,8 @@ public:
     cursor is closed. For now stored procedures always use materialized
     cursors and the call is not used.
   */
-  virtual void cleanup_stmt() { /* no op */ }
+  virtual void cleanup_stmt(bool /*restore_set_statement_vars*/)
+  { /* no op */ }
 private:
 
   sp_lex_keeper m_lex_keeper;

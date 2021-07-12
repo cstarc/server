@@ -266,6 +266,12 @@ static bool sst_auth_real_set (const char* value)
       if (wsrep_sst_auth) { my_free((void*) wsrep_sst_auth); }
       wsrep_sst_auth= my_strdup(PSI_INSTRUMENT_ME, WSREP_SST_AUTH_MASK, MYF(0));
     }
+    else
+    {
+      if (wsrep_sst_auth) { my_free((void*) wsrep_sst_auth); }
+      wsrep_sst_auth= NULL;
+    }
+
     return 0;
   }
   return 1;
@@ -696,51 +702,75 @@ err:
   return NULL;
 }
 
-#define WSREP_SST_AUTH_ENV "WSREP_SST_OPT_AUTH"
+#define WSREP_SST_AUTH_ENV        "WSREP_SST_OPT_AUTH"
+#define WSREP_SST_REMOTE_AUTH_ENV "WSREP_SST_OPT_REMOTE_AUTH"
+#define DATA_HOME_DIR_ENV         "INNODB_DATA_HOME_DIR"
 
-static int sst_append_auth_env(wsp::env& env, const char* sst_auth)
+static int sst_append_env_var(wsp::env&   env,
+                              const char* const var,
+                              const char* const val)
 {
-  int const sst_auth_size= strlen(WSREP_SST_AUTH_ENV) + 1 /* = */
-    + (sst_auth ? strlen(sst_auth) : 0) + 1 /* \0 */;
+  int const env_str_size= strlen(var) + 1 /* = */
+                          + (val ? strlen(val) : 0) + 1 /* \0 */;
 
-  wsp::string sst_auth_str(sst_auth_size); // for automatic cleanup on return
-  if (!sst_auth_str()) return -ENOMEM;
+  wsp::string env_str(env_str_size); // for automatic cleanup on return
+  if (!env_str()) return -ENOMEM;
 
-  int ret= snprintf(sst_auth_str(), sst_auth_size, "%s=%s",
-                    WSREP_SST_AUTH_ENV, sst_auth ? sst_auth : "");
+  int ret= snprintf(env_str(), env_str_size, "%s=%s", var, val ? val : "");
 
-  if (ret < 0 || ret >= sst_auth_size)
+  if (ret < 0 || ret >= env_str_size)
   {
-    WSREP_ERROR("sst_append_auth_env(): snprintf() failed: %d", ret);
+    WSREP_ERROR("sst_append_env_var(): snprintf(%s=%s) failed: %d",
+                var, val, ret);
     return (ret < 0 ? ret : -EMSGSIZE);
   }
 
-  env.append(sst_auth_str());
+  env.append(env_str());
   return -env.error();
 }
 
-#define DATA_HOME_DIR_ENV "INNODB_DATA_HOME_DIR"
-
-static int sst_append_data_dir(wsp::env& env, const char* data_dir)
-{
-  int const data_dir_size= strlen(DATA_HOME_DIR_ENV) + 1 /* = */
-    + (data_dir ? strlen(data_dir) : 0) + 1 /* \0 */;
-
-  wsp::string data_dir_str(data_dir_size); // for automatic cleanup on return
-  if (!data_dir_str()) return -ENOMEM;
-
-  int ret= snprintf(data_dir_str(), data_dir_size, "%s=%s",
-                    DATA_HOME_DIR_ENV, data_dir ? data_dir : "");
-
-  if (ret < 0 || ret >= data_dir_size)
-  {
-    WSREP_ERROR("sst_append_data_dir(): snprintf() failed: %d", ret);
-    return (ret < 0 ? ret : -EMSGSIZE);
-  }
-
-  env.append(data_dir_str());
-  return -env.error();
-}
+#ifdef _WIN32
+/*
+  Space, single quote, ampersand, backquote, I/O redirection
+  characters, caret, all brackets, plus, exclamation and comma
+  characters require text to be enclosed in double quotes:
+*/
+#define IS_SPECIAL(c) \
+  (isspace(c) || c == '\'' || c == '&' || c == '`' || c == '|' || \
+                 c ==  '>' || c == '<' || c == ';' || c == '^' || \
+                 c ==  '[' || c == ']' || c == '{' || c == '}' || \
+                 c ==  '(' || c == ')' || c == '+' || c == '!' || \
+                 c ==  ',')
+/*
+  Inside values, equals character are interpreted as special
+  character and requires quotation:
+*/
+#define IS_SPECIAL_V(c) (IS_SPECIAL(c) || c == '=')
+/*
+  Double quotation mark and percent characters require escaping:
+*/
+#define IS_REQ_ESCAPING(c) (c == '""' || c == '%')
+#else
+/*
+  Space, single quote, ampersand, backquote, and I/O redirection
+  characters require text to be enclosed in double quotes. The
+  semicolon is used to separate shell commands, so it must be
+  enclosed in double quotes as well:
+*/
+#define IS_SPECIAL(c) \
+  (isspace(c) || c == '\'' || c == '&' || c == '`' || c == '|' || \
+                 c ==  '>' || c == '<' || c == ';')
+/*
+  Inside values, characters are interpreted as in parameter names:
+*/
+#define IS_SPECIAL_V(c) IS_SPECIAL(c)
+/*
+  Double quotation mark and backslash characters require
+  backslash prefixing, the dollar symbol is used to substitute
+  a variable value, therefore it also requires escaping:
+*/
+#define IS_REQ_ESCAPING(c) (c == '"' || c == '\\' || c == '$')
+#endif
 
 static size_t estimate_cmd_len (bool* extra_args)
 {
@@ -766,10 +796,16 @@ static size_t estimate_cmd_len (bool* extra_args)
       char c;
       while ((c = *arg++) != 0)
       {
-        /* A whitespace or a single quote requires double quotation marks: */
-        if (isspace(c) || c == '\'')
+        if (IS_SPECIAL(c))
         {
           quotation= true;
+        }
+        else if (IS_REQ_ESCAPING(c))
+        {
+          cmd_len++;
+#ifdef _WIN32
+          quotation= true;
+#endif
         }
         /*
           If the equals symbol is encountered, then we need to separately
@@ -789,48 +825,19 @@ static size_t estimate_cmd_len (bool* extra_args)
           }
           while ((c = *arg++) != 0)
           {
-            /*
-              A whitespace or a single quote requires double
-              quotation marks:
-            */
-            if (isspace(c) || c == '\'')
+            if (IS_SPECIAL_V(c))
             {
               quotation= true;
             }
-            /*
-              Double quotation mark or backslash symbol requires backslash
-              prefixing:
-            */
-#ifdef __WIN__
-            else if (c == '"' || c == '\\')
-#else
-            /*
-              The dollar symbol is used to substitute a variable, therefore
-              it also requires escaping:
-            */
-            else if (c == '"' || c == '\\' || c == '$')
-#endif
+            else if (IS_REQ_ESCAPING(c))
             {
               cmd_len++;
+#ifdef _WIN32
+              quotation= true;
+#endif
             }
           }
           break;
-        }
-        /*
-          Double quotation mark or backslash symbol requires backslash
-          prefixing:
-        */
-#ifdef __WIN__
-        else if (c == '"' || c == '\\')
-#else
-        /*
-          The dollar symbol is used to substitute a variable, therefore
-          it also requires escaping:
-        */
-        else if (c == '"' || c == '\\' || c == '$')
-#endif
-        {
-          cmd_len++;
         }
       }
       /* Perhaps we need to quote the entire argument or its right part: */
@@ -874,10 +881,16 @@ static void copy_orig_argv (char* cmd_str)
       char c;
       while ((c = *arg_scan++) != 0)
       {
-        /* A whitespace or a single quote requires double quotation marks: */
-        if (isspace(c) || c == '\'')
+        if (IS_SPECIAL(c))
         {
           quotation= true;
+        }
+        else if (IS_REQ_ESCAPING(c))
+        {
+          plain= false;
+#ifdef _WIN32
+          quotation= true;
+#endif
         }
         /*
           If the equals symbol is encountered, then we need to separately
@@ -913,13 +926,13 @@ static void copy_orig_argv (char* cmd_str)
               while (m)
               {
                 c = *arg++;
-#ifdef __WIN__
-                if (c == '"' || c == '\\')
-#else
-                if (c == '"' || c == '\\' || c == '$')
-#endif
+                if (IS_REQ_ESCAPING(c))
                 {
+#ifdef _WIN32
+                  *cmd_str++ = c;
+#else
                   *cmd_str++ = '\\';
+#endif
                 }
                 *cmd_str++ = c;
                 m--;
@@ -948,48 +961,19 @@ static void copy_orig_argv (char* cmd_str)
           /* Let's deal with the left side of the expression: */
           while ((c = *arg_scan++) != 0)
           {
-            /*
-              A whitespace or a single quote requires double
-              quotation marks:
-            */
-            if (isspace(c) || c == '\'')
+            if (IS_SPECIAL_V(c))
             {
               quotation= true;
             }
-            /*
-              Double quotation mark or backslash symbol requires backslash
-              prefixing:
-            */
-#ifdef __WIN__
-            else if (c == '"' || c == '\\')
-#else
-            /*
-              The dollar symbol is used to substitute a variable, therefore
-              it also requires escaping:
-            */
-            else if (c == '"' || c == '\\' || c == '$')
-#endif
+            else if (IS_REQ_ESCAPING(c))
             {
               plain= false;
+#ifdef _WIN32
+              quotation= true;
+#endif
             }
           }
           break;
-        }
-        /*
-          Double quotation mark or backslash symbol requires backslash
-          prefixing:
-        */
-#ifdef __WIN__
-        else if (c == '"' || c == '\\')
-#else
-        /*
-          The dollar symbol is used to substitute a variable, therefore
-          it also requires escaping:
-        */
-        else if (c == '"' || c == '\\' || c == '$')
-#endif
-        {
-          plain= false;
         }
       }
       if (n)
@@ -1013,13 +997,13 @@ static void copy_orig_argv (char* cmd_str)
         {
           while ((c = *arg++) != 0)
           {
-#ifdef __WIN__
-            if (c == '"' || c == '\\')
-#else
-            if (c == '"' || c == '\\' || c == '$')
-#endif
+            if (IS_REQ_ESCAPING(c))
             {
+#ifdef _WIN32
+              *cmd_str++ = c;
+#else
               *cmd_str++ = '\\';
+#endif
             }
             *cmd_str++ = c;
           }
@@ -1071,6 +1055,8 @@ static ssize_t sst_prepare_other (const char*  method,
   {
     WSREP_ERROR("sst_prepare_other(): generate_binlog_index_opt_val() failed %d",
                 ret);
+    if (binlog_opt_val) my_free(binlog_opt_val);
+    return ret;
   }
 
   make_wsrep_defaults_file();
@@ -1088,6 +1074,7 @@ static ssize_t sst_prepare_other (const char*  method,
                  wsrep_defaults_file,
                  (int)getpid(),
                  binlog_opt_val, binlog_index_opt_val);
+
   my_free(binlog_opt_val);
   my_free(binlog_index_opt_val);
 
@@ -1107,7 +1094,7 @@ static ssize_t sst_prepare_other (const char*  method,
     return -env.error();
   }
 
-  if ((ret= sst_append_auth_env(env, sst_auth)))
+  if ((ret= sst_append_env_var(env, WSREP_SST_AUTH_ENV, sst_auth)))
   {
     WSREP_ERROR("sst_prepare_other(): appending auth failed: %d", ret);
     return ret;
@@ -1115,7 +1102,7 @@ static ssize_t sst_prepare_other (const char*  method,
 
   if (data_home_dir)
   {
-    if ((ret= sst_append_data_dir(env, data_home_dir)))
+    if ((ret= sst_append_env_var(env, DATA_HOME_DIR_ENV, data_home_dir)))
     {
       WSREP_ERROR("sst_prepare_other(): appending data "
                   "directory failed: %d", ret);
@@ -1203,6 +1190,19 @@ static ssize_t sst_prepare_mysqldump (const char*  addr_in,
   else {
     *addr_out= addr_in;
   }
+
+  pthread_t monitor;
+  ret = mysql_thread_create (key_wsrep_sst_joiner_monitor, &monitor, NULL, wsrep_sst_joiner_monitor_thread, NULL);
+
+  if (ret)
+  {
+    WSREP_ERROR("sst_prepare_other(): mysql_thread_create() failed: %d (%s)",
+                ret, strerror(ret));
+    return -ret;
+  }
+
+  sst_joiner_completed= false;
+  pthread_detach (monitor);
 
   return ret;
 }
@@ -1314,7 +1314,7 @@ std::string wsrep_sst_prepare()
 
   const char* method_ptr(ret.data());
   const char* addr_ptr(ret.data() + strlen(method_ptr) + 1);
-  WSREP_INFO ("Prepared SST request: %s|%s", method_ptr, addr_ptr);
+  WSREP_DEBUG("Prepared SST request: %s|%s", method_ptr, addr_ptr);
 
   if (addr_out != addr_in) /* malloc'ed */ free ((char*)addr_out);
 
@@ -1430,6 +1430,8 @@ static int sst_donate_mysqldump (const char*         addr,
                                         wsrep::seqno::undefined()));
   Wsrep_server_state::instance().sst_sent(sst_sent_gtid, ret);
 
+  wsrep_donor_monitor_end();
+
   return ret;
 }
 
@@ -1527,10 +1529,10 @@ static int sst_flush_tables(THD* thd)
   if (!is_supported_parser_charset(current_charset))
   {
       /* Do not use non-supported parser character sets */
-      WSREP_WARN("Current client character set is non-supported parser character set: %s", current_charset->csname);
+      WSREP_WARN("Current client character set is non-supported parser character set: %s", current_charset->cs_name.str);
       thd->variables.character_set_client= &my_charset_latin1;
       WSREP_WARN("For SST temporally setting character set to : %s",
-                 my_charset_latin1.csname);
+                 my_charset_latin1.cs_name.str);
   }
 
   if (run_sql_command(thd, "FLUSH TABLES WITH READ LOCK"))
@@ -1629,10 +1631,10 @@ static void sst_disallow_writes (THD* thd, bool yes)
   if (!is_supported_parser_charset(current_charset))
   {
       /* Do not use non-supported parser character sets */
-      WSREP_WARN("Current client character set is non-supported parser character set: %s", current_charset->csname);
+      WSREP_WARN("Current client character set is non-supported parser character set: %s", current_charset->cs_name.str);
       thd->variables.character_set_client= &my_charset_latin1;
       WSREP_WARN("For SST temporally setting character set to : %s",
-                 my_charset_latin1.csname);
+                 my_charset_latin1.cs_name.str);
   }
 
   snprintf (query_str, query_max, "SET GLOBAL innodb_disallow_writes=%d",
@@ -1801,6 +1803,8 @@ static int sst_donate_other (const char*        method,
   {
     WSREP_ERROR("sst_prepare_other(): generate_binlog_index_opt_val() failed %d",
                 ret);
+    if (binlog_opt_val) my_free(binlog_opt_val);
+    return ret;
   }
 
   make_wsrep_defaults_file();
@@ -1811,6 +1815,7 @@ static int sst_donate_other (const char*        method,
                  "wsrep_sst_%s "
                  WSREP_SST_OPT_ROLE " 'donor' "
                  WSREP_SST_OPT_ADDR " '%s' "
+                 WSREP_SST_OPT_LPORT " '%u' "
                  WSREP_SST_OPT_SOCKET " '%s' "
                  WSREP_SST_OPT_DATA " '%s' "
                  "%s"
@@ -1819,7 +1824,8 @@ static int sst_donate_other (const char*        method,
                  "%s"
                  "%s"
                  "%s",
-                 method, addr, mysqld_unix_port, mysql_real_data_home,
+                 method, addr, mysqld_port, mysqld_unix_port,
+                 mysql_real_data_home,
                  wsrep_defaults_file,
                  uuid_oss.str().c_str(), gtid.seqno().get(), wsrep_gtid_server.domain_id,
                  binlog_opt_val, binlog_index_opt_val,
@@ -1908,7 +1914,21 @@ int wsrep_sst_donate(const std::string& msg,
 
   const char* data= method + method_len + 1;
 
-  if (check_request_str(data, address_char))
+  /* check for auth@addr separator */
+  const char* addr= strrchr(data, '@');
+  wsp::string remote_auth;
+  if (addr)
+  {
+    remote_auth.set(strndup(data, addr - data));
+    addr++;
+  }
+  else
+  {
+    // no auth part
+    addr= data;
+  }
+
+  if (check_request_str(addr, address_char))
   {
     WSREP_ERROR("Bad SST address string. SST canceled.");
     return WSREP_CB_FAILURE;
@@ -1922,15 +1942,25 @@ int wsrep_sst_donate(const std::string& msg,
   }
 
   int ret;
-  if ((ret= sst_append_auth_env(env, sst_auth_real)))
+  if ((ret= sst_append_env_var(env, WSREP_SST_AUTH_ENV, sst_auth_real)))
   {
     WSREP_ERROR("wsrep_sst_donate_cb(): appending auth env failed: %d", ret);
     return WSREP_CB_FAILURE;
   }
 
+  if (remote_auth())
+  {
+    if ((ret= sst_append_env_var(env, WSREP_SST_REMOTE_AUTH_ENV,remote_auth())))
+    {
+      WSREP_ERROR("wsrep_sst_donate_cb(): appending remote auth env failed: "
+                  "%d", ret);
+      return WSREP_CB_FAILURE;
+    }
+  }
+
   if (data_home_dir)
   {
-    if ((ret= sst_append_data_dir(env, data_home_dir)))
+    if ((ret= sst_append_env_var(env, DATA_HOME_DIR_ENV, data_home_dir)))
     {
       WSREP_ERROR("wsrep_sst_donate_cb(): appending data "
                   "directory failed: %d", ret);
@@ -1952,11 +1982,11 @@ int wsrep_sst_donate(const std::string& msg,
 
   if (!strcmp (WSREP_SST_MYSQLDUMP, method))
   {
-    ret= sst_donate_mysqldump(data, current_gtid, bypass, env());
+    ret= sst_donate_mysqldump(addr, current_gtid, bypass, env());
   }
   else
   {
-    ret= sst_donate_other(method, data, current_gtid, bypass, env());
+    ret= sst_donate_other(method, addr, current_gtid, bypass, env());
   }
 
   return (ret >= 0 ? 0 : 1);

@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1995, 2017, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2013, 2020, MariaDB Corporation.
+Copyright (c) 2013, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -55,7 +55,7 @@ inline void buf_dblwr_t::init(const byte *header)
   ut_ad(!batch_running);
 
   mysql_mutex_init(buf_dblwr_mutex_key, &mutex, nullptr);
-  mysql_cond_init(0, &cond, nullptr);
+  pthread_cond_init(&cond, nullptr);
   block1= page_id_t(0, mach_read_from_4(header + TRX_SYS_DOUBLEWRITE_BLOCK1));
   block2= page_id_t(0, mach_read_from_4(header + TRX_SYS_DOUBLEWRITE_BLOCK2));
 
@@ -300,7 +300,7 @@ func_exit:
     for (ulint i= 0; i < size * 2; i++, page += srv_page_size)
     {
       memset(page + FIL_PAGE_SPACE_ID, 0, 4);
-      /* For innodb_checksum_algorithm=innodb, we do not need to
+      /* For pre-MySQL-4.1 innodb_checksum_algorithm=innodb, we do not need to
       calculate new checksums for the pages because the field
       .._SPACE_ID does not affect them. Write the page back to where
       we read it from. */
@@ -356,7 +356,7 @@ void buf_dblwr_t::recover()
 
     if (recv_sys.scanned_lsn < lsn)
     {
-      ib::warn() << "Ignoring a doublewrite copy of page " << page_id
+      ib::info() << "Ignoring a doublewrite copy of page " << page_id
                  << " with future log sequence number " << lsn;
       continue;
     }
@@ -374,7 +374,7 @@ void buf_dblwr_t::recover()
       if (!srv_is_undo_tablespace(space_id))
         ib::warn() << "A copy of page " << page_no
                    << " in the doublewrite buffer slot " << page_no_dblwr
-                   << " is beyond the end of tablespace " << space->name
+                   << " is beyond the end of " << space->chain.start->name
                    << " (" << space->size << " pages)";
 next_page:
       space->release();
@@ -395,7 +395,7 @@ next_page:
 
     if (UNIV_UNLIKELY(fio.err != DB_SUCCESS))
        ib::warn() << "Double write buffer recovery: " << page_id
-                  << " (tablespace '" << space->name
+                  << " ('" << space->chain.start->name
                   << "') read failed with error: " << fio.err;
 
     if (buf_is_zeroes(span<const byte>(read_buf, physical_size)))
@@ -445,7 +445,7 @@ void buf_dblwr_t::close()
   ut_ad(!active_slot->first_free);
   ut_ad(!batch_running);
 
-  mysql_cond_destroy(&cond);
+  pthread_cond_destroy(&cond);
   for (int i= 0; i < 2; i++)
   {
     aligned_free(slots[i].write_buf);
@@ -482,7 +482,7 @@ void buf_dblwr_t::write_completed()
     /* We can now reuse the doublewrite memory buffer: */
     flush_slot->first_free= 0;
     batch_running= false;
-    mysql_cond_broadcast(&cond);
+    pthread_cond_broadcast(&cond);
   }
 
   mysql_mutex_unlock(&mutex);
@@ -559,7 +559,7 @@ bool buf_dblwr_t::flush_buffered_writes(const ulint size)
       return false;
     if (!batch_running)
       break;
-    mysql_cond_wait(&cond, &mutex);
+    my_cond_wait(&cond, &mutex.m_mutex);
   }
 
   ut_ad(active_slot->reserved == active_slot->first_free);
@@ -669,6 +669,13 @@ void buf_dblwr_t::flush_buffered_writes_completed(const IORequest &request)
       ut_d(buf_dblwr_check_page_lsn(*bpage, static_cast<const byte*>(frame)));
     }
 
+    const lsn_t lsn= mach_read_from_8(my_assume_aligned<8>
+                                      (FIL_PAGE_LSN +
+                                       static_cast<const byte*>(frame)));
+    ut_ad(lsn);
+    ut_ad(lsn >= bpage->oldest_modification());
+    if (lsn > log_sys.get_flushed_lsn())
+      log_write_up_to(lsn, true);
     e.request.node->space->io(e.request, bpage->physical_offset(), e_size,
                               frame, bpage);
   }
@@ -682,7 +689,6 @@ void buf_dblwr_t::flush_buffered_writes()
 {
   if (!is_initialised() || !srv_use_doublewrite_buf)
   {
-    os_aio_wait_until_no_pending_writes();
     fil_flush_file_spaces();
     return;
   }
@@ -706,6 +712,7 @@ void buf_dblwr_t::add_to_batch(const IORequest &request, size_t size)
   ut_ad(request.bpage);
   ut_ad(request.bpage->in_file());
   ut_ad(request.node);
+  ut_ad(request.node->space->purpose == FIL_TYPE_TABLESPACE);
   ut_ad(request.node->space->id == request.bpage->id().space());
   ut_ad(request.node->space->referenced());
   ut_ad(!srv_read_only_mode);

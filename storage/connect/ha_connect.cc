@@ -170,7 +170,7 @@
 #define JSONMAX      10             // JSON Default max grp size
 
 extern "C" {
-       char version[]= "Version 1.07.0002 October 18, 2020";
+       char version[]= "Version 1.07.0002 March 22, 2021";
 #if defined(__WIN__)
        char compver[]= "Version 1.07.0002 " __DATE__ " "  __TIME__;
        static char slash= '\\';
@@ -230,6 +230,9 @@ char *GetUserVariable(PGLOBAL g, const uchar *varname)
 PQRYRES OEMColumns(PGLOBAL g, PTOS topt, char *tab, char *db, bool info);
 PQRYRES VirColumns(PGLOBAL g, bool info);
 PQRYRES JSONColumns(PGLOBAL g, PCSZ db, PCSZ dsn, PTOS topt, bool info);
+#ifdef    BSON_SUPPORT
+PQRYRES BSONColumns(PGLOBAL g, PCSZ db, PCSZ dsn, PTOS topt, bool info);
+#endif // BSON_SUPPORT
 PQRYRES XMLColumns(PGLOBAL g, char *db, char *tab, PTOS topt, bool info);
 #if defined(REST_SUPPORT)
 PQRYRES RESTColumns(PGLOBAL g, PTOS topt, char *tab, char *db, bool info);
@@ -251,11 +254,15 @@ bool    ExactInfo(void);
 USETEMP UseTemp(void);
 int     GetConvSize(void);
 TYPCONV GetTypeConv(void);
+int     GetDefaultDepth(void);
+int     GetDefaultPrec(void);
 bool    JsonAllPath(void);
 char   *GetJsonNull(void);
-int GetDefaultDepth(void);
 uint    GetJsonGrpSize(void);
 char   *GetJavaWrapper(void);
+#if defined(BSON_SUPPORT)
+bool    Force_Bson(void);
+#endif   // BSON_SUPPORT
 size_t  GetWorkSize(void);
 void    SetWorkSize(size_t);
 extern "C" const char *msglang(void);
@@ -268,6 +275,10 @@ static handler *connect_create_handler(handlerton *hton,
                                        TABLE_SHARE *table,
                                        MEM_ROOT *mem_root);
 
+static bool checkPrivileges(THD* thd, TABTYPE type, PTOS options,
+                            const char* db, TABLE* table = NULL,
+                            bool quick = false);
+
 static int connect_assisted_discovery(handlerton *hton, THD* thd,
                                       TABLE_SHARE *table_s,
                                       HA_CREATE_INFO *info);
@@ -279,7 +290,12 @@ static char *strz(PGLOBAL g, LEX_CSTRING &ls)
 {
   char *str= (char*)PlugSubAlloc(g, NULL, ls.length + 1);
 
-  memcpy(str, ls.str, ls.length);
+  /*
+    ls.str can be NULL, for example when called with
+    create_info->connect_string
+  */
+  if (ls.str)
+    memcpy(str, ls.str, ls.length);
   str[ls.length]= 0;
   return str;
 } // end of strz
@@ -397,7 +413,7 @@ static MYSQL_THDVAR_ENUM(
 // Adding JPATH to all Json table columns
 static MYSQL_THDVAR_BOOL(json_all_path, PLUGIN_VAR_RQCMDARG,
 	"Adding JPATH to all Json table columns",
-	NULL, NULL, 0);							// NO by default
+	NULL, NULL, 1);							     // YES by default
 
 // Null representation for JSON values
 static MYSQL_THDVAR_STR(json_null,
@@ -410,11 +426,17 @@ static MYSQL_THDVAR_STR(json_null,
 static MYSQL_THDVAR_INT(default_depth,
 	PLUGIN_VAR_RQCMDARG,
 	"Default depth used by Json, XML and Mongo discovery",
-	NULL, NULL, 0, -1, 16, 1);
+	NULL, NULL, 5, -1, 16, 1);			 // Defaults to 5
+
+// Default precision for doubles
+static MYSQL_THDVAR_INT(default_prec,
+  PLUGIN_VAR_RQCMDARG,
+  "Default precision used for doubles",
+  NULL, NULL, 6, 0, 16, 1);			 // Defaults to 6
 
 // Estimate max number of rows for JSON aggregate functions
 static MYSQL_THDVAR_UINT(json_grp_size,
-       PLUGIN_VAR_RQCMDARG,             // opt
+       PLUGIN_VAR_RQCMDARG,      // opt
        "max number of rows for JSON aggregate functions.",
        NULL, NULL, JSONMAX, 1, INT_MAX, 1);
 
@@ -438,6 +460,13 @@ static MYSQL_THDVAR_BOOL(enable_mongo, PLUGIN_VAR_RQCMDARG,
 	"Enabling the MongoDB access", NULL, NULL, 0);
 #endif  // !version 2,3
 #endif   // JAVA_SUPPORT || CMGO_SUPPORT   
+
+#if defined(BSON_SUPPORT)
+// Force using BSON for JSON tables
+static MYSQL_THDVAR_BOOL(force_bson, PLUGIN_VAR_RQCMDARG,
+  "Force using BSON for JSON tables",
+  NULL, NULL, 0);							// NO by default
+#endif   // BSON_SUPPORT
 
 #if defined(XMSG) || defined(NEWMSG)
 const char *language_names[]=
@@ -480,6 +509,7 @@ TYPCONV GetTypeConv(void) {return (TYPCONV)THDVAR(current_thd, type_conv);}
 char *GetJsonNull(void)
 	{return connect_hton ? THDVAR(current_thd, json_null) : NULL;}
 int GetDefaultDepth(void) {return THDVAR(current_thd, default_depth);}
+int GetDefaultPrec(void) {return THDVAR(current_thd, default_prec);}
 uint GetJsonGrpSize(void)
   {return connect_hton ? THDVAR(current_thd, json_grp_size) : 10;}
 size_t GetWorkSize(void) {return (size_t)THDVAR(current_thd, work_size);}
@@ -500,6 +530,10 @@ char *GetJavaWrapper(void)
 #if defined(JAVA_SUPPORT) || defined(CMGO_SUPPORT)
 bool MongoEnabled(void) {return THDVAR(current_thd, enable_mongo);}
 #endif   // JAVA_SUPPORT || CMGO_SUPPORT
+
+#if defined(BSON_SUPPORT)
+bool Force_Bson(void) {return THDVAR(current_thd, force_bson);}
+#endif   // BSON_SUPPORT)
 
 #if defined(XMSG) || defined(NEWMSG)
 extern "C" const char *msglang(void)
@@ -732,8 +766,8 @@ DllExport LPCSTR PlugSetPath(LPSTR to, LPCSTR name, LPCSTR dir)
 
   For engines that have two file name extensions (separate meta/index file
   and data file), the order of elements is relevant. First element of engine
-  file name extensions array should be meta/index file extention. Second
-  element - data file extention. This order is assumed by
+  file name extensions array should be meta/index file extension. Second
+  element - data file extension. This order is assumed by
   prepare_for_repair() when REPAIR TABLE ... USE_FRM is issued.
 
   @see
@@ -1050,12 +1084,12 @@ static PGLOBAL GetPlug(THD *thd, PCONNECT& lxp)
 /****************************************************************************/
 TABTYPE ha_connect::GetRealType(PTOS pos)
 {
-  TABTYPE type;
+  TABTYPE type= TAB_UNDEF;
   
   if (pos || (pos= GetTableOptionStruct())) {
     type= GetTypeID(pos->type);
 
-    if (type == TAB_UNDEF)
+    if (type == TAB_UNDEF && !pos->http)
       type= pos->srcdef ? TAB_MYSQL : pos->tabname ? TAB_PRX : TAB_DOS;
 #if defined(REST_SUPPORT)
 		else if (pos->http)
@@ -1063,7 +1097,8 @@ TABTYPE ha_connect::GetRealType(PTOS pos)
 				case TAB_JSON:
 				case TAB_XML:
 				case TAB_CSV:
-					type = TAB_REST;
+        case TAB_UNDEF:
+          type = TAB_REST;
 					break;
 				case TAB_REST:
 					type = TAB_NIY;
@@ -1073,8 +1108,7 @@ TABTYPE ha_connect::GetRealType(PTOS pos)
 			}	// endswitch type
 #endif   // REST_SUPPORT
 
-  } else
-    type= TAB_UNDEF;
+  } // endif pos
 
   return type;
 } // end of GetRealType
@@ -1144,7 +1178,8 @@ ulonglong ha_connect::table_flags() const
 //                   HA_NULL_IN_KEY |    not implemented yet
 //                   HA_FAST_KEY_READ |  causes error when sorting (???)
                      HA_NO_TRANSACTIONS | HA_DUPLICATE_KEY_NOT_IN_ORDER |
-                     HA_NO_BLOBS | HA_MUST_USE_TABLE_CONDITION_PUSHDOWN;
+                     HA_NO_BLOBS | HA_MUST_USE_TABLE_CONDITION_PUSHDOWN |
+                     HA_REUSES_FILE_NAMES;
   ha_connect *hp= (ha_connect*)this;
   PTOS        pos= hp->GetTableOptionStruct();
 
@@ -1268,9 +1303,9 @@ PCSZ GetStringTableOption(PGLOBAL g, PTOS options, PCSZ opname, PCSZ sdef)
 	else if (!stricmp(opname, "Data_charset"))
     opval= options->data_charset;
 	else if (!stricmp(opname, "Http") || !stricmp(opname, "URL"))
-		opval = options->http;
+		opval= options->http;
 	else if (!stricmp(opname, "Uri"))
-		opval = options->uri;
+		opval= options->uri;
 
   if (!opval && options->oplist)
     opval= GetListOption(g, opname, options->oplist);
@@ -1386,7 +1421,7 @@ PCSZ ha_connect::GetStringOption(PCSZ opname, PCSZ sdef)
   PTOS options= GetTableOptionStruct();
 
   if (!stricmp(opname, "Connect")) {
-    LEX_CSTRING cnc= (tshp) ? tshp->connect_string 
+    LEX_CSTRING cnc= (tshp) ? tshp->connect_string
                            : table->s->connect_string;
 
     if (cnc.length)
@@ -1408,7 +1443,7 @@ PCSZ ha_connect::GetStringOption(PCSZ opname, PCSZ sdef)
                                      : table->s->table_charset;
 
     if (chif)
-      opval= (char*)chif->csname;
+      opval= (char*)chif->cs_name.str;
 
   } else
     opval= GetStringTableOption(xp->g, options, opname, NULL);
@@ -1572,6 +1607,7 @@ void *ha_connect::GetColumnOption(PGLOBAL g, void *field, PCOLINFO pcf)
 
   // Now get column information
   pcf->Name= (char*)fp->field_name.str;
+  chset= (char*)fp->charset()->coll_name.str;
 
   if (fop && fop->special) {
     pcf->Fieldfmt= (char*)fop->special;
@@ -1582,8 +1618,15 @@ void *ha_connect::GetColumnOption(PGLOBAL g, void *field, PCOLINFO pcf)
   pcf->Scale= 0;
   pcf->Opt= (fop) ? (int)fop->opt : 0;
 
-  if ((pcf->Length= fp->field_length) < 0)
-    pcf->Length= 256;            // BLOB?
+//	if (fp->field_length >= 0) {
+		pcf->Length= fp->field_length;
+
+		// length is bytes for Connect, not characters
+		if (!strnicmp(chset, "utf8", 4))
+			pcf->Length /= 3;
+
+//	} else
+//		pcf->Length= 256;            // BLOB?
 
   pcf->Precision= pcf->Length;
 
@@ -1591,7 +1634,7 @@ void *ha_connect::GetColumnOption(PGLOBAL g, void *field, PCOLINFO pcf)
     pcf->Offset= (int)fop->offset;
     pcf->Freq= (int)fop->freq;
     pcf->Datefmt= (char*)fop->dateformat;
-		pcf->Fieldfmt = fop->fieldformat ? (char*)fop->fieldformat
+		pcf->Fieldfmt= fop->fieldformat ? (char*)fop->fieldformat
 			: fop->jsonpath ? (char*)fop->jsonpath : (char*)fop->xmlpath;
 	} else {
     pcf->Offset= -1;
@@ -1599,8 +1642,6 @@ void *ha_connect::GetColumnOption(PGLOBAL g, void *field, PCOLINFO pcf)
     pcf->Datefmt= NULL;
     pcf->Fieldfmt= NULL;
   } // endif fop
-
-  chset= (char *)fp->charset()->name;
 
 	if (!strcmp(chset, "binary"))
 		v = 'B';		// Binary string
@@ -2155,7 +2196,6 @@ int ha_connect::MakeRecord(char *buf)
   int            rc= 0;
   Field*        *field;
   Field         *fp;
-  my_bitmap_map *org_bitmap;
   CHARSET_INFO  *charset= tdbp->data_charset();
 //MY_BITMAP      readmap;
   MY_BITMAP     *map;
@@ -2169,7 +2209,7 @@ int ha_connect::MakeRecord(char *buf)
             *table->def_read_set.bitmap, *table->def_write_set.bitmap);
 
   // Avoid asserts in field::store() for columns that are not updated
-  org_bitmap= dbug_tmp_use_all_columns(table, table->write_set);
+  MY_BITMAP *org_bitmap= dbug_tmp_use_all_columns(table, &table->write_set);
 
   // This is for variable_length rows
   memset(buf, 0, table->s->null_bytes);
@@ -2196,7 +2236,7 @@ int ha_connect::MakeRecord(char *buf)
           continue;
 
         htrc("Column %s not found\n", fp->field_name.str);
-        dbug_tmp_restore_column_map(table->write_set, org_bitmap);
+        dbug_tmp_restore_column_map(&table->write_set, org_bitmap);
         DBUG_RETURN(HA_ERR_WRONG_IN_RECORD);
         } // endif colp
 
@@ -2256,7 +2296,7 @@ int ha_connect::MakeRecord(char *buf)
 
           sprintf(buf, "Out of range value %.140s for column '%s' at row %ld",
             value->GetCharString(val),
-            fp->field_name.str, 
+            fp->field_name.str,
             thd->get_stmt_da()->current_row_for_warning());
 
           push_warning(thd, Sql_condition::WARN_LEVEL_WARN, 0, buf);
@@ -2279,7 +2319,7 @@ int ha_connect::MakeRecord(char *buf)
     memcpy(buf, table->record[0], table->s->stored_rec_length);
 
   // This is copied from ha_tina and is necessary to avoid asserts
-  dbug_tmp_restore_column_map(table->write_set, org_bitmap);
+  dbug_tmp_restore_column_map(&table->write_set, org_bitmap);
   DBUG_RETURN(rc);
 } // end of MakeRecord
 
@@ -2299,7 +2339,7 @@ int ha_connect::ScanRecord(PGLOBAL g, const uchar *)
 //PTDBASE tp= (PTDBASE)tdbp;
   String  attribute(attr_buffer, sizeof(attr_buffer),
                     table->s->table_charset);
-  my_bitmap_map *bmap= dbug_tmp_use_all_columns(table, table->read_set);
+  MY_BITMAP *bmap= dbug_tmp_use_all_columns(table, &table->read_set);
   const CHARSET_INFO *charset= tdbp->data_charset();
   String  data_charset_value(data_buffer, sizeof(data_buffer),  charset);
 
@@ -2421,7 +2461,7 @@ int ha_connect::ScanRecord(PGLOBAL g, const uchar *)
     } // endfor field
 
  err:
-  dbug_tmp_restore_column_map(table->read_set, bmap);
+  dbug_tmp_restore_column_map(&table->read_set, bmap);
   return rc;
 } // end of ScanRecord
 
@@ -2469,7 +2509,7 @@ bool ha_connect::MakeKeyWhere(PGLOBAL g, PSTRG qry, OPVAL vop, char q,
 	OPVAL            op;
 	Field           *fp;
 	const key_range *ranges[2];
-	my_bitmap_map   *old_map;
+	MY_BITMAP    *old_map;
 	KEY             *kfp;
   KEY_PART_INFO   *kpart;
 
@@ -2486,7 +2526,7 @@ bool ha_connect::MakeKeyWhere(PGLOBAL g, PSTRG qry, OPVAL vop, char q,
 		both= ranges[0] && ranges[1];
 
 	kfp= &table->key_info[active_index];
-	old_map= dbug_tmp_use_all_columns(table, table->write_set);
+	old_map= dbug_tmp_use_all_columns(table, &table->write_set);
 
 	for (i= 0; i <= 1; i++) {
 		if (ranges[i] == NULL)
@@ -2546,11 +2586,9 @@ bool ha_connect::MakeKeyWhere(PGLOBAL g, PSTRG qry, OPVAL vop, char q,
 				qry->Append('\'');
 
 			if (kpart->key_part_flag & HA_VAR_LENGTH_PART) {
-				String varchar;
-				uint   var_length= uint2korr(ptr);
-
-				varchar.set_quick((char*)ptr + HA_KEY_BLOB_LENGTH,
-					var_length, &my_charset_bin);
+                                 uint   var_length= uint2korr(ptr);
+                                 String varchar((char*) ptr + HA_KEY_BLOB_LENGTH,
+                                         var_length, &my_charset_bin);
 				qry->Append(varchar.ptr(), varchar.length(), nq);
 			}	else {
 				char   strbuff[MAX_FIELD_WIDTH];
@@ -2581,11 +2619,11 @@ bool ha_connect::MakeKeyWhere(PGLOBAL g, PSTRG qry, OPVAL vop, char q,
   if ((oom= qry->IsTruncated()))
     strcpy(g->Message, "Out of memory");
 
-	dbug_tmp_restore_column_map(table->write_set, old_map);
+	dbug_tmp_restore_column_map(&table->write_set, old_map);
 	return oom;
 
 err:
-	dbug_tmp_restore_column_map(table->write_set, old_map);
+	dbug_tmp_restore_column_map(&table->write_set, old_map);
 	return true;
 } // end of MakeKeyWhere
 
@@ -2798,7 +2836,6 @@ PFIL ha_connect::CondFilter(PGLOBAL g, Item *cond)
       } else {
         char    buff[256];
         String *res, tmp(buff, sizeof(buff), &my_charset_bin);
-        Item_basic_constant *pval= (Item_basic_constant *)args[i];
         PPARM pp= (PPARM)PlugSubAlloc(g, NULL, sizeof(PARM));
 
         // IN and BETWEEN clauses should be col VOP list
@@ -2807,6 +2844,8 @@ PFIL ha_connect::CondFilter(PGLOBAL g, Item *cond)
 
         switch (args[i]->real_type()) {
           case COND::CONST_ITEM:
+          {
+            Item *pval= (Item *)args[i];
           switch (args[i]->cmp_type()) {
             case STRING_RESULT:
               res= pval->val_str(&tmp);
@@ -2832,6 +2871,7 @@ PFIL ha_connect::CondFilter(PGLOBAL g, Item *cond)
             case ROW_RESULT:
               DBUG_ASSERT(0);
               return NULL;
+          }
           }
           break;
           case COND::CACHE_ITEM:    // Possible ???
@@ -3088,7 +3128,7 @@ PCFIL ha_connect::CheckCond(PGLOBAL g, PCFIL filp, const Item *cond)
       } else {
         char    buff[256];
         String *res, tmp(buff, sizeof(buff), &my_charset_bin);
-        Item_basic_constant *pval= (Item_basic_constant *)args[i];
+        Item *pval= (Item *)args[i];
         Item::Type type= args[i]->real_type();
 
         switch (type) {
@@ -3438,11 +3478,11 @@ bool ha_connect::get_error_message(int error, String* buf)
 
 		if (trace(1))
 			htrc("GEM(%d): %s\n", error, g->Message);
-
-		buf->append(ErrConvString(g->Message, strlen(g->Message),
-			&my_charset_latin1).ptr());
+                buf->append(ErrConvString(g->Message,
+                                          strlen(g->Message),
+                                          &my_charset_latin1).lex_cstring());
 	} else
-    buf->append("Cannot retrieve error message");
+                buf->append(STRING_WITH_LEN("Cannot retrieve error message"));
 
   DBUG_RETURN(false);
 } // end of get_error_message
@@ -4473,11 +4513,9 @@ int ha_connect::delete_all_rows()
 } // end of delete_all_rows
 
 
-bool ha_connect::check_privileges(THD *thd, PTOS options, const char *dbn, bool quick)
+static bool checkPrivileges(THD *thd, TABTYPE type, PTOS options, 
+                            const char *db, TABLE *table, bool quick)
 {
-  const char *db= (dbn && *dbn) ? dbn : NULL;
-  TABTYPE     type=GetRealType(options);
-
   switch (type) {
     case TAB_UNDEF:
 //  case TAB_CATLG:
@@ -4500,7 +4538,10 @@ bool ha_connect::check_privileges(THD *thd, PTOS options, const char *dbn, bool 
     case TAB_VEC:
 		case TAB_REST:
     case TAB_JSON:
-			if (options->filename && *options->filename) {
+#if defined(BSON_SUPPORT)
+    case TAB_BSON:
+#endif   // BSON_SUPPORT
+      if (options->filename && *options->filename) {
 				if (!quick) {
 					char path[FN_REFLEN], dbpath[FN_REFLEN];
 
@@ -4531,11 +4572,10 @@ bool ha_connect::check_privileges(THD *thd, PTOS options, const char *dbn, bool 
 		case TAB_DIR:
 		case TAB_ZIP:
 		case TAB_OEM:
-      if (table && table->pos_in_table_list) {		// if SELECT
+      if (table && table->pos_in_table_list) { // if SELECT
 #if MYSQL_VERSION_ID > 100200
 				Switch_to_definer_security_ctx backup_ctx(thd, table->pos_in_table_list);
 #endif // VERSION_ID > 100200
-
         return check_global_access(thd, FILE_ACL);
       }	else
         return check_global_access(thd, FILE_ACL);
@@ -4551,12 +4591,23 @@ bool ha_connect::check_privileges(THD *thd, PTOS options, const char *dbn, bool 
     case TAB_OCCUR:
     case TAB_PIVOT:
     case TAB_VIR:
+    default:
 			// This is temporary until a solution is found
 			return false;
-  } // endswitch type
+    } // endswitch type
 
   my_printf_error(ER_UNKNOWN_ERROR, "check_privileges failed", MYF(0));
   return true;
+} // end of checkPrivileges
+
+// Check whether the user has required (file) privileges
+bool ha_connect::check_privileges(THD *thd, PTOS options, const char *dbn,
+				  bool quick)
+{
+  const char *db= (dbn && *dbn) ? dbn : NULL;
+  TABTYPE     type=GetRealType(options);
+
+  return checkPrivileges(thd, type, options, db, table, quick);
 } // end of check_privileges
 
 // Check that two indexes are equivalent
@@ -4804,6 +4855,7 @@ int ha_connect::start_stmt(THD *thd, thr_lock_type lock_type)
   lock.cc by lock_external() and unlock_external() in lock.cc;
   the section "locking functions for mysql" in lock.cc;
   copy_data_between_tables() in sql_table.cc.
+
 */
 int ha_connect::external_lock(THD *thd, int lock_type)
 {
@@ -4936,11 +4988,11 @@ int ha_connect::external_lock(THD *thd, int lock_type)
             // Here we do make the new indexes
             if (tdp->MakeIndex(g, adp, true) == RC_FX) {
               // Make it a warning to avoid crash
-              push_warning(thd, Sql_condition::WARN_LEVEL_WARN, 
-                                0, g->Message);
-              rc= 0;
-							//my_message(ER_UNKNOWN_ERROR, g->Message, MYF(0));
-							//rc= HA_ERR_INTERNAL_ERROR;
+              //push_warning(thd, Sql_condition::WARN_LEVEL_WARN, 
+              //                  0, g->Message);
+              //rc= 0;
+							my_message(ER_TOO_MANY_KEYS, g->Message, MYF(0));
+							rc= HA_ERR_INDEX_CORRUPT;
 						} // endif MakeIndex
       
         } else if (tdbp->GetDef()->Indexable() == 3) {
@@ -5210,6 +5262,14 @@ int ha_connect::delete_or_rename_table(const char *name, const char *to)
     thd->push_internal_handler(&error_handler);
     bool got_error= open_table_def(thd, share);
     thd->pop_internal_handler();
+    if (!got_error && share->db_type() != connect_hton)
+    {
+      /* The .frm file is not for the connect engine. Something is wrong! */
+      got_error= 1;
+      rc= HA_ERR_INTERNAL_ERROR;
+      my_error(HA_ERR_INTERNAL_ERROR, MYF(0),
+               "TABLE_SHARE is not for the CONNECT engine");
+    }
     if (!got_error) {
       // Now we can work
       if ((pos= share->option_struct)) {
@@ -5354,20 +5414,16 @@ static char *encode(PGLOBAL g, const char *cnm)
 */
 static bool add_field(String* sql, TABTYPE ttp, const char* field_name, int typ,
 	                    int len, int dec, char* key, uint tm, const char* rem,
-	                    char* dft, char* xtra, char* fmt, int flag, bool dbf, char v) {
-#if defined(DEVELOPMENT)
-	// Some client programs regard CHAR(36) as GUID
-	char var = (len > 255 || len == 36) ? 'V' : v;
-#else
+	                    char* dft, char* xtra, char* fmt, int flag, bool dbf, char v)
+{
 	char var = (len > 255) ? 'V' : v;
-#endif
 	bool q, error = false;
 	const char* type = PLGtoMYSQLtype(typ, dbf, var);
 
-	error |= sql->append('`');
-	error |= sql->append(field_name);
-	error |= sql->append("` ");
-	error |= sql->append(type);
+	error|= sql->append('`');
+	error|= sql->append(field_name, strlen(field_name));
+	error|= sql->append(STRING_WITH_LEN("` "));
+	error|= sql->append(type, strlen(type));
 
 	if (typ == TYPE_STRING ||
 		(len && typ != TYPE_DATE && (typ != TYPE_DOUBLE || dec >= 0))) {
@@ -5388,20 +5444,20 @@ static bool add_field(String* sql, TABTYPE ttp, const char* field_name, int typ,
 	} // endif len
 
 	if (v == 'U')
-		error |= sql->append(" UNSIGNED");
+          error |= sql->append(STRING_WITH_LEN(" UNSIGNED"));
 	else if (v == 'Z')
-		error |= sql->append(" ZEROFILL");
+          error |= sql->append(STRING_WITH_LEN(" ZEROFILL"));
 
 	if (key && *key) {
-		error |= sql->append(" ");
-		error |= sql->append(key);
+		error |= sql->append(' ');
+		error |= sql->append(key, strlen(key));
 	} // endif key
 
 	if (tm)
 		error |= sql->append(STRING_WITH_LEN(" NOT NULL"), system_charset_info);
 
 	if (dft && *dft) {
-		error |= sql->append(" DEFAULT ");
+          error |= sql->append(STRING_WITH_LEN(" DEFAULT "));
 
 		if (typ == TYPE_DATE)
 			q = (strspn(dft, "0123456789 -:/") == strlen(dft));
@@ -5409,38 +5465,41 @@ static bool add_field(String* sql, TABTYPE ttp, const char* field_name, int typ,
 			q = !IsTypeNum(typ);
 
 		if (q) {
-			error |= sql->append("'");
+			error |= sql->append(STRING_WITH_LEN("'"));
 			error |= sql->append_for_single_quote(dft, strlen(dft));
-			error |= sql->append("'");
+			error |= sql->append('\'');
 		} else
-			error |= sql->append(dft);
+			error |= sql->append(dft, strlen(dft));
 
 	} // endif dft
 
 	if (xtra && *xtra) {
-		error |= sql->append(" ");
-		error |= sql->append(xtra);
+		error |= sql->append(' ');
+		error |= sql->append(xtra, strlen(xtra));
 	} // endif rem
 
 	if (rem && *rem) {
-		error |= sql->append(" COMMENT '");
+		error |= sql->append(STRING_WITH_LEN(" COMMENT '"));
 		error |= sql->append_for_single_quote(rem, strlen(rem));
-		error |= sql->append("'");
+		error |= sql->append(STRING_WITH_LEN("'"));
 	} // endif rem
 
 	if (fmt && *fmt) {
 		switch (ttp) {
-		case TAB_JSON: error |= sql->append(" JPATH='"); break;
-		case TAB_XML:  error |= sql->append(" XPATH='"); break;
-		default:	     error |= sql->append(" FIELD_FORMAT='");
+		case TAB_JSON: error |= sql->append(STRING_WITH_LEN(" JPATH='")); break;
+#if defined(BSON_SUPPORT)
+                case TAB_BSON: error |= sql->append(STRING_WITH_LEN(" JPATH='")); break;
+#endif   // BSON_SUPPORT
+                case TAB_XML:  error |= sql->append(STRING_WITH_LEN(" XPATH='")); break;
+		default:	     error |= sql->append(STRING_WITH_LEN(" FIELD_FORMAT='"));
 		} // endswitch ttp
 
 		error |= sql->append_for_single_quote(fmt, strlen(fmt));
-		error |= sql->append("'");
+		error |= sql->append('\'');
 	} // endif flag
 
 	if (flag) {
-		error |= sql->append(" FLAG=");
+		error |= sql->append(STRING_WITH_LEN(" FLAG="));
 		error |= sql->append_ulonglong(flag);
 	} // endif flag
 
@@ -5476,7 +5535,7 @@ static int init_table_share(THD* thd,
 
         if (vull != opt->def_value) {
           oom|= sql->append(' ');
-          oom|= sql->append(opt->name);
+          oom|= sql->append(opt->name, strlen(opt->name));
           oom|= sql->append('=');
           oom|= sql->append_ulonglong(vull);
           } // endif vull
@@ -5487,8 +5546,8 @@ static int init_table_share(THD* thd,
 
         if (vstr) {
           oom|= sql->append(' ');
-          oom|= sql->append(opt->name);
-          oom|= sql->append("='");
+          oom|= sql->append(opt->name, strlen(opt->name));
+          oom|= sql->append(STRING_WITH_LEN("='"));
           oom|= sql->append_for_single_quote(vstr, strlen(vstr));
           oom|= sql->append('\'');
           } // endif vstr
@@ -5499,9 +5558,12 @@ static int init_table_share(THD* thd,
 
         if (vull != opt->def_value) {
           oom|= sql->append(' ');
-          oom|= sql->append(opt->name);
+          oom|= sql->append(opt->name, strlen(opt->name));
           oom|= sql->append('=');
-          oom|= sql->append(vull ? "YES" : "NO");
+          if (vull)
+            oom|= sql->append("YES", 3);
+          else
+            oom|= sql->append("NO", 2);
           } // endif vull
 
         break;
@@ -5516,7 +5578,7 @@ static int init_table_share(THD* thd,
 
   if (create_info->connect_string.length) {
     oom|= sql->append(' ');
-    oom|= sql->append("CONNECTION='");
+    oom|= sql->append(STRING_WITH_LEN("CONNECTION='"));
     oom|= sql->append_for_single_quote(create_info->connect_string.str,
                                        create_info->connect_string.length);
     oom|= sql->append('\'');
@@ -5528,8 +5590,8 @@ static int init_table_share(THD* thd,
 
   if (create_info->default_table_charset) {
     oom|= sql->append(' ');
-    oom|= sql->append("CHARSET=");
-    oom|= sql->append(create_info->default_table_charset->csname);
+    oom|= sql->append(STRING_WITH_LEN("CHARSET="));
+    oom|= sql->append(create_info->default_table_charset->cs_name);
 
     if (oom)
       return HA_ERR_OUT_OF_MEM;
@@ -5596,8 +5658,8 @@ static int connect_assisted_discovery(handlerton *, THD* thd,
   String   sql(buf, sizeof(buf), system_charset_info);
 
   sql.copy(STRING_WITH_LEN("CREATE TABLE whatever ("), system_charset_info);
-	user = host = pwd = tbl = src = col = ocl = pic = fcl = skc = rnk = zfn = NULL;
-	dsn = url = NULL;
+	user= host= pwd= tbl= src= col= ocl= pic= fcl= skc= rnk= zfn= NULL;
+	dsn= url= NULL;
 
   // Get the useful create options
   ttp= GetTypeID(topt->type);
@@ -5658,7 +5720,7 @@ static int connect_assisted_discovery(handlerton *, THD* thd,
 
 	try {
 		// Check table type
-		if (ttp == TAB_UNDEF) {
+		if (ttp == TAB_UNDEF && !topt->http) {
 			topt->type= (src) ? "MYSQL" : (tab) ? "PROXY" : "DOS";
 			ttp= GetTypeID(topt->type);
 			sprintf(g->Message, "No table_type. Was set to %s", topt->type);
@@ -5669,17 +5731,50 @@ static int connect_assisted_discovery(handlerton *, THD* thd,
 			goto err;
 #if defined(REST_SUPPORT)
 		} else if (topt->http) {
-			switch (ttp) {
+      if (ttp == TAB_UNDEF) {
+        topt->type = "JSON";
+        ttp= GetTypeID(topt->type);
+        sprintf(g->Message, "No table_type. Was set to %s", topt->type);
+        push_warning(thd, Sql_condition::WARN_LEVEL_WARN, 0, g->Message);
+      } // endif ttp
+
+      switch (ttp) {
 				case TAB_JSON:
-				case TAB_XML:
+#if defined(BSON_SUPPORT)
+        case TAB_BSON:
+#endif   // BSON_SUPPORT
+        case TAB_XML:
 				case TAB_CSV:
-					ttp = TAB_REST;
+          ttp = TAB_REST;
 					break;
 				default:
 					break;
 			}	// endswitch type
 #endif   // REST_SUPPORT
 		} // endif ttp
+
+    if (fn && *fn)
+      switch (ttp) {
+        case TAB_FMT:
+        case TAB_DBF:
+        case TAB_XML:
+        case TAB_INI:
+        case TAB_VEC:
+        case TAB_REST:
+        case TAB_JSON:
+#if defined(BSON_SUPPORT)
+        case TAB_BSON:
+#endif   // BSON_SUPPORT
+          if (checkPrivileges(thd, ttp, topt, db)) {
+            strcpy(g->Message, "This operation requires the FILE privilege");
+            rc= HA_ERR_INTERNAL_ERROR;
+            goto err;
+          } // endif check_privileges
+
+          break;
+        default:
+          break;
+      } // endswitch ttp
 
 		if (!tab) {
 			if (ttp == TAB_TBL) {
@@ -5856,7 +5951,10 @@ static int connect_assisted_discovery(handlerton *, THD* thd,
 			case TAB_XML:
 #endif   // LIBXML2_SUPPORT  ||         DOMDOC_SUPPORT
 			case TAB_JSON:
-				dsn= strz(g, create_info->connect_string);
+#if defined(BSON_SUPPORT)
+      case TAB_BSON:
+#endif   // BSON_SUPPORT
+        dsn= strz(g, create_info->connect_string);
 
 				if (!fn && !zfn && !mul && !dsn)
 					sprintf(g->Message, "Missing %s file name", topt->type);
@@ -6020,8 +6118,15 @@ static int connect_assisted_discovery(handlerton *, THD* thd,
 					qrp= VirColumns(g, fnc == FNC_COL);
 					break;
 				case TAB_JSON:
+#if !defined(FORCE_BSON)
 					qrp= JSONColumns(g, db, dsn, topt, fnc == FNC_COL);
 					break;
+#endif   // !FORCE_BSON
+#if defined(BSON_SUPPORT)
+        case TAB_BSON:
+          qrp= BSONColumns(g, db, dsn, topt, fnc == FNC_COL);
+          break;
+#endif   // BSON_SUPPORT
 #if defined(JAVA_SUPPORT)
 				case TAB_MONGO:
 					url= strz(g, create_info->connect_string);
@@ -6085,6 +6190,10 @@ static int connect_assisted_discovery(handlerton *, THD* thd,
 					rc= HA_ERR_INTERNAL_ERROR;
 					goto err;
 				} // endif !nblin
+
+				// Restore language type
+				if (ttp == TAB_REST)
+          ttp = GetTypeID(topt->type);
 
 				for (i= 0; !rc && i < qrp->Nblin; i++) {
 					typ= len= prec= dec= flg= 0;
@@ -6261,7 +6370,7 @@ static int connect_assisted_discovery(handlerton *, THD* thd,
 
 						// Now add the field
 						if (add_field(&sql, ttp, cnm, typ, prec, dec, key, tm, rem, dft, xtra,
-							fmt, flg, dbf, v))
+								fmt, flg, dbf, v))
 							rc= HA_ERR_OUT_OF_MEM;
 				} // endfor i
 
@@ -6352,6 +6461,7 @@ int ha_connect::create(const char *name, TABLE *table_arg,
   TABLE  *st= table;                       // Probably unuseful
   THD    *thd= ha_thd();
   LEX_CSTRING cnc = table_arg->s->connect_string;
+  myf utf8_flag= thd->get_utf8_flag();
 #if defined(WITH_PARTITION_STORAGE_ENGINE)
   partition_info *part_info= table_arg->part_info;
 #else		// !WITH_PARTITION_STORAGE_ENGINE
@@ -6385,6 +6495,9 @@ int ha_connect::create(const char *name, TABLE *table_arg,
   // Check table type
   if (type == TAB_UNDEF) {
     options->type= (options->srcdef)  ? "MYSQL" :
+#if defined(REST_SUPPORT)
+                   (options->http) ? "JSON" :
+#endif   // REST_SUPPORT
                    (options->tabname) ? "PROXY" : "DOS";
     type= GetTypeID(options->type);
     sprintf(g->Message, "No table_type. Will be set to %s", options->type);
@@ -6402,13 +6515,14 @@ int ha_connect::create(const char *name, TABLE *table_arg,
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
 
   inward= IsFileType(type) && !options->filename &&
-		     (type != TAB_JSON || !cnc.length);
+		     ((type != TAB_JSON && type != TAB_BSON) || !cnc.length);
 
   if (options->data_charset) {
     const CHARSET_INFO *data_charset;
 
     if (!(data_charset= get_charset_by_csname(options->data_charset,
-                                              MY_CS_PRIMARY, MYF(0)))) {
+                                                    MY_CS_PRIMARY,
+                                                     MYF(utf8_flag)))) {
       my_error(ER_UNKNOWN_CHARACTER_SET, MYF(0), options->data_charset);
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
       } // endif charset
@@ -6760,8 +6874,8 @@ int ha_connect::create(const char *name, TABLE *table_arg,
   if (trace(1))
     htrc("xchk=%p createas=%d\n", g->Xchk, g->Createas);
 
-#if defined(ZIP_SUPPORT)
 	if (options->zipped) {
+#if defined(ZIP_SUPPORT)
 		// Check whether the zip entry must be made from a file
 		PCSZ fn= GetListOption(g, "Load", options->oplist, NULL);
 
@@ -6783,9 +6897,11 @@ int ha_connect::create(const char *name, TABLE *table_arg,
 			}	// endif LoadFile
 
 		}	// endif fn
-
+#else   // !ZIP_SUPPORT
+		my_message(ER_UNKNOWN_ERROR, "Option ZIP not supported", MYF(0));
+		DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+#endif  // !ZIP_SUPPORT
 	}	// endif zipped
-#endif   // ZIP_SUPPORT
 
   // To check whether indexes have to be made or remade
   if (!g->Xchk) {
@@ -7387,7 +7503,8 @@ static struct st_mysql_sys_var* connect_system_variables[]= {
 	MYSQL_SYSVAR(json_null),
 	MYSQL_SYSVAR(json_all_path),
 	MYSQL_SYSVAR(default_depth),
-	MYSQL_SYSVAR(json_grp_size),
+  MYSQL_SYSVAR(default_prec),
+  MYSQL_SYSVAR(json_grp_size),
 #if defined(JAVA_SUPPORT)
 	MYSQL_SYSVAR(jvm_path),
 	MYSQL_SYSVAR(class_path),
@@ -7397,7 +7514,10 @@ static struct st_mysql_sys_var* connect_system_variables[]= {
 	MYSQL_SYSVAR(enable_mongo),
 #endif   // JAVA_SUPPORT || CMGO_SUPPORT   
 	MYSQL_SYSVAR(cond_push),
-	NULL
+#if defined(BSON_SUPPORT)
+  MYSQL_SYSVAR(force_bson),
+#endif   // BSON_SUPPORT
+  NULL
 };
 
 maria_declare_plugin(connect)

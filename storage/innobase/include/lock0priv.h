@@ -391,9 +391,6 @@ static const byte lock_strength_matrix[5][5] = {
  /* AI */ {  FALSE, FALSE, FALSE, FALSE,  TRUE}
 };
 
-/** Maximum depth of the DFS stack. */
-static const ulint MAX_STACK_SIZE = 4096;
-
 #define PRDT_HEAPNO	PAGE_HEAP_NO_INFIMUM
 /** Record locking request status */
 enum lock_rec_req_status {
@@ -418,14 +415,6 @@ lock_rec_get_prev(
 /*==============*/
 	const lock_t*	in_lock,/*!< in: record lock */
 	ulint		heap_no);/*!< in: heap number of the record */
-
-/*********************************************************************//**
-Cancels a waiting lock request and releases possible other transactions
-waiting behind it. */
-void
-lock_cancel_waiting_and_release(
-/*============================*/
-	lock_t*	lock);	/*!< in/out: waiting lock request */
 
 /*********************************************************************//**
 Checks if some transaction has an implicit x-lock on a record in a clustered
@@ -484,7 +473,7 @@ lock_rec_set_nth_bit(
 inline byte lock_rec_reset_nth_bit(lock_t* lock, ulint i)
 {
 	ut_ad(!lock->is_table());
-	lock_sys.mutex_assert_locked();
+	ut_ad(lock_sys.is_writer() || lock->trx->mutex_is_owner());
 	ut_ad(i < lock->un_member.rec_lock.n_bits);
 
 	byte*	b = reinterpret_cast<byte*>(&lock[1]) + (i >> 3);
@@ -530,16 +519,26 @@ lock_rec_get_next_const(
 	ulint		heap_no,/*!< in: heap number of the record */
 	const lock_t*	lock);	/*!< in: lock */
 
-/*********************************************************************//**
-Gets the first explicit lock request on a record.
-@return first lock, NULL if none exists */
-UNIV_INLINE
-lock_t*
-lock_rec_get_first(
-/*===============*/
-	hash_table_t*		hash,	/*!< in: hash chain the lock on */
-	const buf_block_t*	block,	/*!< in: block containing the record */
-	ulint			heap_no);/*!< in: heap number of the record */
+/** Get the first explicit lock request on a record.
+@param cell     first lock hash table cell
+@param id       page identifier
+@param heap_no  record identifier in page
+@return first lock
+@retval nullptr if none exists */
+inline lock_t *lock_sys_t::get_first(const hash_cell_t &cell, page_id_t id,
+                                     ulint heap_no)
+{
+  lock_sys.assert_locked(cell);
+
+  for (lock_t *lock= static_cast<lock_t*>(cell.node); lock; lock= lock->hash)
+  {
+    ut_ad(!lock->is_table());
+    if (lock->un_member.rec_lock.page_id == id &&
+        lock_rec_get_nth_bit(lock, heap_no))
+      return lock;
+  }
+  return nullptr;
+}
 
 /*********************************************************************//**
 Calculates if lock mode 1 is compatible with lock mode 2.

@@ -80,6 +80,8 @@ static my_bool g_allow_create_integer_latch = FALSE;
 
 using namespace open_query;
 
+static const LEX_CSTRING empty_lex_cstring= {"", 0};
+
 // Table of varchar latch operations.
 // In the future this needs to be refactactored to live somewhere else
 struct oqgraph_latch_op_table { const char *key; int latch; };
@@ -149,12 +151,13 @@ static handler* oqgraph_create_handler(handlerton *hton, TABLE_SHARE *table,
 "           KEY (latch, destid, origid) USING HASH       "\
 "         )                                              "
 
-#define append_opt(NAME,VAL)                                    \
-  if (share->option_struct->VAL)                                \
-  {                                                             \
-    sql.append(STRING_WITH_LEN(" " NAME "='"));                  \
-    sql.append_for_single_quote(share->option_struct->VAL);     \
-    sql.append('\'');                                           \
+#define append_opt(NAME,VAL)                              \
+  if (share->option_struct->VAL)                          \
+  {                                                       \
+    const char *val= share->option_struct->VAL;           \
+    sql.append(STRING_WITH_LEN(" " NAME "='"));           \
+    sql.append_for_single_quote(val, strlen(val));        \
+    sql.append('\'');                                     \
   }
 
 int oqgraph_discover_table_structure(handlerton *hton, THD* thd,
@@ -162,7 +165,6 @@ int oqgraph_discover_table_structure(handlerton *hton, THD* thd,
 {
   StringBuffer<1024> sql(system_charset_info);
   sql.copy(STRING_WITH_LEN(OQGRAPH_CREATE_TABLE), system_charset_info);
-
   append_opt("data_table", table_name);
   append_opt("origid", origid);
   append_opt("destid", destid);
@@ -623,7 +625,7 @@ int ha_oqgraph::open(const char *name, int mode, uint test_if_locked)
   }
 
   if (enum open_frm_error err= open_table_from_share(thd, share,
-                                                     &empty_clex_str,
+                                                     &empty_lex_cstring,
                             (uint) (HA_OPEN_KEYFILE | HA_TRY_READ_ONLY),
                             EXTRA_RECORD,
                             thd->open_options, edges, FALSE))
@@ -908,7 +910,7 @@ int ha_oqgraph::index_read_idx(byte * buf, uint index, const byte * key,
   bmove_align(buf, table->s->default_values, table->s->reclength);
   key_restore(buf, (byte*) key, key_info, key_len);
 
-  my_bitmap_map *old_map= dbug_tmp_use_all_columns(table, table->read_set);
+  MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->read_set);
   my_ptrdiff_t ptrdiff= buf - table->record[0];
 
   if (ptrdiff)
@@ -937,7 +939,7 @@ int ha_oqgraph::index_read_idx(byte * buf, uint index, const byte * key,
           field[1]->move_field_offset(-ptrdiff);
           field[2]->move_field_offset(-ptrdiff);
         }
-        dbug_tmp_restore_column_map(table->read_set, old_map);
+        dbug_tmp_restore_column_map(&table->read_set, old_map);
         return error_code(oqgraph::NO_MORE_DATA);
       }
     }
@@ -962,7 +964,7 @@ int ha_oqgraph::index_read_idx(byte * buf, uint index, const byte * key,
     field[1]->move_field_offset(-ptrdiff);
     field[2]->move_field_offset(-ptrdiff);
   }
-  dbug_tmp_restore_column_map(table->read_set, old_map);
+  dbug_tmp_restore_column_map(&table->read_set, old_map);
 
   // Keep the latch around so we can use it in the query result later -
   // See fill_record().
@@ -995,7 +997,7 @@ int ha_oqgraph::fill_record(byte *record, const open_query::row &row)
 
   bmove_align(record, table->s->default_values, table->s->reclength);
 
-  my_bitmap_map *old_map= dbug_tmp_use_all_columns(table, table->write_set);
+  MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->write_set);
   my_ptrdiff_t ptrdiff= record - table->record[0];
 
   if (ptrdiff)
@@ -1071,7 +1073,7 @@ int ha_oqgraph::fill_record(byte *record, const open_query::row &row)
     field[4]->move_field_offset(-ptrdiff);
     field[5]->move_field_offset(-ptrdiff);
   }
-  dbug_tmp_restore_column_map(table->write_set, old_map);
+  dbug_tmp_restore_column_map(&table->write_set, old_map);
 
   return 0;
 }

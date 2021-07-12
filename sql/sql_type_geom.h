@@ -34,8 +34,9 @@ public:
     GEOM_MULTIPOINT = 4, GEOM_MULTILINESTRING = 5, GEOM_MULTIPOLYGON = 6,
     GEOM_GEOMETRYCOLLECTION = 7
   };
-  static bool check_type_geom_or_binary(const char *opname, const Item *item);
-  static bool check_types_geom_or_binary(const char *opname,
+  static bool check_type_geom_or_binary(const LEX_CSTRING &opname,
+                                        const Item *item);
+  static bool check_types_geom_or_binary(const LEX_CSTRING &opname,
                                          Item * const *args,
                                          uint start, uint end);
   static const Type_handler_geometry *type_handler_geom_by_type(uint type);
@@ -108,7 +109,10 @@ public:
                                         MEM_ROOT *mem_root,
                                         Column_definition *c,
                                         handler *file,
-                                        ulonglong table_flags) const override;
+                                        ulonglong table_flags,
+                                        const Column_derived_attributes
+                                              *derived_attr)
+                                        const override;
   bool Column_definition_prepare_stage2(Column_definition *c,
                                         handler *file,
                                         ulonglong table_flags) const override;
@@ -152,7 +156,7 @@ public:
   bool Item_func_abs_fix_length_and_dec(Item_func_abs *) const override;
   bool Item_func_neg_fix_length_and_dec(Item_func_neg *) const override;
   bool Item_hybrid_func_fix_attributes(THD *thd,
-                                       const char *name,
+                                       const LEX_CSTRING &name,
                                        Type_handler_hybrid_field_type *h,
                                        Type_all_attributes *attr,
                                        Item **items, uint nitems) const

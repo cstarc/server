@@ -517,6 +517,7 @@ int append_query_string(CHARSET_INFO *csinfo, String *to,
                         const char *str, size_t len, bool no_backslash)
 {
   char *beg, *ptr;
+  my_bool overflow;
   uint32 const orig_len= to->length();
   if (to->reserve(orig_len + len * 2 + 4))
     return 1;
@@ -530,7 +531,7 @@ int append_query_string(CHARSET_INFO *csinfo, String *to,
     *ptr++= '\'';
     if (!no_backslash)
     {
-      ptr+= escape_string_for_mysql(csinfo, ptr, 0, str, len);
+      ptr+= escape_string_for_mysql(csinfo, ptr, 0, str, len, &overflow);
     }
     else
     {
@@ -643,7 +644,7 @@ Log_event::do_shall_skip(rpl_group_info *rgi)
                       rli->replicate_same_server_id,
                       rli->slave_skip_counter));
   if ((server_id == global_system_variables.server_id &&
-       !rli->replicate_same_server_id) ||
+       !(rli->replicate_same_server_id || (flags &  LOG_EVENT_ACCEPT_OWN_F))) ||
       (rli->slave_skip_counter == 1 && rli->is_in_group()) ||
       (flags & LOG_EVENT_SKIP_REPLICATION_F &&
        opt_replicate_events_marked_for_skip != RPL_SKIP_REPLICATE))
@@ -660,7 +661,7 @@ Log_event::do_shall_skip(rpl_group_info *rgi)
 
 void Log_event::pack_info(Protocol *protocol)
 {
-  protocol->store("", &my_charset_bin);
+  protocol->store("", 0, &my_charset_bin);
 }
 
 
@@ -675,7 +676,7 @@ int Log_event::net_send(Protocol *protocol, const char* log_name, my_off_t pos)
     log_name = p + 1;
 
   protocol->prepare_for_resend();
-  protocol->store(log_name, &my_charset_bin);
+  protocol->store(log_name, strlen(log_name), &my_charset_bin);
   protocol->store((ulonglong) pos);
   event_type = get_type_str();
   protocol->store(event_type, strlen(event_type), &my_charset_bin);
@@ -1293,6 +1294,15 @@ bool Query_log_event::write()
     int3store(start, when_sec_part);
     start+= 3;
   }
+
+  /* xid's is used with ddl_log handling */
+  if (thd && thd->binlog_xid)
+  {
+    *start++= Q_XID;
+    int8store(start, thd->query_id);
+    start+= 8;
+  }
+
   /*
     NOTE: When adding new status vars, please don't forget to update
     the MAX_SIZE_LOG_EVENT_STATUS in log_event.h and update the function
@@ -1330,14 +1340,14 @@ bool Query_log_event::write()
 
 bool Query_compressed_log_event::write()
 {
-  char *buffer;
+  uchar *buffer;
   uint32 alloc_size, compressed_size;
   bool ret= true;
 
   compressed_size= alloc_size= binlog_get_compress_len(q_len);
-  buffer= (char*) my_safe_alloca(alloc_size);
+  buffer= (uchar*) my_safe_alloca(alloc_size);
   if (buffer &&
-      !binlog_buf_compress(query, buffer, q_len, &compressed_size))
+      !binlog_buf_compress((uchar*) query, buffer, q_len, &compressed_size))
   {
     /*
       Write the compressed event. We have to temporarily store the event
@@ -1345,7 +1355,7 @@ bool Query_compressed_log_event::write()
     */
     const char *query_tmp= query;
     uint32 q_len_tmp= q_len;
-    query= buffer;
+    query= (char*) buffer;
     q_len= compressed_size;
     ret= Query_log_event::write();
     query= query_tmp;
@@ -2160,9 +2170,10 @@ Query_log_event::do_shall_skip(rpl_group_info *rgi)
 
 
 bool
-Query_log_event::peek_is_commit_rollback(const char *event_start,
+Query_log_event::peek_is_commit_rollback(const uchar *event_start,
                                          size_t event_len,
-                                         enum enum_binlog_checksum_alg checksum_alg)
+                                         enum enum_binlog_checksum_alg
+                                         checksum_alg)
 {
   if (checksum_alg == BINLOG_CHECKSUM_ALG_CRC32)
   {
@@ -3250,10 +3261,13 @@ bool Binlog_checkpoint_log_event::write()
 Gtid_log_event::Gtid_log_event(THD *thd_arg, uint64 seq_no_arg,
                                uint32 domain_id_arg, bool standalone,
                                uint16 flags_arg, bool is_transactional,
-                               uint64 commit_id_arg)
+                               uint64 commit_id_arg, bool has_xid,
+                               bool ro_1pc)
   : Log_event(thd_arg, flags_arg, is_transactional),
     seq_no(seq_no_arg), commit_id(commit_id_arg), domain_id(domain_id_arg),
-    flags2((standalone ? FL_STANDALONE : 0) | (commit_id_arg ? FL_GROUP_COMMIT_ID : 0))
+    flags2((standalone ? FL_STANDALONE : 0) |
+           (commit_id_arg ? FL_GROUP_COMMIT_ID : 0)),
+    flags_extra(0), extra_engines(0)
 {
   cache_type= Log_event::EVENT_NO_CACHE;
   bool is_tmp_table= thd_arg->lex->stmt_accessed_temp_table();
@@ -3262,8 +3276,10 @@ Gtid_log_event::Gtid_log_event(THD *thd_arg, uint64 seq_no_arg,
     flags2|= FL_WAITED;
   if (thd_arg->transaction->stmt.trans_did_ddl() ||
       thd_arg->transaction->stmt.has_created_dropped_temp_table() ||
+      thd_arg->transaction->stmt.trans_executed_admin_cmd() ||
       thd_arg->transaction->all.trans_did_ddl() ||
-      thd_arg->transaction->all.has_created_dropped_temp_table())
+      thd_arg->transaction->all.has_created_dropped_temp_table() ||
+      thd_arg->transaction->all.trans_executed_admin_cmd())
     flags2|= FL_DDL;
   else if (is_transactional && !is_tmp_table)
     flags2|= FL_TRANSACTIONAL;
@@ -3274,15 +3290,40 @@ Gtid_log_event::Gtid_log_event(THD *thd_arg, uint64 seq_no_arg,
     flags2|= (thd_arg->rgi_slave->gtid_ev_flags2 & (FL_DDL|FL_WAITED));
 
   XID_STATE &xid_state= thd->transaction->xid_state;
-  if (is_transactional && xid_state.is_explicit_XA() &&
-      (thd->lex->sql_command == SQLCOM_XA_PREPARE ||
-       xid_state.get_state_code() == XA_PREPARED))
+  if (is_transactional)
   {
-    DBUG_ASSERT(thd->lex->xa_opt != XA_ONE_PHASE);
+    if (xid_state.is_explicit_XA() &&
+        (thd->lex->sql_command == SQLCOM_XA_PREPARE ||
+         xid_state.get_state_code() == XA_PREPARED))
+    {
+      DBUG_ASSERT(thd->lex->xa_opt != XA_ONE_PHASE);
 
-    flags2|= thd->lex->sql_command == SQLCOM_XA_PREPARE ?
-      FL_PREPARED_XA : FL_COMPLETED_XA;
-    xid.set(xid_state.get_xid());
+      flags2|= thd->lex->sql_command == SQLCOM_XA_PREPARE ?
+        FL_PREPARED_XA : FL_COMPLETED_XA;
+      xid.set(xid_state.get_xid());
+    }
+    /* count non-zero extra recoverable engines; total = extra + 1 */
+    if (has_xid)
+    {
+      DBUG_ASSERT(ha_count_rw_2pc(thd_arg,
+                                  thd_arg->in_multi_stmt_transaction_mode()));
+
+      extra_engines=
+        ha_count_rw_2pc(thd_arg, thd_arg->in_multi_stmt_transaction_mode()) - 1;
+    }
+    else if (ro_1pc)
+    {
+      extra_engines= UCHAR_MAX;
+    }
+    else if (thd->lex->sql_command == SQLCOM_XA_PREPARE)
+    {
+      DBUG_ASSERT(thd_arg->in_multi_stmt_transaction_mode());
+
+      uint8 count= ha_count_rw_2pc(thd_arg, true);
+      extra_engines= count > 1 ? 0 : UCHAR_MAX;
+    }
+    if (extra_engines > 0)
+      flags_extra|= FL_EXTRA_MULTI_ENGINE;
   }
 }
 
@@ -3292,12 +3333,12 @@ Gtid_log_event::Gtid_log_event(THD *thd_arg, uint64 seq_no_arg,
   fully contruct every Gtid_log_event() needlessly.
 */
 bool
-Gtid_log_event::peek(const char *event_start, size_t event_len,
+Gtid_log_event::peek(const uchar *event_start, size_t event_len,
                      enum enum_binlog_checksum_alg checksum_alg,
                      uint32 *domain_id, uint32 *server_id, uint64 *seq_no,
                      uchar *flags2, const Format_description_log_event *fdev)
 {
-  const char *p;
+  const uchar *p;
 
   if (checksum_alg == BINLOG_CHECKSUM_ALG_CRC32)
   {
@@ -3318,7 +3359,7 @@ Gtid_log_event::peek(const char *event_start, size_t event_len,
   p+= 8;
   *domain_id= uint4korr(p);
   p+= 4;
-  *flags2= (uchar)*p;
+  *flags2= *p;
   return false;
 }
 
@@ -3326,19 +3367,19 @@ Gtid_log_event::peek(const char *event_start, size_t event_len,
 bool
 Gtid_log_event::write()
 {
-  uchar buf[GTID_HEADER_LEN+2+sizeof(XID)];
-  size_t write_len;
+  uchar buf[GTID_HEADER_LEN+2+sizeof(XID) + /* flags_extra: */ 1+4];
+  size_t write_len= 13;
 
   int8store(buf, seq_no);
   int4store(buf+8, domain_id);
   buf[12]= flags2;
   if (flags2 & FL_GROUP_COMMIT_ID)
   {
-    int8store(buf+13, commit_id);
+    DBUG_ASSERT(write_len + 8 == GTID_HEADER_LEN + 2);
+
+    int8store(buf+write_len, commit_id);
     write_len= GTID_HEADER_LEN + 2;
   }
-  else
-    write_len= 13;
 
   if (flags2 & (FL_PREPARED_XA | FL_COMPLETED_XA))
   {
@@ -3349,6 +3390,16 @@ Gtid_log_event::write()
     long data_length= xid.bqual_length + xid.gtrid_length;
     memcpy(buf+write_len, xid.data, data_length);
     write_len+= data_length;
+  }
+  if (flags_extra > 0)
+  {
+    buf[write_len]= flags_extra;
+    write_len++;
+  }
+  if (flags_extra & FL_EXTRA_MULTI_ENGINE)
+  {
+    buf[write_len]= extra_engines;
+    write_len++;
   }
 
   if (write_len < GTID_HEADER_LEN)
@@ -3912,6 +3963,19 @@ int Xid_apply_log_event::do_record_gtid(THD *thd, rpl_group_info *rgi,
   return err;
 }
 
+static bool wsrep_must_replay(THD *thd)
+{
+#ifdef WITH_WSREP
+  mysql_mutex_lock(&thd->LOCK_thd_data);
+  bool res= WSREP(thd) && thd->wsrep_trx().state() == wsrep::transaction::s_must_replay;
+  mysql_mutex_unlock(&thd->LOCK_thd_data);
+  return res;
+#else
+  return false;
+#endif
+}
+
+
 int Xid_apply_log_event::do_apply_event(rpl_group_info *rgi)
 {
   bool res;
@@ -3970,21 +4034,13 @@ int Xid_apply_log_event::do_apply_event(rpl_group_info *rgi)
       return err;
   }
 
-#ifdef WITH_WSREP
-  if (WSREP(thd)) mysql_mutex_lock(&thd->LOCK_thd_data);
-  if ((!res || (WSREP(thd) && thd->wsrep_trx().state() == wsrep::transaction::s_must_replay )) && sub_id)
-#else
-  if (likely(!res) && sub_id)
-#endif /* WITH_WSREP */
+  if (sub_id && (!res || wsrep_must_replay(thd)))
     rpl_global_gtid_slave_state->update_state_hash(sub_id, &gtid, hton, rgi);
-#ifdef WITH_WSREP
-  if (WSREP(thd)) mysql_mutex_unlock(&thd->LOCK_thd_data);
-#endif /* WITH_WSREP */
   /*
     Increment the global status commit count variable
   */
-  enum enum_sql_command cmd= !thd->transaction->xid_state.is_explicit_XA() ?
-    SQLCOM_COMMIT : SQLCOM_XA_PREPARE;
+  enum enum_sql_command cmd= !thd->transaction->xid_state.is_explicit_XA()
+    ? SQLCOM_COMMIT : SQLCOM_XA_PREPARE;
   status_var_increment(thd->status_var.com_stat[cmd]);
 
   return res;
@@ -4125,9 +4181,9 @@ static bool
 user_var_append_name_part(THD *thd, String *buf,
                           const char *name, size_t name_len)
 {
-  return buf->append("@") ||
+  return buf->append('@') ||
     append_identifier(thd, buf, name, name_len) ||
-    buf->append("=");
+    buf->append('=');
 }
 
 void User_var_log_event::pack_info(Protocol* protocol)
@@ -4138,7 +4194,7 @@ void User_var_log_event::pack_info(Protocol* protocol)
     String buf(buf_mem, sizeof(buf_mem), system_charset_info);
     buf.length(0);
     if (user_var_append_name_part(protocol->thd, &buf, name, name_len) ||
-        buf.append("NULL"))
+        buf.append(NULL_clex_str))
       return;
     protocol->store(buf.ptr(), buf.length(), &my_charset_bin);
   }
@@ -4183,9 +4239,10 @@ void User_var_log_event::pack_info(Protocol* protocol)
       buf.length(0);
       my_decimal((const uchar *) (val + 2), val[0], val[1]).to_string(&str);
       if (user_var_append_name_part(protocol->thd, &buf, name, name_len) ||
-          buf.append(buf2))
+          buf.append(str))
         return;
       protocol->store(buf.ptr(), buf.length(), &my_charset_bin);
+
       break;
     }
     case STRING_RESULT:
@@ -4197,7 +4254,7 @@ void User_var_log_event::pack_info(Protocol* protocol)
       buf.length(0);
       if (!(cs= get_charset(charset_number, MYF(0))))
       {
-        if (buf.append("???"))
+        if (buf.append(STRING_WITH_LEN("???")))
           return;
       }
       else
@@ -4205,9 +4262,9 @@ void User_var_log_event::pack_info(Protocol* protocol)
         size_t old_len;
         char *beg, *end;
         if (user_var_append_name_part(protocol->thd, &buf, name, name_len) ||
-            buf.append("_") ||
-            buf.append(cs->csname) ||
-            buf.append(" "))
+            buf.append('_') ||
+            buf.append(cs->cs_name) ||
+            buf.append(' '))
           return;
         old_len= buf.length();
         if (buf.reserve(old_len + val_len * 2 + 3 + sizeof(" COLLATE ") +
@@ -4216,8 +4273,8 @@ void User_var_log_event::pack_info(Protocol* protocol)
         beg= const_cast<char *>(buf.ptr()) + old_len;
         end= str_to_hex(beg, val, val_len);
         buf.length(old_len + (end - beg));
-        if (buf.append(" COLLATE ") ||
-            buf.append(cs->name))
+        if (buf.append(STRING_WITH_LEN(" COLLATE ")) ||
+            buf.append(cs->coll_name))
           return;
       }
       protocol->store(buf.ptr(), buf.length(), &my_charset_bin);
@@ -5021,7 +5078,7 @@ void Execute_load_query_log_event::pack_info(Protocol *protocol)
   }
   if (query && q_len && buf.append(query, q_len))
     return;
-  if (buf.append(" ;file_id=") ||
+  if (buf.append(STRING_WITH_LEN(" ;file_id=")) ||
       buf.append_ulonglong(file_id))
     return;
   protocol->store(buf.ptr(), buf.length(), &my_charset_bin);
@@ -5458,7 +5515,7 @@ int Rows_log_event::do_apply_event(rpl_group_info *rgi)
     */
 
     {
-      DBUG_PRINT("debug", ("Checking compability of tables to lock - tables_to_lock: %p",
+      DBUG_PRINT("debug", ("Checking compatibility of tables to lock - tables_to_lock: %p",
                            rgi->tables_to_lock));
 
       /**
@@ -5997,14 +6054,15 @@ bool Rows_log_event::write_data_body()
 
 bool Rows_log_event::write_compressed()
 {
-  uchar *m_rows_buf_tmp = m_rows_buf;
-  uchar *m_rows_cur_tmp = m_rows_cur;
-  bool ret = true;
+  uchar *m_rows_buf_tmp= m_rows_buf;
+  uchar *m_rows_cur_tmp= m_rows_cur;
+  bool ret= true;
   uint32 comlen, alloc_size;
-  comlen= alloc_size= binlog_get_compress_len((uint32)(m_rows_cur_tmp - m_rows_buf_tmp));
-  m_rows_buf = (uchar *)my_safe_alloca(alloc_size);
+  comlen= alloc_size= binlog_get_compress_len((uint32)(m_rows_cur_tmp -
+                                                       m_rows_buf_tmp));
+  m_rows_buf= (uchar*) my_safe_alloca(alloc_size);
   if(m_rows_buf &&
-     !binlog_buf_compress((const char *)m_rows_buf_tmp, (char *)m_rows_buf,
+     !binlog_buf_compress(m_rows_buf_tmp, m_rows_buf,
                           (uint32)(m_rows_cur_tmp - m_rows_buf_tmp), &comlen))
   {
     m_rows_cur= comlen + m_rows_buf;
@@ -7460,11 +7518,11 @@ int Rows_log_event::update_sequence()
     /* This event come from a setval function executed on the master.
        Update the sequence next_number and round, like we do with setval()
     */
-    my_bitmap_map *old_map= dbug_tmp_use_all_columns(table,
-                                                     table->read_set);
+    MY_BITMAP *old_map= dbug_tmp_use_all_columns(table,
+                                                 &table->read_set);
     longlong nextval= table->field[NEXT_FIELD_NO]->val_int();
     longlong round= table->field[ROUND_FIELD_NO]->val_int();
-    dbug_tmp_restore_column_map(table->read_set, old_map);
+    dbug_tmp_restore_column_map(&table->read_set, old_map);
 
     return table->s->sequence->set_value(table, nextval, round, 0) > 0;
   }
@@ -7487,13 +7545,21 @@ Write_rows_log_event::do_exec_row(rpl_group_info *rgi)
 {
   DBUG_ASSERT(m_table != NULL);
   const char *tmp= thd->get_proc_info();
-  const char *message= "Write_rows_log_event::write_row()";
+  LEX_CSTRING tmp_db= thd->db;
+  char *message, msg[128];
+  const char *table_name= m_table->s->table_name.str;
+  char quote_char= get_quote_char_for_identifier(thd, STRING_WITH_LEN(table_name));
+  my_snprintf(msg, sizeof(msg),"Write_rows_log_event::write_row() on table %c%s%c",
+                   quote_char, table_name, quote_char);
+  thd->reset_db(&m_table->s->db);
+  message= msg;
   int error;
 
 #ifdef WSREP_PROC_INFO
   my_snprintf(thd->wsrep_info, sizeof(thd->wsrep_info) - 1,
-              "Write_rows_log_event::write_row(%lld)",
-              (long long) wsrep_thd_trx_seqno(thd));
+              "Write_rows_log_event::write_row(%lld) on table %c%s%c",
+              (long long) wsrep_thd_trx_seqno(thd), quote_char, table_name,
+              quote_char);
   message= thd->wsrep_info;
 #endif /* WSREP_PROC_INFO */
 
@@ -7507,6 +7573,7 @@ Write_rows_log_event::do_exec_row(rpl_group_info *rgi)
     my_error(ER_UNKNOWN_ERROR, MYF(0));
   }
 
+  thd->reset_db(&tmp_db);
   return error;
 }
 
@@ -8103,14 +8170,22 @@ int Delete_rows_log_event::do_exec_row(rpl_group_info *rgi)
 {
   int error;
   const char *tmp= thd->get_proc_info();
-  const char *message= "Delete_rows_log_event::find_row()";
+  LEX_CSTRING tmp_db= thd->db;
+  char *message, msg[128];
+  const char *table_name= m_table->s->table_name.str;
+  char quote_char= get_quote_char_for_identifier(thd, STRING_WITH_LEN(table_name));
+  my_snprintf(msg, sizeof(msg),"Delete_rows_log_event::find_row() on table %c%s%c",
+                   quote_char, table_name, quote_char);
+  thd->reset_db(&m_table->s->db);
+  message= msg;
   const bool invoke_triggers= (m_table->triggers && do_invoke_trigger());
   DBUG_ASSERT(m_table != NULL);
 
 #ifdef WSREP_PROC_INFO
   my_snprintf(thd->wsrep_info, sizeof(thd->wsrep_info) - 1,
-              "Delete_rows_log_event::find_row(%lld)",
-              (long long) wsrep_thd_trx_seqno(thd));
+              "Delete_rows_log_event::find_row(%lld) on table %c%s%c",
+              (long long) wsrep_thd_trx_seqno(thd), quote_char, table_name,
+              quote_char);
   message= thd->wsrep_info;
 #endif /* WSREP_PROC_INFO */
 
@@ -8120,11 +8195,14 @@ int Delete_rows_log_event::do_exec_row(rpl_group_info *rgi)
     /*
       Delete the record found, located in record[0]
     */
-    message= "Delete_rows_log_event::ha_delete_row()";
+    my_snprintf(msg, sizeof(msg),"Delete_rows_log_event::ha_delete_row() on table %c%s%c",
+                   quote_char, table_name, quote_char);
+    message= msg;
 #ifdef WSREP_PROC_INFO
     snprintf(thd->wsrep_info, sizeof(thd->wsrep_info) - 1,
-             "Delete_rows_log_event::ha_delete_row(%lld)",
-             (long long) wsrep_thd_trx_seqno(thd));
+             "Delete_rows_log_event::ha_delete_row(%lld) on table %c%s%c",
+              (long long) wsrep_thd_trx_seqno(thd), quote_char, table_name,
+              quote_char);
     message= thd->wsrep_info;
 #endif
     thd_proc_info(thd, message);
@@ -8155,6 +8233,7 @@ int Delete_rows_log_event::do_exec_row(rpl_group_info *rgi)
       error= HA_ERR_GENERIC; // in case if error is not set yet
     m_table->file->ha_index_or_rnd_end();
   }
+  thd->reset_db(&tmp_db);
   thd_proc_info(thd, tmp);
   return error;
 }
@@ -8254,13 +8333,21 @@ Update_rows_log_event::do_exec_row(rpl_group_info *rgi)
 {
   const bool invoke_triggers= (m_table->triggers && do_invoke_trigger());
   const char *tmp= thd->get_proc_info();
-  const char *message= "Update_rows_log_event::find_row()";
   DBUG_ASSERT(m_table != NULL);
+  LEX_CSTRING tmp_db= thd->db;
+  char *message, msg[128];
+  const char *table_name= m_table->s->table_name.str;
+  char quote_char= get_quote_char_for_identifier(thd, STRING_WITH_LEN(table_name));
+  my_snprintf(msg, sizeof(msg),"Update_rows_log_event::find_row() on table %c%s%c",
+                   quote_char, table_name, quote_char);
+  thd->reset_db(&m_table->s->db);
+  message= msg;
 
 #ifdef WSREP_PROC_INFO
   my_snprintf(thd->wsrep_info, sizeof(thd->wsrep_info) - 1,
-              "Update_rows_log_event::find_row(%lld)",
-              (long long) wsrep_thd_trx_seqno(thd));
+              "Update_rows_log_event::find_row(%lld) on table %c%s%c",
+              (long long) wsrep_thd_trx_seqno(thd), quote_char, table_name,
+              quote_char);
   message= thd->wsrep_info;
 #endif /* WSREP_PROC_INFO */
 
@@ -8281,6 +8368,7 @@ Update_rows_log_event::do_exec_row(rpl_group_info *rgi)
     if ((m_curr_row= m_curr_row_end))
       unpack_current_row(rgi, &m_cols_ai);
     thd_proc_info(thd, tmp);
+    thd->reset_db(&tmp_db);
     return error;
   }
 
@@ -8298,11 +8386,14 @@ Update_rows_log_event::do_exec_row(rpl_group_info *rgi)
   store_record(m_table,record[1]);
 
   m_curr_row= m_curr_row_end;
-  message= "Update_rows_log_event::unpack_current_row()";
+  my_snprintf(msg, sizeof(msg),"Update_rows_log_event::unpack_current_row() on table %c%s%c",
+                   quote_char, table_name, quote_char);
+  message= msg;
 #ifdef WSREP_PROC_INFO
   my_snprintf(thd->wsrep_info, sizeof(thd->wsrep_info) - 1,
-              "Update_rows_log_event::unpack_current_row(%lld)",
-              (long long) wsrep_thd_trx_seqno(thd));
+              "Update_rows_log_event::unpack_current_row(%lld) on table %c%s%c",
+              (long long) wsrep_thd_trx_seqno(thd), quote_char, table_name,
+              quote_char);
   message= thd->wsrep_info;
 #endif /* WSREP_PROC_INFO */
 
@@ -8325,11 +8416,13 @@ Update_rows_log_event::do_exec_row(rpl_group_info *rgi)
   DBUG_DUMP("new values", m_table->record[0], m_table->s->reclength);
 #endif
 
-  message= "Update_rows_log_event::ha_update_row()";
+  my_snprintf(msg, sizeof(msg),"Update_rows_log_event::ha_update_row() on table %c%s%c",
+              quote_char, table_name, quote_char);
+  message= msg;
 #ifdef WSREP_PROC_INFO
   my_snprintf(thd->wsrep_info, sizeof(thd->wsrep_info) - 1,
-              "Update_rows_log_event::ha_update_row(%lld)",
-              (long long) wsrep_thd_trx_seqno(thd));
+              "Update_rows_log_event::ha_update_row(%lld) on table %c%s%c",
+              (long long) wsrep_thd_trx_seqno(thd), quote_char, table_name, quote_char);
   message= thd->wsrep_info;
 #endif /* WSREP_PROC_INFO */
 
@@ -8358,9 +8451,10 @@ Update_rows_log_event::do_exec_row(rpl_group_info *rgi)
       unlikely(process_triggers(TRG_EVENT_UPDATE, TRG_ACTION_AFTER, TRUE)))
     error= HA_ERR_GENERIC; // in case if error is not set yet
 
-  thd_proc_info(thd, tmp);
 
 err:
+  thd_proc_info(thd, tmp);
+  thd->reset_db(&tmp_db);
   m_table->file->ha_index_or_rnd_end();
   return error;
 }
@@ -8402,9 +8496,8 @@ Log_event* wsrep_read_log_event(
   char **arg_buf, size_t *arg_buf_len,
   const Format_description_log_event *description_event)
 {
-  char *head= (*arg_buf);
+  uchar *head= (uchar*) (*arg_buf);
   uint data_len = uint4korr(head + EVENT_LEN_OFFSET);
-  char *buf= (*arg_buf);
   const char *error= 0;
   Log_event *res=  0;
   DBUG_ENTER("wsrep_read_log_event");
@@ -8415,15 +8508,16 @@ Log_event* wsrep_read_log_event(
     goto err;
   }
 
-  res= Log_event::read_log_event(buf, data_len, &error, description_event, false);
+  res= Log_event::read_log_event(head, data_len, &error, description_event,
+                                 false);
 
 err:
   if (!res)
   {
     DBUG_ASSERT(error != 0);
     sql_print_error("Error in Log_event::read_log_event(): "
-                    "'%s', data_len: %d, event_type: %d",
-		    error,data_len,(uchar)head[EVENT_TYPE_OFFSET]);
+                    "'%s', data_len: %u, event_type: %d",
+		    error, data_len, (int) head[EVENT_TYPE_OFFSET]);
   }
   (*arg_buf)+= data_len;
   (*arg_buf_len)-= data_len;
@@ -8433,8 +8527,7 @@ err:
 
 
 #if defined(HAVE_REPLICATION)
-int
-Incident_log_event::do_apply_event(rpl_group_info *rgi)
+int Incident_log_event::do_apply_event(rpl_group_info *rgi)
 {
   Relay_log_info const *rli= rgi->rli;
   DBUG_ENTER("Incident_log_event::do_apply_event");
@@ -8487,14 +8580,22 @@ void Ignorable_log_event::pack_info(Protocol *protocol)
 
 
 #if defined(HAVE_REPLICATION)
-Heartbeat_log_event::Heartbeat_log_event(const char* buf, uint event_len,
+Heartbeat_log_event::Heartbeat_log_event(const uchar *buf, uint event_len,
                     const Format_description_log_event* description_event)
   :Log_event(buf, description_event)
 {
   uint8 header_size= description_event->common_header_len;
-  ident_len = event_len - header_size;
-  set_if_smaller(ident_len,FN_REFLEN-1);
-  log_ident= buf + header_size;
+  if (log_pos == 0)
+  {
+    log_pos= uint8korr(buf + header_size);
+    log_ident= buf + header_size + HB_SUB_HEADER_LEN;
+    ident_len= event_len - (header_size + HB_SUB_HEADER_LEN);
+  }
+  else
+  {
+    log_ident= buf + header_size;
+    ident_len = event_len - header_size;
+  }
 }
 #endif
 
@@ -8509,9 +8610,9 @@ Heartbeat_log_event::Heartbeat_log_event(const char* buf, uint event_len,
    1 Don't write event
 */
 
-bool event_that_should_be_ignored(const char *buf)
+bool event_that_should_be_ignored(const uchar *buf)
 {
-  uint event_type= (uchar)buf[EVENT_TYPE_OFFSET];
+  uint event_type= buf[EVENT_TYPE_OFFSET];
   if (event_type == GTID_LOG_EVENT ||
       event_type == ANONYMOUS_GTID_LOG_EVENT ||
       event_type == PREVIOUS_GTIDS_LOG_EVENT ||

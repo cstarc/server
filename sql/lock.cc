@@ -140,7 +140,7 @@ lock_tables_check(THD *thd, TABLE **tables, uint count, uint flags)
         or hold any type of lock in a session,
         since this would be a DOS attack.
       */
-      if ((t->reginfo.lock_type >= TL_READ_NO_INSERT)
+      if ((t->reginfo.lock_type >= TL_FIRST_WRITE)
           || (thd->lex->sql_command == SQLCOM_LOCK_TABLES))
       {
         my_error(ER_CANT_LOCK_LOG_TABLE, MYF(0));
@@ -148,7 +148,7 @@ lock_tables_check(THD *thd, TABLE **tables, uint count, uint flags)
       }
     }
 
-    if (t->reginfo.lock_type >= TL_WRITE_ALLOW_WRITE)
+    if (t->reginfo.lock_type >= TL_FIRST_WRITE)
     {
       if (t->s->table_category == TABLE_CATEGORY_SYSTEM)
         system_count++;
@@ -170,7 +170,7 @@ lock_tables_check(THD *thd, TABLE **tables, uint count, uint flags)
     DBUG_ASSERT(t->s->tmp_table ||
                 thd->mdl_context.is_lock_owner(MDL_key::TABLE,
                                  t->s->db.str, t->s->table_name.str,
-                                 t->reginfo.lock_type >= TL_WRITE_ALLOW_WRITE ?
+                                 t->reginfo.lock_type >= TL_FIRST_WRITE ?
                                  MDL_SHARED_WRITE : MDL_SHARED_READ));
 
     /*
@@ -179,7 +179,7 @@ lock_tables_check(THD *thd, TABLE **tables, uint count, uint flags)
     */
     if (!(flags & MYSQL_LOCK_IGNORE_GLOBAL_READ_ONLY) && !t->s->tmp_table)
     {
-      if (t->reginfo.lock_type >= TL_WRITE_ALLOW_WRITE &&
+      if (t->reginfo.lock_type >= TL_FIRST_WRITE &&
           !ignore_read_only && opt_readonly && !thd->slave_thread)
       {
         my_error(ER_OPTION_PREVENTS_STATEMENT, MYF(0), "--read-only");
@@ -387,7 +387,7 @@ static int lock_external(THD *thd, TABLE **tables, uint count)
     lock_type=F_WRLCK;				/* Lock exclusive */
     if ((*tables)->db_stat & HA_READ_ONLY ||
 	((*tables)->reginfo.lock_type >= TL_READ &&
-	 (*tables)->reginfo.lock_type <= TL_READ_NO_INSERT))
+	 (*tables)->reginfo.lock_type < TL_FIRST_WRITE))
       lock_type=F_RDLCK;
 
     if (unlikely((error=(*tables)->file->ha_external_lock(thd,lock_type))))
@@ -481,7 +481,7 @@ int mysql_unlock_read_tables(THD *thd, MYSQL_LOCK *sql_lock)
   for (i=found=0 ; i < sql_lock->table_count ; i++)
   {
     DBUG_ASSERT(sql_lock->table[i]->lock_position == i);
-    if ((uint) sql_lock->table[i]->reginfo.lock_type > TL_WRITE_ALLOW_WRITE)
+    if ((uint) sql_lock->table[i]->reginfo.lock_type >= TL_FIRST_WRITE)
     {
       swap_variables(TABLE *, *table, sql_lock->table[i]);
       table++;
@@ -501,7 +501,7 @@ int mysql_unlock_read_tables(THD *thd, MYSQL_LOCK *sql_lock)
   THR_LOCK_DATA **lock=sql_lock->locks;
   for (i=found=0 ; i < sql_lock->lock_count ; i++)
   {
-    if (sql_lock->locks[i]->type >= TL_WRITE_ALLOW_WRITE)
+    if (sql_lock->locks[i]->type >= TL_FIRST_WRITE)
     {
       swap_variables(THR_LOCK_DATA *, *lock, sql_lock->locks[i]);
       lock++;
@@ -746,6 +746,9 @@ static int unlock_external(THD *thd, TABLE **table,uint count)
            - GET_LOCK_STORE_LOCKS : Store lock info in TABLE
            - GET_LOCK_SKIP_SEQUENCES : Ignore sequences (for temporary unlock)
            - GET_LOCK_ON_THD      : Store lock in thd->mem_root
+
+  Temporary tables are not locked (as these are single user), except for
+  TRANSACTIONAL_TMP_TABLES as locking is needed to handle transactions.
 */
 
 MYSQL_LOCK *get_lock_data(THD *thd, TABLE **table_ptr, uint count, uint flags)
@@ -762,8 +765,8 @@ MYSQL_LOCK *get_lock_data(THD *thd, TABLE **table_ptr, uint count, uint flags)
   {
     TABLE *t= table_ptr[i];
     
-    if (t->s->tmp_table != NON_TRANSACTIONAL_TMP_TABLE && 
-        t->s->tmp_table != INTERNAL_TMP_TABLE &&
+    if ((likely(!t->s->tmp_table) ||
+         (t->s->tmp_table == TRANSACTIONAL_TMP_TABLE)) &&
         (!(flags & GET_LOCK_SKIP_SEQUENCES) || t->s->sequence == 0))
     {
       lock_count+= t->file->lock_count();
@@ -792,13 +795,13 @@ MYSQL_LOCK *get_lock_data(THD *thd, TABLE **table_ptr, uint count, uint flags)
 
   for (i=0 ; i < count ; i++)
   {
-    TABLE *table;
+    TABLE *table= table_ptr[i];
     enum thr_lock_type lock_type;
     THR_LOCK_DATA **locks_start;
-    table= table_ptr[i];
-    if (table->s->tmp_table == NON_TRANSACTIONAL_TMP_TABLE ||
-        table->s->tmp_table == INTERNAL_TMP_TABLE ||
-        ((flags & GET_LOCK_SKIP_SEQUENCES) && table->s->sequence))
+
+    if (!((likely(!table->s->tmp_table) ||
+           (table->s->tmp_table == TRANSACTIONAL_TMP_TABLE)) &&
+          (!(flags & GET_LOCK_SKIP_SEQUENCES) || table->s->sequence == 0)))
       continue;
     lock_type= table->reginfo.lock_type;
     DBUG_ASSERT(lock_type != TL_WRITE_DEFAULT && lock_type != TL_READ_DEFAULT);
@@ -1121,21 +1124,22 @@ void Global_read_lock::unlock_global_read_lock(THD *thd)
   thd->mdl_context.release_lock(m_mdl_global_read_lock);
 
 #ifdef WITH_WSREP
-  if (m_state == GRL_ACQUIRED_AND_BLOCKS_COMMIT)
+  if (m_state == GRL_ACQUIRED_AND_BLOCKS_COMMIT &&
+      wsrep_locked_seqno != WSREP_SEQNO_UNDEFINED)
   {
     Wsrep_server_state& server_state= Wsrep_server_state::instance();
     if (server_state.state() == Wsrep_server_state::s_donor ||
         (WSREP_NNULL(thd) &&
          server_state.state() != Wsrep_server_state::s_synced))
     {
-      /* TODO: maybe redundant here?: */
-      wsrep_locked_seqno= WSREP_SEQNO_UNDEFINED;
       server_state.resume();
+      wsrep_locked_seqno= WSREP_SEQNO_UNDEFINED;
     }
     else if (WSREP_NNULL(thd) &&
              server_state.state() == Wsrep_server_state::s_synced)
     {
       server_state.resume_and_resync();
+      wsrep_locked_seqno= WSREP_SEQNO_UNDEFINED;
     }
   }
 #endif /* WITH_WSREP */

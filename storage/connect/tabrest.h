@@ -5,7 +5,8 @@
 /***********************************************************************/
 #pragma once
 
-#ifndef __WIN__
+#if defined(__WIN__)
+#else // !__WIN__
 #define stricmp strcasecmp
 #endif // !__WIN__
 

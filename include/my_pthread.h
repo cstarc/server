@@ -30,7 +30,7 @@ extern "C" {
 #define EXTERNC
 #endif /* __cplusplus */ 
 
-#if defined(__WIN__)
+#if defined(_WIN32)
 typedef CRITICAL_SECTION pthread_mutex_t;
 typedef DWORD		 pthread_t;
 typedef struct thread_attr {
@@ -196,7 +196,6 @@ static inline int my_sigwait(sigset_t *set, int *sig, int *code)
   *code= siginfo.si_code;
   return *sig < 0 ?  errno : 0;
 #else
-#define SI_KERNEL 128
   *code= 0;
   return sigwait(set, sig);
 #endif
@@ -278,7 +277,7 @@ struct tm *gmtime_r(const time_t *clock, struct tm *res);
 #define HAVE_PTHREAD_KILL 1
 #endif
 
-#endif /* defined(__WIN__) */
+#endif /* defined(_WIN32) */
 
 #if defined(HPUX10) && !defined(DONT_REMAP_PTHREAD_FUNCTIONS)
 #undef pthread_cond_timedwait
@@ -666,7 +665,11 @@ extern void my_mutex_end(void);
   with the current number of keys and key parts.
 */
 #if defined(__SANITIZE_ADDRESS__) || defined(WITH_UBSAN)
+#ifndef DBUG_OFF
+#define DEFAULT_THREAD_STACK	(1024*1024L)
+#else
 #define DEFAULT_THREAD_STACK	(383*1024L) /* 392192 */
+#endif
 #else
 #define DEFAULT_THREAD_STACK	(292*1024L) /* 299008 */
 #endif

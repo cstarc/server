@@ -342,7 +342,7 @@ int opt_sum_query(THD *thd,
           to the number of rows in the tables if this number is exact and
           there are no outer joins.
         */
-        if (!conds && !((Item_sum_count*) item)->get_arg(0)->maybe_null &&
+        if (!conds && !((Item_sum_count*) item)->get_arg(0)->maybe_null() &&
             !outer_tables && maybe_exact_count &&
             ((item->used_tables() & OUTER_REF_TABLE_BIT) == 0))
         {
@@ -448,7 +448,8 @@ int opt_sum_query(THD *thd,
           const_result= 0;
           break;
         }
-        item_sum->set_aggregator(item_sum->has_with_distinct() ? 
+        item_sum->set_aggregator(thd,
+                                 item_sum->has_with_distinct() ?
                                  Aggregator::DISTINCT_AGGREGATOR :
                                  Aggregator::SIMPLE_AGGREGATOR);
         /*
@@ -842,7 +843,10 @@ static bool matching_cond(bool max_fl, TABLE_REF *ref, KEY *keyinfo,
     if (is_field_part)
     {
       if (between || eq_type)
+      {
         *range_fl&= ~(NO_MAX_RANGE | NO_MIN_RANGE);
+        *range_fl&= ~(max_fl ? NEAR_MAX : NEAR_MIN);
+      }
       else
       {
         *range_fl&= ~(max_fl ? NO_MAX_RANGE : NO_MIN_RANGE);

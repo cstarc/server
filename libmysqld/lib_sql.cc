@@ -115,7 +115,7 @@ emb_advanced_command(MYSQL *mysql, enum enum_server_command command,
   NET *net= &mysql->net;
   my_bool stmt_skip= stmt ? stmt->state != MYSQL_STMT_INIT_DONE : FALSE;
 
-  if (thd->killed != NOT_KILLED)
+  if (thd && thd->killed != NOT_KILLED)
   {
     if (thd->killed < KILL_CONNECTION)
       thd->killed= NOT_KILLED;
@@ -578,7 +578,7 @@ int init_embedded_server(int argc, char **argv, char **groups)
 
   /* Get default temporary directory */
   opt_mysql_tmpdir=getenv("TMPDIR");	/* Use this if possible */
-#if defined(__WIN__)
+#if defined(_WIN32)
   if (!opt_mysql_tmpdir)
     opt_mysql_tmpdir=getenv("TEMP");
   if (!opt_mysql_tmpdir)
@@ -624,7 +624,8 @@ int init_embedded_server(int argc, char **argv, char **groups)
 
   (void) thr_setconcurrency(concurrency);	// 10 by default
 
-  start_handle_manager();
+  if (flush_time && flush_time != ~(ulong) 0L)
+    start_handle_manager();
 
   // FIXME initialize binlog_filter and rpl_filter if not already done
   //       corresponding delete is in clean_up()
@@ -640,7 +641,11 @@ int init_embedded_server(int argc, char **argv, char **groups)
     }
   }
 
-  execute_ddl_log_recovery();
+  if (ddl_log_execute_recovery() > 0)
+  {
+    mysql_server_end();
+    return 1;
+  }
   mysql_embedded_init= 1;
   return 0;
 }

@@ -6,9 +6,9 @@ INSERT INTO t1 VALUES('MySQL has now support', 'for full-text search'),
 ('Full-text search in MySQL', 'implements vector space model');
 ANALYZE TABLE t1;
 SHOW INDEX FROM t1;
-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
-t1	1	a	1	a	NULL	NULL	NULL	NULL	YES	FULLTEXT		
-t1	1	a	2	b	NULL	NULL	NULL	NULL	YES	FULLTEXT		
+Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+t1	1	a	1	a	NULL	NULL	NULL	NULL	YES	FULLTEXT			NO
+t1	1	a	2	b	NULL	NULL	NULL	NULL	YES	FULLTEXT			NO
 select * from t1 where MATCH(a,b) AGAINST ("collections");
 a	b
 Full-text indexes	are called collections
@@ -232,9 +232,9 @@ match(ttxt.inhalt) against ('foobar');
 id
 3
 show keys from t2;
-Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment
-t2	1	tig	1	ticket	A	3	NULL	NULL	YES	BTREE		
-t2	1	tix	1	inhalt	NULL	NULL	NULL	NULL	YES	FULLTEXT		
+Table	Non_unique	Key_name	Seq_in_index	Column_name	Collation	Cardinality	Sub_part	Packed	Null	Index_type	Comment	Index_comment	Ignored
+t2	1	tig	1	ticket	A	3	NULL	NULL	YES	BTREE			NO
+t2	1	tix	1	inhalt	NULL	NULL	NULL	NULL	YES	FULLTEXT			NO
 show create table t2;
 Table	Create Table
 t2	CREATE TABLE `t2` (
@@ -349,7 +349,7 @@ INSERT t1 VALUES ("Это мы - опилки"),("Отлезь, гнида!"),
 ("Не влезай, убьет!"),("и будет прав!");
 SELECT t, collation(t) FROM t1 WHERE MATCH t AGAINST ('ОПИЛКИ');
 t	collation(t)
-Это мы - опилки	utf8_general_ci
+Это мы - опилки	utf8mb3_general_ci
 DROP TABLE t1;
 CREATE TABLE t1 (s varchar(255), FULLTEXT (s)) ENGINE = InnoDB DEFAULT CHARSET=utf8;
 insert into t1 (s) values ('pДra para para'),('para para para');
@@ -689,3 +689,31 @@ FTS_DOC_ID	t
 2	foo bar
 3	foo
 DROP TABLE t;
+#
+# MDEV-25295 Aborted FTS_DOC_ID_INDEX considered as
+# 	existing FTS_DOC_ID_INDEX during DDL
+#
+SET sql_mode='';
+CREATE TABLE t1 (FTS_DOC_ID BIGINT UNSIGNED NOT NULL,title CHAR(1),body TEXT)engine=innodb;
+INSERT INTO t1 (FTS_DOC_ID,title,body)VALUES(1,0,0), (1,0,0);
+CREATE FULLTEXT INDEX idx1 ON t1 (title,body);
+ERROR 23000: Duplicate entry '' for key '*UNKNOWN*'
+CREATE FULLTEXT INDEX idx1 ON t1 (title,body);
+ERROR 23000: Duplicate entry '' for key '*UNKNOWN*'
+DROP TABLE t1;
+SET sql_mode = DEFAULT;
+#
+# MDEV-25070 SIGSEGV in fts_create_in_mem_aux_table
+#
+CREATE TABLE t1 (a CHAR, FULLTEXT KEY(a)) ENGINE=InnoDB;
+ALTER TABLE t1 DISCARD TABLESPACE;
+ALTER TABLE t1 ADD FULLTEXT INDEX (a);
+SHOW CREATE TABLE t1;
+Table	Create Table
+t1	CREATE TABLE `t1` (
+  `a` char(1) DEFAULT NULL,
+  FULLTEXT KEY `a` (`a`),
+  FULLTEXT KEY `a_2` (`a`)
+) ENGINE=InnoDB DEFAULT CHARSET=latin1
+DROP TABLE t1;
+# End of 10.3 tests

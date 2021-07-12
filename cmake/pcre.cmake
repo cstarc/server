@@ -14,8 +14,15 @@ MACRO(BUNDLE_PCRE2)
     IF(WIN32)
       # Debug libary name.
       # Same condition as in pcre2 CMakeLists.txt that adds "d"
-      SET(file ${dir}/src/pcre2-build/${CMAKE_CFG_INTDIR}/${CMAKE_STATIC_LIBRARY_PREFIX}${lib}${CMAKE_STATIC_LIBRARY_SUFFIX})
-      SET(file_d ${dir}/src/pcre2-build/${CMAKE_CFG_INTDIR}/${CMAKE_STATIC_LIBRARY_PREFIX}${lib}d${CMAKE_STATIC_LIBRARY_SUFFIX})
+      GET_PROPERTY(MULTICONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+      IF(MULTICONFIG)
+        SET(intdir "${CMAKE_CFG_INTDIR}/")
+      ELSE()
+        SET(intdir)
+      ENDIF()
+
+      SET(file ${dir}/src/pcre2-build/${intdir}${CMAKE_STATIC_LIBRARY_PREFIX}${lib}${CMAKE_STATIC_LIBRARY_SUFFIX})
+      SET(file_d ${dir}/src/pcre2-build/${intdir}${CMAKE_STATIC_LIBRARY_PREFIX}${lib}d${CMAKE_STATIC_LIBRARY_SUFFIX})
       SET_TARGET_PROPERTIES(${lib} PROPERTIES IMPORTED_LOCATION_DEBUG ${file_d})
     ELSE()
       SET(file ${dir}/src/pcre2-build/${CMAKE_STATIC_LIBRARY_PREFIX}${lib}${CMAKE_STATIC_LIBRARY_SUFFIX})
@@ -29,15 +36,15 @@ MACRO(BUNDLE_PCRE2)
     IF(MSVC)
       # Suppress a warning
       STRING(APPEND pcre2_flags${v} " /wd4244 " )
-      # Need this only for ASAN support
-      SET(stdlibs "-DCMAKE_C_STANDARD_LIBRARIES=${CMAKE_C_STANDARD_LIBRARIES}")
+      # Disable asan support
+      STRING(REPLACE "-fsanitize=address" "" pcre2_flags${v} "${CMAKE_C_FLAGS${v}}")
     ENDIF()
   ENDFOREACH()
   ExternalProject_Add(
     pcre2
     PREFIX   "${dir}"
-    URL      "http://ftp.pcre.org/pub/pcre/pcre2-10.34.zip"
-    URL_MD5  fdb10dba7f3be43730966bebdd3755ef
+    URL      "http://ftp.pcre.org/pub/pcre/pcre2-10.36.zip"
+    URL_MD5  ba9e743af42aac5642f7504b12af4116
     INSTALL_COMMAND ""
     CMAKE_ARGS
       "-DPCRE2_BUILD_TESTS=OFF"

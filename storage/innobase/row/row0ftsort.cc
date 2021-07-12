@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 2010, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2015, 2020, MariaDB Corporation.
+Copyright (c) 2015, 2021, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -216,7 +216,7 @@ row_fts_psort_info_init(
 	common_info->old_zip_size = old_zip_size;
 	common_info->trx = trx;
 	common_info->all_info = psort_info;
-	mysql_cond_init(0, &common_info->sort_cond, nullptr);
+	pthread_cond_init(&common_info->sort_cond, nullptr);
 	common_info->opt_doc_id_size = opt_doc_id_size;
 
 	if (log_tmp_is_encrypted()) {
@@ -336,7 +336,7 @@ row_fts_psort_info_destroy(
 			mysql_mutex_destroy(&psort_info[j].mutex);
 		}
 
-		mysql_cond_destroy(&merge_info[0].psort_common->sort_cond);
+		pthread_cond_destroy(&merge_info[0].psort_common->sort_cond);
 		ut_free(merge_info[0].psort_common->dup);
 		ut_free(merge_info[0].psort_common);
 		ut_free(psort_info);
@@ -756,7 +756,6 @@ void fts_parallel_tokenization(
 	row_merge_block_t**	crypt_block;
 	pfs_os_file_t		tmpfd[FTS_NUM_AUX_INDEX];
 	ulint			mycount[FTS_NUM_AUX_INDEX];
-	ib_uint64_t		total_rec = 0;
 	ulint			num_doc_processed = 0;
 	doc_id_t		last_doc_id = 0;
 	mem_heap_t*		blob_heap = NULL;
@@ -910,7 +909,7 @@ loop:
 				<< " records, the sort queue has "
 				<< UT_LIST_GET_LEN(psort_info->fts_doc_list)
 				<< " records. But sort cannot get the next"
-				" records";
+				" records during alter table " << table->name;
 			goto exit;
 		}
 	} else if (psort_info->state == FTS_PARENT_EXITING) {
@@ -919,7 +918,7 @@ loop:
 	}
 
 	if (doc_item == NULL) {
-		os_thread_yield();
+		std::this_thread::yield();
 	}
 
 	row_merge_fts_get_next_doc_item(psort_info, &doc_item);
@@ -1024,7 +1023,6 @@ exit:
 			goto func_exit;
 		}
 
-		total_rec += merge_file[i]->n_rec;
 		row_merge_file_destroy_low(tmpfd[i]);
 	}
 
@@ -1052,7 +1050,7 @@ func_exit:
 
 	mysql_mutex_lock(&psort_info->mutex);
 	psort_info->child_status = FTS_CHILD_COMPLETE;
-	mysql_cond_signal(&psort_info->psort_common->sort_cond);
+	pthread_cond_signal(&psort_info->psort_common->sort_cond);
 	mysql_mutex_unlock(&psort_info->mutex);
 }
 
@@ -1192,7 +1190,9 @@ row_merge_write_fts_word(
 
 		if (UNIV_UNLIKELY(error != DB_SUCCESS)) {
 			ib::error() << "Failed to write word to FTS auxiliary"
-				" index table, error " << error;
+				" index table "
+				<< ins_ctx->btr_bulk->table_name()
+				<< ", error " << error;
 			ret = error;
 		}
 

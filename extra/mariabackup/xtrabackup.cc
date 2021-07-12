@@ -58,12 +58,19 @@ Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 #ifdef __linux__
 # include <sys/prctl.h>
-#include <sys/resource.h>
+# include <sys/resource.h>
+#endif
+
+#ifdef __APPLE__
+# include "libproc.h"
+#endif
+
+#ifdef __FreeBSD__
+# include <sys/sysctl.h>
 #endif
 
 
 #include <btr0sea.h>
-#include <dict0priv.h>
 #include <lock0lock.h>
 #include <log0recv.h>
 #include <log0crypt.h>
@@ -173,12 +180,11 @@ static hash_table_t databases_exclude_hash;
 
 static hash_table_t inc_dir_tables_hash;
 
-struct xb_filter_entry_struct{
+struct xb_filter_entry_t{
 	char*		name;
 	ibool		has_tables;
-	hash_node_t	name_hash;
+	xb_filter_entry_t *name_hash;
 };
-typedef struct xb_filter_entry_struct	xb_filter_entry_t;
 
 lsn_t checkpoint_lsn_start;
 lsn_t checkpoint_no_start;
@@ -247,11 +253,14 @@ static char*	innobase_ignored_opt;
 char*	innobase_data_home_dir;
 char*	innobase_data_file_path;
 
-#ifndef _WIN32
-static char *xtrabackup_debug_sync = NULL;
-#endif
 
 my_bool xtrabackup_incremental_force_scan = FALSE;
+
+/*
+ * Ignore corrupt pages (disabled by default; used
+ * by "innobackupex" as a command line argument).
+ */
+ulong xtrabackup_innodb_force_recovery = 0;
 
 /* The flushed lsn which is read from data files */
 lsn_t	flushed_lsn= 0;
@@ -310,7 +319,7 @@ char *opt_incremental_history_name;
 char *opt_incremental_history_uuid;
 
 char *opt_user;
-char *opt_password;
+const char *opt_password;
 char *opt_host;
 char *opt_defaults_group;
 char *opt_socket;
@@ -354,7 +363,7 @@ struct ddl_tracker_t {
 static ddl_tracker_t ddl_tracker;
 
 // Convert non-null terminated filename to space name
-std::string filename_to_spacename(const byte *filename, size_t len);
+static std::string filename_to_spacename(const void *filename, size_t len);
 
 CorruptedPages::CorruptedPages() { ut_a(!pthread_mutex_init(&m_mutex, NULL)); }
 
@@ -366,11 +375,9 @@ void CorruptedPages::add_page_no_lock(const char *space_name, ulint space_id,
 {
   space_info_t  &space_info = m_spaces[space_id];
   if (space_info.space_name.empty())
-    space_info.space_name=
-        convert_space_name
-            ? filename_to_spacename(reinterpret_cast<const byte *>(space_name),
-                                    strlen(space_name))
-            : space_name;
+    space_info.space_name= convert_space_name
+      ? filename_to_spacename(space_name, strlen(space_name))
+      : space_name;
   (void)space_info.pages.insert(page_no);
 }
 
@@ -498,7 +505,8 @@ bool CorruptedPages::empty() const
 }
 
 static void xb_load_single_table_tablespace(const std::string &space_name,
-                                            bool set_size);
+                                            bool set_size,
+                                            ulint defer_space_id=0);
 static void xb_data_files_close();
 static fil_space_t* fil_space_get_by_name(const char* name);
 
@@ -575,41 +583,26 @@ xtrabackup_add_datasink(ds_ctxt_t *ds)
 typedef void (*process_single_tablespace_func_t)(const char *dirname,
                                                  const char *filname,
                                                  bool is_remote,
-                                                 bool skip_node_page0);
+                                                 bool skip_node_page0,
+                                                 ulint defer_space_id);
 static dberr_t enumerate_ibd_files(process_single_tablespace_func_t callback);
 
 /* ======== Datafiles iterator ======== */
 struct datafiles_iter_t {
-	fil_space_t	*space;
-	fil_node_t	*node;
-	ibool		started;
-	pthread_mutex_t	mutex;
+	space_list_t::iterator space = fil_system.space_list.end();
+	fil_node_t	*node = nullptr;
+	bool		started = false;
+	std::mutex	mutex;
 };
 
 /* ======== Datafiles iterator ======== */
-static
-datafiles_iter_t *
-datafiles_iter_new()
-{
-	datafiles_iter_t *it;
-
-	it = static_cast<datafiles_iter_t *>(malloc(sizeof(datafiles_iter_t)));
-	pthread_mutex_init(&it->mutex, NULL);
-
-	it->space = NULL;
-	it->node = NULL;
-	it->started = FALSE;
-
-	return it;
-}
-
 static
 fil_node_t *
 datafiles_iter_next(datafiles_iter_t *it)
 {
 	fil_node_t *new_node;
 
-	pthread_mutex_lock(&it->mutex);
+	std::lock_guard<std::mutex> _(it->mutex);
 
 	if (it->node == NULL) {
 		if (it->started)
@@ -621,32 +614,23 @@ datafiles_iter_next(datafiles_iter_t *it)
 			goto end;
 	}
 
-	it->space = (it->space == NULL) ?
-		UT_LIST_GET_FIRST(fil_system.space_list) :
-		UT_LIST_GET_NEXT(space_list, it->space);
+	it->space = (it->space == fil_system.space_list.end()) ?
+		fil_system.space_list.begin() :
+		std::next(it->space);
 
-	while (it->space != NULL &&
+	while (it->space != fil_system.space_list.end() &&
 	       (it->space->purpose != FIL_TYPE_TABLESPACE ||
 		UT_LIST_GET_LEN(it->space->chain) == 0))
-		it->space = UT_LIST_GET_NEXT(space_list, it->space);
-	if (it->space == NULL)
+		++it->space;
+	if (it->space == fil_system.space_list.end())
 		goto end;
 
 	it->node = UT_LIST_GET_FIRST(it->space->chain);
 
 end:
 	new_node = it->node;
-	pthread_mutex_unlock(&it->mutex);
 
 	return new_node;
-}
-
-static
-void
-datafiles_iter_free(datafiles_iter_t *it)
-{
-	pthread_mutex_destroy(&it->mutex);
-	free(it);
 }
 
 #ifndef DBUG_OFF
@@ -741,24 +725,25 @@ end:
 
 void mdl_lock_all()
 {
-	mdl_lock_init();
-	datafiles_iter_t *it = datafiles_iter_new();
-	if (!it)
-		return;
+  mdl_lock_init();
+  datafiles_iter_t it;
 
-	while (fil_node_t *node = datafiles_iter_next(it)){
-		if (fil_is_user_tablespace_id(node->space->id)
-			&& check_if_skip_table(node->space->name))
-			continue;
-
-		mdl_lock_table(node->space->id);
-	}
-	datafiles_iter_free(it);
+  while (fil_node_t *node= datafiles_iter_next(&it))
+  {
+    const auto id= node->space->id;
+    if (const char *name= (fil_is_user_tablespace_id(id) &&
+                           node->space->chain.start)
+        ? node->space->chain.start->name : nullptr)
+      if (check_if_skip_table(filename_to_spacename(name,
+                                                    strlen(name)).c_str()))
+        continue;
+    mdl_lock_table(id);
+  }
 }
 
 
 // Convert non-null terminated filename to space name
-std::string filename_to_spacename(const byte *filename, size_t len)
+static std::string filename_to_spacename(const void *filename, size_t len)
 {
 	// null- terminate filename
 	char *f = (char *)malloc(len + 1);
@@ -894,7 +879,6 @@ typedef struct {
 	uint			num;
 	uint			*count;
 	pthread_mutex_t*	count_mutex;
-	os_thread_id_t		id;
 	CorruptedPages *corrupted_pages;
 } data_thread_ctxt_t;
 
@@ -998,13 +982,14 @@ enum options_xtrabackup
   OPT_BACKUP_ROCKSDB,
   OPT_XTRA_CHECK_PRIVILEGES,
   OPT_XTRA_MYSQLD_ARGS,
-  OPT_XB_IGNORE_INNODB_PAGE_CORRUPTION
+  OPT_XB_IGNORE_INNODB_PAGE_CORRUPTION,
+  OPT_INNODB_FORCE_RECOVERY
 };
 
 struct my_option xb_client_options[]= {
     {"verbose", 'V', "display verbose output", (G_PTR *) &verbose,
      (G_PTR *) &verbose, 0, GET_BOOL, NO_ARG, FALSE, 0, 0, 0, 0, 0},
-    {"version", 'v', "print xtrabackup version information",
+    {"version", 'v', "print version information",
      (G_PTR *) &xtrabackup_version, (G_PTR *) &xtrabackup_version, 0, GET_BOOL,
      NO_ARG, 0, 0, 0, 0, 0, 0},
     {"target-dir", OPT_XTRA_TARGET_DIR, "destination directory",
@@ -1295,8 +1280,8 @@ struct my_option xb_client_options[]= {
      "starting lsn for the incremental backup. This will be mutually "
      "exclusive with --incremental-history-uuid, --incremental-basedir "
      "and --incremental-lsn. If no valid lsn can be found (no series by "
-     "that name, no successful backups by that name) xtrabackup will "
-     "return with an error. It is used with the --incremental option.",
+     "that name, no successful backups by that name), an error will be returned."
+     " It is used with the --incremental option.",
      (uchar *) &opt_incremental_history_name,
      (uchar *) &opt_incremental_history_name, 0, GET_STR, REQUIRED_ARG, 0, 0,
      0, 0, 0, 0},
@@ -1306,8 +1291,8 @@ struct my_option xb_client_options[]= {
      "stored in the PERCONA_SCHEMA.xtrabackup_history to base an "
      "incremental backup on. --incremental-history-name, "
      "--incremental-basedir and --incremental-lsn. If no valid lsn can be "
-     "found (no success record with that uuid) xtrabackup will return "
-     "with an error. It is used with the --incremental option.",
+     "found (no success record with that uuid), an error will be returned."
+     " It is used with the --incremental option.",
      (uchar *) &opt_incremental_history_uuid,
      (uchar *) &opt_incremental_history_uuid, 0, GET_STR, REQUIRED_ARG, 0, 0,
      0, 0, 0, 0},
@@ -1364,11 +1349,6 @@ struct my_option xb_client_options[]= {
      (uchar *) &opt_lock_wait_threshold, (uchar *) &opt_lock_wait_threshold, 0,
      GET_UINT, REQUIRED_ARG, 60, 0, 0, 0, 0, 0},
 
-    {"debug-sleep-before-unlock", OPT_DEBUG_SLEEP_BEFORE_UNLOCK,
-     "This is a debug-only option used by the XtraBackup test suite.",
-     (uchar *) &opt_debug_sleep_before_unlock,
-     (uchar *) &opt_debug_sleep_before_unlock, 0, GET_UINT, REQUIRED_ARG, 0, 0,
-     0, 0, 0, 0},
 
     {"safe-slave-backup-timeout", OPT_SAFE_SLAVE_BACKUP_TIMEOUT,
      "How many seconds --safe-slave-backup should wait for "
@@ -1378,9 +1358,9 @@ struct my_option xb_client_options[]= {
      0, 0, 0, 0, 0},
 
     {"binlog-info", OPT_BINLOG_INFO,
-     "This option controls how XtraBackup should retrieve server's binary log "
+     "This option controls how backup should retrieve server's binary log "
      "coordinates corresponding to the backup. Possible values are OFF, ON, "
-     "LOCKLESS and AUTO. See the XtraBackup manual for more information",
+     "LOCKLESS and AUTO.",
      &opt_binlog_info, &opt_binlog_info, &binlog_info_typelib, GET_ENUM,
      OPT_ARG, BINLOG_INFO_AUTO, 0, 0, 0, 0, 0},
 
@@ -1418,7 +1398,7 @@ struct my_option xb_server_options[] =
    (G_PTR*) &mysql_data_home, 0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
   {"tmpdir", 't',
    "Path for temporary files. Several paths may be specified, separated by a "
-#if defined(__WIN__) || defined(OS2) || defined(__NETWARE__)
+#if defined(_WIN32)
    "semicolon (;)"
 #else
    "colon (:)"
@@ -1506,7 +1486,7 @@ struct my_option xb_server_options[] =
    "With which method to flush data.",
    &srv_file_flush_method, &srv_file_flush_method,
    &innodb_flush_method_typelib, GET_ENUM, REQUIRED_ARG,
-   IF_WIN(SRV_ALL_O_DIRECT_FSYNC, SRV_FSYNC), 0, 0, 0, 0, 0},
+   IF_WIN(SRV_ALL_O_DIRECT_FSYNC, SRV_O_DIRECT), 0, 0, 0, 0, 0},
 
   {"innodb_log_buffer_size", OPT_INNODB_LOG_BUFFER_SIZE,
    "The size of the buffer which InnoDB uses to write log to the log files on disk.",
@@ -1546,17 +1526,10 @@ struct my_option xb_server_options[] =
    &dbug_option, &dbug_option, 0, GET_STR, OPT_ARG,
    0, 0, 0, 0, 0, 0},
 #endif
-#ifndef __WIN__
-  {"debug-sync", OPT_XTRA_DEBUG_SYNC,
-   "Debug sync point. This is only used by the xtrabackup test suite",
-   (G_PTR*) &xtrabackup_debug_sync,
-   (G_PTR*) &xtrabackup_debug_sync,
-   0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
-#endif
 
   {"innodb_checksum_algorithm", OPT_INNODB_CHECKSUM_ALGORITHM,
   "The algorithm InnoDB uses for page checksumming. [CRC32, STRICT_CRC32, "
-   "INNODB, STRICT_INNODB, NONE, STRICT_NONE]", &srv_checksum_algorithm,
+   "FULL_CRC32, STRICT_FULL_CRC32]", &srv_checksum_algorithm,
    &srv_checksum_algorithm, &innodb_checksum_algorithm_typelib, GET_ENUM,
    REQUIRED_ARG, SRV_CHECKSUM_ALGORITHM_CRC32, 0, 0, 0, 0, 0},
 
@@ -1591,7 +1564,7 @@ struct my_option xb_server_options[] =
    REQUIRED_ARG, 0, 0, UINT_MAX, 0, 1, 0},
 
   {"lock-ddl-per-table", OPT_LOCK_DDL_PER_TABLE, "Lock DDL for each table "
-   "before xtrabackup starts to copy it and until the backup is completed.",
+   "before backup starts to copy it and until the backup is completed.",
    (uchar*) &opt_lock_ddl_per_table, (uchar*) &opt_lock_ddl_per_table, 0,
    GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
 
@@ -1610,6 +1583,13 @@ struct my_option xb_server_options[] =
    &opt_check_privileges, &opt_check_privileges,
    0, GET_BOOL, NO_ARG, 1, 0, 0, 0, 0, 0 },
 
+  {"innodb_force_recovery", OPT_INNODB_FORCE_RECOVERY,
+   "(for --prepare): Crash recovery mode (ignores "
+   "page corruption; for emergencies only).",
+   (G_PTR*)&srv_force_recovery,
+   (G_PTR*)&srv_force_recovery,
+   0, GET_ULONG, OPT_ARG, 0, 0, SRV_FORCE_IGNORE_CORRUPT, 0, 0, 0},
+
     {"mysqld-args", OPT_XTRA_MYSQLD_ARGS,
      "All arguments that follow this argument are considered as server "
      "options, and if some of them are not supported by mariabackup, they "
@@ -1627,65 +1607,12 @@ struct my_option xb_server_options[] =
 
 uint xb_server_options_count = array_elements(xb_server_options);
 
-#ifndef __WIN__
-static int debug_sync_resumed;
-
-static void sigcont_handler(int sig);
-
-static void sigcont_handler(int sig __attribute__((unused)))
-{
-	debug_sync_resumed= 1;
-}
-#endif
-
-static inline
-void
-debug_sync_point(const char *name)
-{
-#ifndef __WIN__
-	FILE	*fp;
-	pid_t	pid;
-	char	pid_path[FN_REFLEN];
-
-	if (xtrabackup_debug_sync == NULL) {
-		return;
-	}
-
-	if (strcmp(xtrabackup_debug_sync, name)) {
-		return;
-	}
-
-	pid = getpid();
-
-	snprintf(pid_path, sizeof(pid_path), "%s/xtrabackup_debug_sync",
-		 xtrabackup_target_dir);
-	fp = fopen(pid_path, "w");
-	if (fp == NULL) {
-		die("Can't open open %s", pid_path);
-	}
-	fprintf(fp, "%u\n", (uint) pid);
-	fclose(fp);
-
-	msg("mariabackup: DEBUG: Suspending at debug sync point '%s'. "
-	    "Resume with 'kill -SIGCONT %u'.", name, (uint) pid);
-
-	debug_sync_resumed= 0;
-	kill(pid, SIGSTOP);
-	while (!debug_sync_resumed) {
-		sleep(1);
-	}
-
-	/* On resume */
-	msg("mariabackup: DEBUG: removing the pid file.");
-	my_delete(pid_path, MYF(MY_WME));
-#endif
-}
-
 
 static std::set<std::string> tables_for_export;
 
 static void append_export_table(const char *dbname, const char *tablename,
-                                bool is_remote, bool skip_node_page0)
+                                bool is_remote, bool skip_node_page0,
+                                ulint defer_space_id)
 {
   if(dbname && tablename && !is_remote)
   {
@@ -1746,31 +1673,33 @@ static int prepare_export()
 
   // Process defaults-file , it can have some --lc-language stuff,
   // which is* unfortunately* still necessary to get mysqld up
-  if (strncmp(orig_argv1,"--defaults-file=",16) == 0)
+  if (strncmp(orig_argv1,"--defaults-file=", 16) == 0)
   {
     snprintf(cmdline, sizeof cmdline,
-     IF_WIN("\"","") "\"%s\" --mysqld \"%s\" "
+      IF_WIN("\"","") "\"%s\" --mysqld \"%s\""
       " --defaults-extra-file=./backup-my.cnf --defaults-group-suffix=%s --datadir=."
       " --innodb --innodb-fast-shutdown=0 --loose-partition"
       " --innodb_purge_rseg_truncate_frequency=1 --innodb-buffer-pool-size=%llu"
-      " --console  --skip-log-error --skip-log-bin --bootstrap  < "
+      " --console --skip-log-error --skip-log-bin --bootstrap %s< "
       BOOTSTRAP_FILENAME IF_WIN("\"",""),
-      mariabackup_exe, 
+      mariabackup_exe,
       orig_argv1, (my_defaults_group_suffix?my_defaults_group_suffix:""),
-      xtrabackup_use_memory);
+      xtrabackup_use_memory,
+      (srv_force_recovery ? "--innodb-force-recovery=1 " : ""));
   }
   else
   {
-    sprintf(cmdline,
-     IF_WIN("\"","") "\"%s\" --mysqld"
+    snprintf(cmdline, sizeof cmdline,
+      IF_WIN("\"","") "\"%s\" --mysqld"
       " --defaults-file=./backup-my.cnf --defaults-group-suffix=%s --datadir=."
       " --innodb --innodb-fast-shutdown=0 --loose-partition"
       " --innodb_purge_rseg_truncate_frequency=1 --innodb-buffer-pool-size=%llu"
-      " --console  --log-error= --skip-log-bin --bootstrap  < "
+      " --console --log-error= --skip-log-bin --bootstrap %s< "
       BOOTSTRAP_FILENAME IF_WIN("\"",""),
       mariabackup_exe,
       (my_defaults_group_suffix?my_defaults_group_suffix:""),
-      xtrabackup_use_memory);
+      xtrabackup_use_memory,
+      (srv_force_recovery ? "--innodb-force-recovery=1 " : ""));
   }
 
   msg("Prepare export : executing %s\n", cmdline);
@@ -1846,7 +1775,7 @@ check_if_param_set(const char *param)
 
 my_bool
 xb_get_one_option(const struct my_option *opt,
-		  char *argument, const char *)
+		  const char *argument, const char *)
 {
   switch(opt->id) {
   case 'h':
@@ -1915,6 +1844,13 @@ xb_get_one_option(const struct my_option *opt,
   case OPT_INNODB_BUFFER_POOL_FILENAME:
 
     ADD_PRINT_PARAM_OPT(innobase_buffer_pool_filename);
+    break;
+
+  case OPT_INNODB_FORCE_RECOVERY:
+
+    if (srv_force_recovery) {
+        ADD_PRINT_PARAM_OPT(srv_force_recovery);
+    }
     break;
 
   case OPT_XTRA_TARGET_DIR:
@@ -2066,7 +2002,6 @@ static bool innodb_init_param()
 	    innobase_data_file_path);
 
 	srv_sys_space.set_space_id(TRX_SYS_SPACE);
-	srv_sys_space.set_name("innodb_system");
 	srv_sys_space.set_path(srv_data_home);
 	switch (srv_checksum_algorithm) {
 	case SRV_CHECKSUM_ALGORITHM_FULL_CRC32:
@@ -2097,8 +2032,6 @@ static bool innodb_init_param()
 	}
 	msg("innodb_log_group_home_dir = %s",
 	    srv_log_group_home_dir);
-
-	os_normalize_path(srv_log_group_home_dir);
 
 	if (strchr(srv_log_group_home_dir, ';')) {
 		msg("syntax error in innodb_log_group_home_dir, ");
@@ -2137,6 +2070,11 @@ static bool innodb_init_param()
 	if (srv_use_native_aio) {
 		msg("InnoDB: Using Linux native AIO");
 	}
+#elif defined(HAVE_URING)
+
+	if (srv_use_native_aio) {
+		msg("InnoDB: Using liburing");
+	}
 #else
 	/* Currently native AIO is supported only on windows and linux
 	and that also when the support is compiled in. In all other
@@ -2153,6 +2091,29 @@ static bool innodb_init_param()
 
 	if (!srv_undo_dir || !xtrabackup_backup) {
 		srv_undo_dir = (char*) ".";
+	}
+
+	compile_time_assert(SRV_FORCE_IGNORE_CORRUPT == 1);
+
+	/*
+	 * This option can be read both from the command line, and the
+	 * defaults file. The assignment should account for both cases,
+	 * and for "--innobackupex". Since the command line argument is
+	 * parsed after the defaults file, it takes precedence.
+	 */
+	if (xtrabackup_innodb_force_recovery) {
+		srv_force_recovery = xtrabackup_innodb_force_recovery;
+	}
+
+	if (srv_force_recovery >= SRV_FORCE_IGNORE_CORRUPT) {
+		if (!xtrabackup_prepare) {
+			msg("mariabackup: The option \"innodb_force_recovery\""
+			    " should only be used with \"%s\".",
+			    (innobackupex_mode ? "--apply-log" : "--prepare"));
+			goto error;
+		} else {
+			msg("innodb_force_recovery = %lu", srv_force_recovery);
+		}
 	}
 
 #ifdef _WIN32
@@ -2453,7 +2414,8 @@ find_filter_in_hashtable(
 )
 {
 	xb_filter_entry_t* found = NULL;
-	HASH_SEARCH(name_hash, table, ut_fold_string(name),
+	const ulint fold = my_crc32c(0, name, strlen(name));
+	HASH_SEARCH(name_hash, table, fold,
 		    xb_filter_entry_t*,
 		    found, (void) 0,
 		    !strcmp(found->name, name));
@@ -2547,7 +2509,15 @@ check_if_skip_database_by_path(
 		return(FALSE);
 	}
 
-	const char* db_name = strrchr(path, OS_PATH_SEPARATOR);
+	const char* db_name = strrchr(path, '/');
+#ifdef _WIN32
+	if (const char* last = strrchr(path, '\\')) {
+		if (!db_name || last > db_name) {
+			db_name = last;
+		}
+	}
+#endif
+
 	if (db_name == NULL) {
 		db_name = path;
 	} else {
@@ -2576,7 +2546,16 @@ check_if_skip_table(
 
 	dbname = NULL;
 	tbname = name;
-	while ((ptr = strchr(tbname, '/')) != NULL) {
+	for (;;) {
+		ptr= strchr(tbname, '/');
+#ifdef _WIN32
+		if (!ptr) {
+			ptr= strchr(tbname,'\\');
+		}
+#endif
+		if (!ptr) {
+			break;
+		}
 		dbname = tbname;
 		tbname = ptr + 1;
 	}
@@ -2706,21 +2685,11 @@ static my_bool xtrabackup_copy_datafile(fil_node_t *node, uint thread_n,
 	xb_read_filt_t		*read_filter;
 	my_bool			rc = FALSE;
 
-	/* Get the name and the path for the tablespace. node->name always
-	contains the path (which may be absolute for remote tablespaces in
-	5.6+). space->name contains the tablespace name in the form
-	"./database/table.ibd" (in 5.5-) or "database/table" (in 5.6+). For a
-	multi-node shared tablespace, space->name contains the name of the first
-	node, but that's irrelevant, since we only need node_name to match them
-	against filters, and the shared tablespace is always copied regardless
-	of the filters value. */
-
-	const char* const node_name = node->space->name;
-	const char* const node_path = node->name;
-
 	if (fil_is_user_tablespace_id(node->space->id)
-	    && check_if_skip_table(node_name)) {
-		msg(thread_n, "Skipping %s.", node_name);
+	    && check_if_skip_table(filename_to_spacename(node->name,
+							 strlen(node->name)).
+				   c_str())) {
+		msg(thread_n, "Skipping %s.", node->name);
 		return(FALSE);
 	}
 
@@ -2775,9 +2744,10 @@ static my_bool xtrabackup_copy_datafile(fil_node_t *node, uint thread_n,
 	action = xb_get_copy_action();
 
 	if (xtrabackup_stream) {
-		msg(thread_n, "%s %s", action, node_path);
+		msg(thread_n, "%s %s", action, node->name);
 	} else {
-		msg(thread_n, "%s %s to %s", action, node_path, dstfile->path);
+		msg(thread_n, "%s %s to %s", action, node->name,
+		    dstfile->path);
 	}
 
 	/* The main copy loop */
@@ -2795,11 +2765,15 @@ static my_bool xtrabackup_copy_datafile(fil_node_t *node, uint thread_n,
 	if (write_filter.finalize
 	    && !write_filter.finalize(&write_filt_ctxt, dstfile)) {
 		goto error;
-	}
+	} else {
+		const fil_space_t::name_type name = node->space->name();
 
-	pthread_mutex_lock(&backup_mutex);
-	ddl_tracker.tables_in_backup[node->space->id] = node_name;
-	pthread_mutex_unlock(&backup_mutex);
+		pthread_mutex_lock(&backup_mutex);
+		ddl_tracker.tables_in_backup.emplace(node->space->id,
+						     std::string(name.data(),
+								 name.size()));
+		pthread_mutex_unlock(&backup_mutex);
+	}
 
 	/* close */
 	msg(thread_n,"        ...done");
@@ -2831,7 +2805,7 @@ skip:
 	if (write_filter.deinit) {
 		write_filter.deinit(&write_filt_ctxt);
 	}
-	msg(thread_n,"Warning: We assume the  table was dropped during xtrabackup execution and ignore the tablespace %s", node_name);
+	msg(thread_n,"Warning: We assume the  table was dropped during xtrabackup execution and ignore the tablespace %s", node->name);
 	return(FALSE);
 }
 
@@ -2984,8 +2958,6 @@ static bool xtrabackup_copy_logfile(bool last = false)
 	log_copy_scanned_lsn = start_lsn;
 	pthread_cond_broadcast(&scanned_lsn_cond);
 	pthread_mutex_unlock(&backup_mutex);
-
-	debug_sync_point("xtrabackup_copy_logfile_pause");
 	return(false);
 }
 
@@ -3004,7 +2976,7 @@ void backup_wait_for_lsn(lsn_t lsn) {
 
 extern lsn_t server_lsn_after_lock;
 
-static os_thread_ret_t DECLARE_THREAD(log_copying_thread)(void*)
+static void log_copying_thread()
 {
   my_thread_init();
   mysql_mutex_lock(&log_sys.mutex);
@@ -3018,8 +2990,6 @@ static os_thread_ret_t DECLARE_THREAD(log_copying_thread)(void*)
   log_copying_running= false;
   mysql_mutex_unlock(&log_sys.mutex);
   my_thread_end();
-  os_thread_exit();
-  return 0;
 }
 
 static bool have_io_watching_thread;
@@ -3050,19 +3020,23 @@ static void *io_watching_thread(void*)
 }
 
 #ifndef DBUG_OFF
-char *dbug_mariabackup_get_val(const char *event, const char *key)
+char *dbug_mariabackup_get_val(const char *event,
+                               const fil_space_t::name_type key)
 {
-	char envvar[FN_REFLEN];
-	if (key) {
-		snprintf(envvar, sizeof(envvar), "%s_%s", event, key);
-		char *slash = strchr(envvar, '/');
-		if (slash)
-			*slash = '_';
-	} else {
-		strncpy(envvar, event, sizeof envvar - 1);
-		envvar[sizeof envvar - 1] = '\0';
-	}
-	return getenv(envvar);
+  char envvar[FN_REFLEN];
+  strncpy(envvar, event, sizeof envvar - 1);
+  envvar[(sizeof envvar) - 1] = '\0';
+
+  if (key.size() && key.size() + strlen(envvar) < (sizeof envvar) - 2)
+  {
+    strcat(envvar, "_");
+    strncat(envvar, key.data(), key.size());
+    if (char *slash= strchr(envvar, '/'))
+      *slash= '_';
+  }
+
+  char *val = getenv(envvar);
+  return val && *val ? val : nullptr;
 }
 
 /*
@@ -3077,7 +3051,8 @@ To use this facility, you need to
    for the variable)
 3. start mariabackup with --dbug=+d,debug_mariabackup_events
 */
-void dbug_mariabackup_event(const char *event,const char *key)
+void dbug_mariabackup_event(const char *event,
+                                   const fil_space_t::name_type key)
 {
 	char *sql = dbug_mariabackup_get_val(event, key);
 	if (sql && *sql) {
@@ -3087,15 +3062,9 @@ void dbug_mariabackup_event(const char *event,const char *key)
 }
 #endif // DBUG_OFF
 
-/**************************************************************************
-Datafiles copying thread.*/
-static
-os_thread_ret_t
-DECLARE_THREAD(data_copy_thread_func)(
-/*==================*/
-	void *arg) /* thread context */
+/** Datafiles copying thread.*/
+static void data_copy_thread_func(data_thread_ctxt_t *ctxt) /* thread context */
 {
-	data_thread_ctxt_t	*ctxt = (data_thread_ctxt_t *) arg;
 	uint			num = ctxt->num;
 	fil_node_t*		node;
 	ut_ad(ctxt->corrupted_pages);
@@ -3106,11 +3075,10 @@ DECLARE_THREAD(data_copy_thread_func)(
 	*/
 	my_thread_init();
 
-	debug_sync_point("data_copy_thread_func");
-
 	while ((node = datafiles_iter_next(ctxt->it)) != NULL) {
-		DBUG_MARIABACKUP_EVENT("before_copy", node->space->name);
-		DBUG_EXECUTE_FOR_KEY("wait_innodb_redo_before_copy", node->space->name,
+		DBUG_MARIABACKUP_EVENT("before_copy", node->space->name());
+		DBUG_EXECUTE_FOR_KEY("wait_innodb_redo_before_copy",
+				     node->space->name(),
 			backup_wait_for_lsn(get_current_lsn(mysql_connection)););
 		/* copy the datafile */
 		if (xtrabackup_copy_datafile(node, num, NULL,
@@ -3118,8 +3086,7 @@ DECLARE_THREAD(data_copy_thread_func)(
 			*ctxt->corrupted_pages))
 			die("failed to copy datafile.");
 
-		DBUG_MARIABACKUP_EVENT("after_copy", node->space->name);
-
+		DBUG_MARIABACKUP_EVENT("after_copy", node->space->name());
 	}
 
 	pthread_mutex_lock(ctxt->count_mutex);
@@ -3127,8 +3094,6 @@ DECLARE_THREAD(data_copy_thread_func)(
 	pthread_mutex_unlock(ctxt->count_mutex);
 
 	my_thread_end();
-	os_thread_exit();
-	OS_THREAD_DUMMY_RETURN;
 }
 
 /************************************************************************
@@ -3235,23 +3200,6 @@ xb_fil_io_init()
 	fil_system.space_id_reuse_warned = true;
 }
 
-static
-Datafile*
-xb_new_datafile(const char *name, bool is_remote)
-{
-	if (is_remote) {
-		RemoteDatafile *remote_file = new RemoteDatafile();
-		remote_file->set_name(name);
-		return(remote_file);
-	} else {
-		Datafile *file = new Datafile();
-		file->set_name(name);
-		file->make_filepath(".", name, IBD);
-		return(file);
-	}
-}
-
-
 /** Load tablespace.
 
 @param[in] dirname directory name of the tablespace to open
@@ -3261,11 +3209,14 @@ xb_new_datafile(const char *name, bool is_remote)
 node page0 will be read, and it's size and free pages limit
 will be set from page 0, what is neccessary for checking and fixing corrupted
 pages.
+@param[in] defer_space_id use the space id to create space object
+when there is deferred tablespace
 */
 static void xb_load_single_table_tablespace(const char *dirname,
                                             const char *filname,
                                             bool is_remote,
-                                            bool skip_node_page0)
+                                            bool skip_node_page0,
+                                            ulint defer_space_id)
 {
 	ut_ad(srv_operation == SRV_OPERATION_BACKUP
 	      || srv_operation == SRV_OPERATION_RESTORE_DELTA
@@ -3288,6 +3239,7 @@ static void xb_load_single_table_tablespace(const char *dirname,
 	lsn_t	flush_lsn;
 	dberr_t	err;
 	fil_space_t	*space;
+	bool	defer = false;
 
 	name = static_cast<char*>(ut_malloc_nokey(pathlen));
 
@@ -3299,32 +3251,62 @@ static void xb_load_single_table_tablespace(const char *dirname,
 		name[pathlen - 5] = 0;
 	}
 
-	Datafile *file = xb_new_datafile(name, is_remote);
+	const fil_space_t::name_type n{name, pathlen - 5};
+	Datafile *file;
+
+	if (is_remote) {
+		RemoteDatafile* rf = new RemoteDatafile();
+		if (!rf->open_link_file(n)) {
+			die("Can't open datafile %s", name);
+		}
+		file = rf;
+	} else {
+		file = new Datafile();
+		file->make_filepath(".", n, IBD);
+	}
 
 	if (file->open_read_only(true) != DB_SUCCESS) {
 		die("Can't open datafile %s", name);
 	}
 
 	for (int i = 0; i < 10; i++) {
+		file->m_defer = false;
 		err = file->validate_first_page(&flush_lsn);
-		if (err != DB_CORRUPTION) {
+
+		if (file->m_defer) {
+			if (defer_space_id) {
+				defer = true;
+				file->set_space_id(defer_space_id);
+				file->set_flags(FSP_FLAGS_PAGE_SSIZE());
+				err = DB_SUCCESS;
+				break;
+			}
+		} else if (err != DB_CORRUPTION) {
 			break;
 		}
 
 		my_sleep(1000);
 	}
 
+	if (!defer && file->m_defer) {
+		delete file;
+		ut_free(name);
+		return;
+	}
+
 	bool is_empty_file = file->exists() && file->is_empty_file();
 
 	if (err == DB_SUCCESS && file->space_id() != SRV_TMP_SPACE_ID) {
 		space = fil_space_t::create(
-			name, file->space_id(), file->flags(),
+			file->space_id(), file->flags(),
 			FIL_TYPE_TABLESPACE, NULL/* TODO: crypt_data */);
 
 		ut_a(space != NULL);
-		space->add(file->filepath(),
-			   skip_node_page0 ? file->detach() : pfs_os_file_t(),
-			   0, false, false);
+		fil_node_t* node= space->add(
+			file->filepath(),
+			skip_node_page0 ? file->detach() : pfs_os_file_t(),
+			0, false, false);
+		node->deferred= defer;
 		mysql_mutex_lock(&fil_system.mutex);
 		space->read_page0();
 		mysql_mutex_unlock(&fil_system.mutex);
@@ -3345,7 +3327,8 @@ static void xb_load_single_table_tablespace(const char *dirname,
 }
 
 static void xb_load_single_table_tablespace(const std::string &space_name,
-                                            bool skip_node_page0)
+                                            bool skip_node_page0,
+                                            ulint defer_space_id)
 {
   std::string name(space_name);
   bool is_remote= access((name + ".ibd").c_str(), R_OK) != 0;
@@ -3356,14 +3339,232 @@ static void xb_load_single_table_tablespace(const std::string &space_name,
   buf[sizeof buf - 1]= '\0';
   const char *dbname= buf;
   char *p= strchr(buf, '/');
-  if (p == 0)
+  if (!p)
     die("Unexpected tablespace %s filename %s", space_name.c_str(),
         name.c_str());
-  ut_a(p);
   *p= 0;
   const char *tablename= p + 1;
   xb_load_single_table_tablespace(dbname, tablename, is_remote,
-                                  skip_node_page0);
+                                  skip_node_page0, defer_space_id);
+}
+
+#ifdef _WIN32
+/**
+The os_file_opendir() function opens a directory stream corresponding to the
+directory named by the dirname argument. The directory stream is positioned
+at the first entry. In both Unix and Windows we automatically skip the '.'
+and '..' items at the start of the directory listing.
+@param[in]	dirname		directory name; it must not contain a trailing
+				'\' or '/'
+@return directory stream, NULL if error */
+os_file_dir_t os_file_opendir(const char *dirname)
+{
+  char path[OS_FILE_MAX_PATH + 3];
+
+  ut_a(strlen(dirname) < OS_FILE_MAX_PATH);
+
+  strcpy(path, dirname);
+  strcpy(path + strlen(path), "\\*");
+
+  /* Note that in Windows opening the 'directory stream' also retrieves
+  the first entry in the directory. Since it is '.', that is no problem,
+  as we will skip over the '.' and '..' entries anyway. */
+
+  LPWIN32_FIND_DATA lpFindFileData= static_cast<LPWIN32_FIND_DATA>
+    (ut_malloc_nokey(sizeof(WIN32_FIND_DATA)));
+  os_file_dir_t dir= FindFirstFile((LPCTSTR) path, lpFindFileData);
+  ut_free(lpFindFileData);
+
+  return dir;
+}
+#endif
+
+/** This function returns information of the next file in the directory. We jump
+over the '.' and '..' entries in the directory.
+@param[in]	dirname		directory name or path
+@param[in]	dir		directory stream
+@param[out]	info		buffer where the info is returned
+@return 0 if ok, -1 if error, 1 if at the end of the directory */
+int
+os_file_readdir_next_file(
+	const char*	dirname,
+	os_file_dir_t	dir,
+	os_file_stat_t* info)
+{
+#ifdef _WIN32
+	BOOL		ret;
+	int		status;
+	WIN32_FIND_DATA find_data;
+
+next_file:
+	ret = FindNextFile(dir, &find_data);
+
+	if (ret > 0) {
+
+		const char* name;
+
+		name = static_cast<const char*>(find_data.cFileName);
+
+		ut_a(strlen(name) < OS_FILE_MAX_PATH);
+
+		if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+
+			goto next_file;
+		}
+
+		strcpy(info->name, name);
+
+		info->size = find_data.nFileSizeHigh;
+		info->size <<= 32;
+		info->size |= find_data.nFileSizeLow;
+
+		if (find_data.dwFileAttributes
+		    & FILE_ATTRIBUTE_REPARSE_POINT) {
+
+			/* TODO: test Windows symlinks */
+			/* TODO: MySQL has apparently its own symlink
+			implementation in Windows, dbname.sym can
+			redirect a database directory:
+			REFMAN "windows-symbolic-links.html" */
+
+			info->type = OS_FILE_TYPE_LINK;
+
+		} else if (find_data.dwFileAttributes
+			   & FILE_ATTRIBUTE_DIRECTORY) {
+
+			info->type = OS_FILE_TYPE_DIR;
+
+		} else {
+
+			/* It is probably safest to assume that all other
+			file types are normal. Better to check them rather
+			than blindly skip them. */
+
+			info->type = OS_FILE_TYPE_FILE;
+		}
+
+		status = 0;
+
+	} else {
+		DWORD err = GetLastError();
+		if (err == ERROR_NO_MORE_FILES) {
+			status = 1;
+		} else {
+			msg("readdir_next_file in %s returned %lu", dir, err);
+			status = -1;
+		}
+	}
+
+	return(status);
+#else
+	struct dirent*	ent;
+	char*		full_path;
+	int		ret;
+	struct stat	statinfo;
+
+next_file:
+
+	ent = readdir(dir);
+
+	if (ent == NULL) {
+
+		return(1);
+	}
+
+	ut_a(strlen(ent->d_name) < OS_FILE_MAX_PATH);
+
+	if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+
+		goto next_file;
+	}
+
+	strcpy(info->name, ent->d_name);
+
+	full_path = static_cast<char*>(
+		ut_malloc_nokey(strlen(dirname) + strlen(ent->d_name) + 10));
+	if (!full_path) {
+		return -1;
+	}
+
+	sprintf(full_path, "%s/%s", dirname, ent->d_name);
+
+	ret = stat(full_path, &statinfo);
+
+	if (ret) {
+
+		if (errno == ENOENT) {
+			/* readdir() returned a file that does not exist,
+			it must have been deleted in the meantime. Do what
+			would have happened if the file was deleted before
+			readdir() - ignore and go to the next entry.
+			If this is the last entry then info->name will still
+			contain the name of the deleted file when this
+			function returns, but this is not an issue since the
+			caller shouldn't be looking at info when end of
+			directory is returned. */
+
+			ut_free(full_path);
+
+			goto next_file;
+		}
+
+		msg("stat %s: Got error %d", full_path, errno);
+
+		ut_free(full_path);
+
+		return(-1);
+	}
+
+	info->size = statinfo.st_size;
+
+	if (S_ISDIR(statinfo.st_mode)) {
+		info->type = OS_FILE_TYPE_DIR;
+	} else if (S_ISLNK(statinfo.st_mode)) {
+		info->type = OS_FILE_TYPE_LINK;
+	} else if (S_ISREG(statinfo.st_mode)) {
+		info->type = OS_FILE_TYPE_FILE;
+	} else {
+		info->type = OS_FILE_TYPE_UNKNOWN;
+	}
+
+	ut_free(full_path);
+	return(0);
+#endif
+}
+
+/***********************************************************************//**
+A fault-tolerant function that tries to read the next file name in the
+directory. We retry 100 times if os_file_readdir_next_file() returns -1. The
+idea is to read as much good data as we can and jump over bad data.
+@return 0 if ok, -1 if error even after the retries, 1 if at the end
+of the directory */
+int
+fil_file_readdir_next_file(
+/*=======================*/
+	dberr_t*	err,	/*!< out: this is set to DB_ERROR if an error
+				was encountered, otherwise not changed */
+	const char*	dirname,/*!< in: directory name or path */
+	os_file_dir_t	dir,	/*!< in: directory stream */
+	os_file_stat_t* info)	/*!< in/out: buffer where the
+				info is returned */
+{
+	for (ulint i = 0; i < 100; i++) {
+		int	ret = os_file_readdir_next_file(dirname, dir, info);
+
+		if (ret != -1) {
+
+			return(ret);
+		}
+
+		ib::error() << "os_file_readdir_next_file() returned -1 in"
+			" directory " << dirname
+			<< ", crash recovery may have failed"
+			" for some .ibd files!";
+
+		*err = DB_ERROR;
+	}
+
+	return(-1);
 }
 
 /** Scan the database directories under the MySQL datadir, looking for
@@ -3384,10 +3585,10 @@ static dberr_t enumerate_ibd_files(process_single_tablespace_func_t callback)
 
 	/* The datadir of MySQL is always the default directory of mysqld */
 
-	dir = os_file_opendir(fil_path_to_mysql_datadir, true);
+	dir = os_file_opendir(fil_path_to_mysql_datadir);
 
-	if (dir == NULL) {
-
+	if (UNIV_UNLIKELY(dir == IF_WIN(INVALID_HANDLE_VALUE, nullptr))) {
+		msg("cannot open dir %s", fil_path_to_mysql_datadir);
 		return(DB_ERROR);
 	}
 
@@ -3402,12 +3603,11 @@ static dberr_t enumerate_ibd_files(process_single_tablespace_func_t callback)
 
 		/* General tablespaces are always at the first level of the
 		data home dir */
-		if (dbinfo.type == OS_FILE_TYPE_FILE) {
-			bool is_isl = ends_with(dbinfo.name, ".isl");
-			bool is_ibd = !is_isl && ends_with(dbinfo.name,".ibd");
-
-			if (is_isl || is_ibd) {
-				(*callback)(NULL, dbinfo.name, is_isl, false);
+		if (dbinfo.type != OS_FILE_TYPE_FILE) {
+			const bool is_isl = ends_with(dbinfo.name, ".isl");
+			if (is_isl || ends_with(dbinfo.name,".ibd")) {
+				(*callback)(nullptr, dbinfo.name, is_isl,
+					    false, 0);
 			}
 		}
 
@@ -3433,19 +3633,15 @@ static dberr_t enumerate_ibd_files(process_single_tablespace_func_t callback)
 		}
 		snprintf(dbpath, dbpath_len,
 			 "%s/%s", fil_path_to_mysql_datadir, dbinfo.name);
-		os_normalize_path(dbpath);
 
 		if (check_if_skip_database_by_path(dbpath)) {
 			fprintf(stderr, "Skipping db: %s\n", dbpath);
 			goto next_datadir_item;
 		}
 
-		/* We want wrong directory permissions to be a fatal error for
-		XtraBackup. */
-		dbdir = os_file_opendir(dbpath, true);
+		dbdir = os_file_opendir(dbpath);
 
-		if (dbdir != NULL) {
-
+		if (UNIV_UNLIKELY(dbdir != IF_WIN(INVALID_HANDLE_VALUE,NULL))){
 			/* We found a database directory; loop through it,
 			looking for possible .ibd files in it */
 
@@ -3464,11 +3660,11 @@ static dberr_t enumerate_ibd_files(process_single_tablespace_func_t callback)
 				if (strlen(fileinfo.name) > 4) {
 					bool is_isl= false;
 					if (ends_with(fileinfo.name, ".ibd") || ((is_isl = ends_with(fileinfo.name, ".isl"))))
-						(*callback)(dbinfo.name, fileinfo.name, is_isl, false);
+						(*callback)(dbinfo.name, fileinfo.name, is_isl, false, 0);
 				}
 			}
 
-			if (0 != os_file_closedir(dbdir)) {
+			if (os_file_closedir_failed(dbdir)) {
 				fprintf(stderr, "InnoDB: Warning: could not"
 				 " close database directory %s\n",
 					dbpath);
@@ -3477,7 +3673,7 @@ static dberr_t enumerate_ibd_files(process_single_tablespace_func_t callback)
 			}
 
 		} else {
-
+			msg("Can't open dir %s", dbpath);
 			err = DB_ERROR;
 			break;
 
@@ -3491,10 +3687,9 @@ next_datadir_item:
 
 	ut_free(dbpath);
 
-	if (0 != os_file_closedir(dir)) {
+	if (os_file_closedir_failed(dir)) {
 		fprintf(stderr,
-			"InnoDB: Error: could not close MySQL datadir\n");
-
+			"InnoDB: Error: could not close MariaDB datadir\n");
 		return(DB_ERROR);
 	}
 
@@ -3552,7 +3747,8 @@ retry:
 	/* TRX_SYS page can't be compressed or encrypted. */
 	if (buf_page_is_corrupted(false, page, fsp_flags)) {
 		if (n_retries--) {
-			os_thread_sleep(1000);
+			std::this_thread::sleep_for(
+				std::chrono::milliseconds(1));
 			goto retry;
 		} else {
 			msg("mariabackup: TRX_SYS page corrupted.\n");
@@ -3646,8 +3842,7 @@ xb_load_tablespaces()
 		return(err);
 	}
 
-	debug_sync_point("xtrabackup_load_tablespaces_pause");
-	DBUG_MARIABACKUP_EVENT("after_load_tablespaces", 0);
+	DBUG_MARIABACKUP_EVENT("after_load_tablespaces", {});
 	return(DB_SUCCESS);
 }
 
@@ -3689,22 +3884,16 @@ new hash table */
 static
 xb_filter_entry_t*
 xb_add_filter(
-/*========================*/
 	const char*	name,	/*!< in: name of table/database */
 	hash_table_t*	hash)	/*!< in/out: hash to insert into */
 {
-	xb_filter_entry_t*	entry;
-
-	entry = xb_new_filter_entry(name);
+	xb_filter_entry_t* entry = xb_new_filter_entry(name);
 
 	if (UNIV_UNLIKELY(!hash->array)) {
 		hash->create(1000);
 	}
-	HASH_INSERT(xb_filter_entry_t,
-		name_hash, hash,
-		ut_fold_string(entry->name),
-		entry);
-
+	const ulint fold = my_crc32c(0, entry->name, strlen(entry->name));
+	HASH_INSERT(xb_filter_entry_t, name_hash, hash, fold, entry);
 	return entry;
 }
 
@@ -3757,9 +3946,10 @@ xb_register_filter_entry(
 		strncpy(dbname, name, p - name);
 		dbname[p - name] = 0;
 
-		if (databases_hash) {
+		if (databases_hash && databases_hash->array) {
+			const ulint fold = my_crc32c(0, dbname, p - name);
 			HASH_SEARCH(name_hash, databases_hash,
-					ut_fold_string(dbname),
+					fold,
 					xb_filter_entry_t*,
 					db_entry, (void) 0,
 					!strcmp(db_entry->name, dbname));
@@ -3968,9 +4158,10 @@ xb_filter_hash_free(hash_table_t* hash)
 
 			table = static_cast<xb_filter_entry_t *>
 				(HASH_GET_NEXT(name_hash, prev_table));
-
+			const ulint fold = my_crc32c(0, prev_table->name,
+						     strlen(prev_table->name));
 			HASH_DELETE(xb_filter_entry_t, name_hash, hash,
-				ut_fold_string(prev_table->name), prev_table);
+				    fold, prev_table);
 			free(prev_table);
 		}
 	}
@@ -4076,7 +4267,7 @@ static void stop_backup_threads(bool running)
     {
       putc('.', stderr);
       fflush(stderr);
-      os_thread_sleep(200000); /*0.2 sec*/
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     putc('\n', stderr);
     mysql_cond_destroy(&log_copying_stop);
@@ -4411,17 +4602,15 @@ fail_before_log_copying_thread_start:
 	if (log_copy_failed)
 		goto fail_before_log_copying_thread_start;
 
-	DBUG_MARIABACKUP_EVENT("before_innodb_log_copy_thread_started",0);
+	DBUG_MARIABACKUP_EVENT("before_innodb_log_copy_thread_started", {});
 
 	mysql_cond_init(0, &log_copying_stop, nullptr);
-	os_thread_create(log_copying_thread);
+	std::thread(log_copying_thread).detach();
 
 	/* FLUSH CHANGED_PAGE_BITMAPS call */
 	if (!flush_changed_page_bitmaps()) {
 		goto fail;
 	}
-	debug_sync_point("xtrabackup_suspend_at_start");
-
 
 	ut_a(xtrabackup_parallel > 0);
 
@@ -4438,11 +4627,7 @@ fail_before_log_copying_thread_start:
 				"Waiting for table metadata lock", 0, 0););
 	}
 
-	datafiles_iter_t *it = datafiles_iter_new();
-	if (it == NULL) {
-		msg("mariabackup: Error: datafiles_iter_new() failed.");
-		goto fail;
-	}
+	datafiles_iter_t it;
 
 	/* Create data copying threads */
 	data_threads = (data_thread_ctxt_t *)
@@ -4451,18 +4636,17 @@ fail_before_log_copying_thread_start:
 	pthread_mutex_init(&count_mutex, NULL);
 
 	for (i = 0; i < (uint) xtrabackup_parallel; i++) {
-		data_threads[i].it = it;
+		data_threads[i].it = &it;
 		data_threads[i].num = i+1;
 		data_threads[i].count = &count;
 		data_threads[i].count_mutex = &count_mutex;
 		data_threads[i].corrupted_pages = &corrupted_pages;
-		data_threads[i].id = os_thread_create(data_copy_thread_func,
-						      data_threads + i);
+		std::thread(data_copy_thread_func, data_threads + i).detach();
 	}
 
 	/* Wait for threads to exit */
 	while (1) {
-		os_thread_sleep(1000000);
+		std::this_thread::sleep_for(std::chrono::seconds(1));
 		pthread_mutex_lock(&count_mutex);
 		bool stop = count == 0;
 		pthread_mutex_unlock(&count_mutex);
@@ -4473,7 +4657,6 @@ fail_before_log_copying_thread_start:
 
 	pthread_mutex_destroy(&count_mutex);
 	free(data_threads);
-	datafiles_iter_free(it);
 	}
 
 	bool ok = backup_start(corrupted_pages);
@@ -4521,13 +4704,12 @@ fail_before_log_copying_thread_start:
 	log_file_op = NULL;
 	pthread_mutex_destroy(&backup_mutex);
 	pthread_cond_destroy(&scanned_lsn_cond);
-	if (opt_log_innodb_page_corruption && !corrupted_pages.empty()) {
+	if (!corrupted_pages.empty()) {
+		ut_ad(opt_log_innodb_page_corruption);
 		msg("Error: corrupted innodb pages are found and logged to "
 			MB_CORRUPTED_PAGES_FILE " file");
-		return false;
 	}
-	else
-		return(true);
+	return(true);
 }
 
 
@@ -4551,16 +4733,16 @@ FTWRL.  This ensures consistent backup in presence of DDL.
 */
 void backup_fix_ddl(CorruptedPages &corrupted_pages)
 {
-	std::set<std::string> new_tables;
 	std::set<std::string> dropped_tables;
 	std::map<std::string, std::string> renamed_tables;
+	space_id_to_name_t new_tables;
 
 	/* Disable further DDL on backed up tables (only needed for --no-lock).*/
 	pthread_mutex_lock(&backup_mutex);
 	log_file_op = backup_file_op_fail;
 	pthread_mutex_unlock(&backup_mutex);
 
-	DBUG_MARIABACKUP_EVENT("backup_fix_ddl",0);
+	DBUG_MARIABACKUP_EVENT("backup_fix_ddl", {});
 
 	for (space_id_to_name_t::iterator iter = ddl_tracker.tables_in_backup.begin();
 		iter != ddl_tracker.tables_in_backup.end();
@@ -4603,7 +4785,7 @@ void backup_fix_ddl(CorruptedPages &corrupted_pages)
 
 		if (ddl_tracker.drops.find(id) == ddl_tracker.drops.end()) {
 			dropped_tables.erase(name);
-			new_tables.insert(name);
+			new_tables[id] = name;
 			if (opt_log_innodb_page_corruption)
 				corrupted_pages.drop_space(id);
 		}
@@ -4628,10 +4810,8 @@ void backup_fix_ddl(CorruptedPages &corrupted_pages)
 	//  Load and copy new tables.
 	//  Close all datanodes first, reload only new tables.
 	std::vector<fil_node_t *> all_nodes;
-	datafiles_iter_t *it = datafiles_iter_new();
-	if (!it)
-		return;
-	while (fil_node_t *node = datafiles_iter_next(it)) {
+	datafiles_iter_t it;
+	while (fil_node_t *node = datafiles_iter_next(&it)) {
 		all_nodes.push_back(node);
 	}
 	for (size_t i = 0; i < all_nodes.size(); i++) {
@@ -4645,32 +4825,28 @@ void backup_fix_ddl(CorruptedPages &corrupted_pages)
 		}
 		fil_space_free(n->space->id, false);
 	}
-	datafiles_iter_free(it);
 
 	DBUG_EXECUTE_IF("check_mdl_lock_works", DBUG_ASSERT(new_tables.size() == 0););
-	for (std::set<std::string>::iterator iter = new_tables.begin();
-		iter != new_tables.end(); iter++) {
-		const char *space_name = iter->c_str();
-		if (check_if_skip_table(space_name))
-			continue;
-		xb_load_single_table_tablespace(*iter, false);
+
+	for (const auto &t : new_tables) {
+		if (!check_if_skip_table(t.second.c_str())) {
+			xb_load_single_table_tablespace(t.second, false,
+							t.first);
+		}
 	}
 
-	it = datafiles_iter_new();
-	if (!it)
-		return;
+	datafiles_iter_t it2;
 
-	while (fil_node_t *node = datafiles_iter_next(it)) {
-		fil_space_t * space = node->space;
-		if (!fil_is_user_tablespace_id(space->id))
+	while (fil_node_t *node = datafiles_iter_next(&it2)) {
+		if (!fil_is_user_tablespace_id(node->space->id))
 			continue;
-		std::string dest_name(node->space->name);
+		std::string dest_name= filename_to_spacename(
+			node->name, strlen(node->name));
 		dest_name.append(".new");
+
 		xtrabackup_copy_datafile(node, 0, dest_name.c_str(), wf_write_through,
 			corrupted_pages);
 	}
-
-	datafiles_iter_free(it);
 }
 
 /* ================= prepare ================= */
@@ -4785,12 +4961,15 @@ xb_space_create_file(
 
 static fil_space_t* fil_space_get_by_name(const char* name)
 {
-	mysql_mutex_assert_owner(&fil_system.mutex);
-	for (fil_space_t* space = UT_LIST_GET_FIRST(fil_system.space_list);
-	     space != NULL;
-	     space = UT_LIST_GET_NEXT(space_list, space))
-		if (!strcmp(space->name, name)) return space;
-	return NULL;
+  mysql_mutex_assert_owner(&fil_system.mutex);
+  for (fil_space_t &space : fil_system.space_list)
+    if (space.chain.start)
+      if (const char *str= strstr(space.chain.start->name, name))
+        if (!strcmp(str + strlen(name), ".ibd") &&
+            (str == space.chain.start->name ||
+             IF_WIN(str[-1] == '\\' ||,) str[-1] == '/'))
+          return &space;
+  return nullptr;
 }
 
 /***********************************************************************
@@ -4825,20 +5004,15 @@ xb_delta_open_matching_space(
 	if (dbname) {
 		snprintf(dest_dir, FN_REFLEN, "%s/%s",
 			xtrabackup_target_dir, dbname);
-		os_normalize_path(dest_dir);
-
 		snprintf(dest_space_name, FN_REFLEN, "%s/%s", dbname, name);
 	} else {
 		snprintf(dest_dir, FN_REFLEN, "%s", xtrabackup_target_dir);
-		os_normalize_path(dest_dir);
-
 		snprintf(dest_space_name, FN_REFLEN, "%s", name);
 	}
 
 	snprintf(real_name, real_name_len,
 		 "%s/%s",
 		 xtrabackup_target_dir, dest_space_name);
-	os_normalize_path(real_name);
 	/* Truncate ".ibd" */
 	dest_space_name[strlen(dest_space_name) - 4] = '\0';
 
@@ -4881,15 +5055,17 @@ exit:
 		return file;
 	}
 
+	const size_t len = strlen(dest_space_name);
 	/* remember space name for further reference */
 	table = static_cast<xb_filter_entry_t *>
 		(malloc(sizeof(xb_filter_entry_t) +
-			strlen(dest_space_name) + 1));
+			len + 1));
 
 	table->name = ((char*)table) + sizeof(xb_filter_entry_t);
-	strcpy(table->name, dest_space_name);
+	memcpy(table->name, dest_space_name, len + 1);
+	const ulint fold = my_crc32c(0, dest_space_name, len);
 	HASH_INSERT(xb_filter_entry_t, name_hash, &inc_dir_tables_hash,
-			ut_fold_string(table->name), table);
+		    fold, table);
 
 	mysql_mutex_lock(&fil_system.mutex);
 	fil_space = fil_space_get_by_name(dest_space_name);
@@ -4908,12 +5084,11 @@ exit:
 				 dbname, fil_space->id);
 
 			msg("mariabackup: Renaming %s to %s.ibd",
-				fil_space->name, tmpname);
+				fil_space->chain.start->name, tmpname);
 
-			if (fil_space->rename(tmpname, NULL, false)
-			    != DB_SUCCESS) {
+			if (fil_space->rename(tmpname, false) != DB_SUCCESS) {
 				msg("mariabackup: Cannot rename %s to %s",
-					fil_space->name, tmpname);
+					fil_space->chain.start->name, tmpname);
 				goto exit;
 			}
 		}
@@ -4930,15 +5105,14 @@ exit:
 	if (fil_space != NULL) {
 		char	tmpname[FN_REFLEN];
 
-		strncpy(tmpname, dest_space_name, FN_REFLEN);
+		snprintf(tmpname, sizeof tmpname, "%s.ibd", dest_space_name);
 
 		msg("mariabackup: Renaming %s to %s",
-		    fil_space->name, dest_space_name);
+		    fil_space->chain.start->name, tmpname);
 
-		if (fil_space->rename(tmpname, NULL, false) != DB_SUCCESS)
-		{
+		if (fil_space->rename(tmpname, false) != DB_SUCCESS) {
 			msg("mariabackup: Cannot rename %s to %s",
-				fil_space->name, dest_space_name);
+			    fil_space->chain.start->name, tmpname);
 			goto exit;
 		}
 
@@ -4961,7 +5135,7 @@ exit:
 	ut_ad(fil_space_t::zip_size(flags) == info.zip_size);
 	ut_ad(fil_space_t::physical_size(flags) == info.page_size);
 
-	if (fil_space_t::create(dest_space_name, info.space_id, flags,
+	if (fil_space_t::create(info.space_id, flags,
 				FIL_TYPE_TABLESPACE, 0)) {
 		*success = xb_space_create_file(real_name, info.space_id,
 						flags, &file);
@@ -5025,10 +5199,6 @@ xtrabackup_apply_delta(
 	if (!get_meta_path(src_path, meta_path)) {
 		goto error;
 	}
-
-	os_normalize_path(dst_path);
-	os_normalize_path(src_path);
-	os_normalize_path(meta_path);
 
 	if (!xb_read_delta_metadata(meta_path, &info)) {
 		goto error;
@@ -5296,8 +5466,10 @@ static ibool prepare_handle_new_files(const char *data_home_dir,
 			(malloc(sizeof(xb_filter_entry_t) + table_name.size() + 1));
 		table->name = ((char*)table) + sizeof(xb_filter_entry_t);
 		strcpy(table->name, table_name.c_str());
+		const ulint fold = my_crc32c(0, table->name,
+					     table_name.size());
 		HASH_INSERT(xb_filter_entry_t, name_hash, &inc_dir_tables_hash,
-				ut_fold_string(table->name), table);
+			    fold, table);
 	}
 
 	return TRUE;
@@ -5320,9 +5492,11 @@ rm_if_not_found(
 
 	snprintf(name, FN_REFLEN, "%s/%s", db_name, file_name);
 	/* Truncate ".ibd" */
-	name[strlen(name) - 4] = '\0';
+	const size_t len = strlen(name) - 4;
+	name[len] = '\0';
+	const ulint fold = my_crc32c(0, name, len);
 
-	HASH_SEARCH(name_hash, &inc_dir_tables_hash, ut_fold_string(name),
+	HASH_SEARCH(name_hash, &inc_dir_tables_hash, fold,
 		    xb_filter_entry_t*,
 		    table, (void) 0,
 		    !strcmp(table->name, name));
@@ -5366,11 +5540,9 @@ static ibool xb_process_datadir(const char *path, const char *suffix,
 	suffix_len = strlen(suffix);
 
 	/* datafile */
-	dbdir = os_file_opendir(path, FALSE);
-
-	if (dbdir != NULL) {
-		ret = fil_file_readdir_next_file(&err, path, dbdir,
-							&fileinfo);
+	dbdir = os_file_opendir(path);
+	if (UNIV_UNLIKELY(dbdir != IF_WIN(INVALID_HANDLE_VALUE, nullptr))) {
+		ret = fil_file_readdir_next_file(&err, path, dbdir, &fileinfo);
 		while (ret == 0) {
 			if (fileinfo.type == OS_FILE_TYPE_DIR) {
 				goto next_file_item_1;
@@ -5400,14 +5572,14 @@ next_file_item_1:
 	}
 
 	/* single table tablespaces */
-	dir = os_file_opendir(path, FALSE);
+	dir = os_file_opendir(path);
 
-	if (dir == NULL) {
+	if (UNIV_UNLIKELY(dbdir == IF_WIN(INVALID_HANDLE_VALUE, nullptr))) {
 		msg("Can't open dir %s", path);
+		return TRUE;
 	}
 
-		ret = fil_file_readdir_next_file(&err, path, dir,
-								&dbinfo);
+	ret = fil_file_readdir_next_file(&err, path, dir, &dbinfo);
 	while (ret == 0) {
 		if (dbinfo.type == OS_FILE_TYPE_FILE
 		    || dbinfo.type == OS_FILE_TYPE_UNKNOWN) {
@@ -5421,12 +5593,9 @@ next_file_item_1:
                          OS_FILE_MAX_PATH/2-1,
                          dbinfo.name);
 
-		os_normalize_path(dbpath);
+		dbdir = os_file_opendir(dbpath);
 
-		dbdir = os_file_opendir(dbpath, FALSE);
-
-		if (dbdir != NULL) {
-
+		if (dbdir != IF_WIN(INVALID_HANDLE_VALUE, nullptr)) {
 			ret = fil_file_readdir_next_file(&err, dbpath, dbdir,
 								&fileinfo);
 			while (ret == 0) {
@@ -5543,8 +5712,7 @@ static void rename_table_in_prepare(const std::string &datadir, const std::strin
 	if (file_exists(dest)) {
 		ren2= std::string(datadir) + "/" + to + ".ren";
 		if (!file_exists(ren2)) {
-			msg("ERROR : File %s was not found, but expected during rename processing\n", ren2.c_str());
-			ut_a(0);
+			die("ERROR : File %s was not found, but expected during rename processing\n", ren2.c_str());
 		}
 		tmp = to + "#";
 		rename_table_in_prepare(datadir, to, tmp);
@@ -6219,8 +6387,9 @@ void handle_options(int argc, char **argv, char ***argv_server,
 			}
 	}
 
+        mariabackup_args.push_back(nullptr);
         *argv_client= *argv_server= *argv_backup= &mariabackup_args[0];
-        int argc_backup= static_cast<int>(mariabackup_args.size());
+        int argc_backup= static_cast<int>(mariabackup_args.size() - 1);
         int argc_client= argc_backup;
         int argc_server= argc_backup;
 
@@ -6323,9 +6492,10 @@ void handle_options(int argc, char **argv, char ***argv_server,
 
         if (opt_password)
         {
-          char *argument= opt_password;
-          char *start= argument;
-          opt_password= my_strdup(PSI_NOT_INSTRUMENTED, opt_password, MYF(MY_FAE));
+          char *argument= (char*) opt_password;
+          char *start= (char*) opt_password;
+          opt_password= my_strdup(PSI_NOT_INSTRUMENTED, opt_password,
+                                  MYF(MY_FAE));
           while (*argument)
             *argument++= 'x'; // Destroy argument
           if (*start)
@@ -6382,6 +6552,8 @@ int main(int argc, char **argv)
   char **server_defaults;
   char **client_defaults;
   char **backup_defaults;
+
+	my_getopt_prefix_matching= 0;
 
 	if (get_exepath(mariabackup_exe,FN_REFLEN, argv[0]))
     strncpy(mariabackup_exe,argv[0], FN_REFLEN-1);
@@ -6530,7 +6702,7 @@ static int main_low(char** argv)
 	/* get default temporary directory */
 	if (!opt_mysql_tmpdir || !opt_mysql_tmpdir[0]) {
 		opt_mysql_tmpdir = getenv("TMPDIR");
-#if defined(__WIN__)
+#if defined(_WIN32)
 		if (!opt_mysql_tmpdir) {
 			opt_mysql_tmpdir = getenv("TEMP");
 		}
@@ -6639,12 +6811,6 @@ static int main_low(char** argv)
 		}
 	}
 
-#ifndef __WIN__
-	if (xtrabackup_debug_sync) {
-		signal(SIGCONT, sigcont_handler);
-	}
-#endif
-
 	/* --backup */
 	if (xtrabackup_backup && !xtrabackup_backup_func()) {
 		return(EXIT_FAILURE);
@@ -6682,6 +6848,17 @@ static int get_exepath(char *buf, size_t size, const char *argv0)
   ssize_t ret = readlink("/proc/self/exe", buf, size-1);
   if(ret > 0)
     return 0;
+#elif defined(__APPLE__)
+  size_t ret = proc_pidpath(getpid(), buf, static_cast<uint32_t>(size));
+  if (ret > 0) {
+    buf[ret] = 0;
+    return 0;
+  }
+#elif defined(__FreeBSD__)
+  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+  if (sysctl(mib, 4, buf, &size, NULL, 0) == 0) {
+    return 0;
+  }
 #endif
 
   return my_realpath(buf, argv0, 0);

@@ -455,8 +455,9 @@ ibuf_init_at_db_start(void)
 	mtr.commit();
 
 	ibuf.index = dict_mem_index_create(
-		dict_mem_table_create("innodb_change_buffer",
-				      fil_system.sys_space, 1, 0, 0, 0),
+		dict_table_t::create(
+			{C_STRING_WITH_LEN("innodb_change_buffer")},
+			fil_system.sys_space, 1, 0, 0, 0),
 		"CLUST_IND",
 		DICT_CLUSTERED | DICT_IBUF, 1);
 	ibuf.index->id = DICT_IBUF_ID_MIN + IBUF_SPACE_ID;
@@ -669,7 +670,7 @@ ibuf_bitmap_get_map_page(
 {
 	return buf_page_get_gen(
 		ibuf_bitmap_page_no_calc(page_id, zip_size),
-		zip_size, RW_X_LATCH, NULL, BUF_GET, mtr);
+		zip_size, RW_X_LATCH, NULL, BUF_GET_POSSIBLY_FREED, mtr);
 }
 
 /************************************************************************//**
@@ -697,9 +698,12 @@ ibuf_set_free_bits_low(
 #endif /* UNIV_IBUF_DEBUG */
 	const page_id_t id(block->page.id());
 
-	ibuf_bitmap_page_set_bits<IBUF_BITMAP_FREE>(
-		ibuf_bitmap_get_map_page(id, block->zip_size(), mtr),
-		id, block->physical_size(), val, mtr);
+	if (buf_block_t* bitmap_page = ibuf_bitmap_get_map_page(
+			id, block->zip_size(), mtr)) {
+		ibuf_bitmap_page_set_bits<IBUF_BITMAP_FREE>(
+			bitmap_page, id, block->physical_size(),
+			val, mtr);
+	}
 }
 
 /************************************************************************//**
@@ -843,10 +847,13 @@ ibuf_update_free_bits_zip(
 		buf_page_make_young(&block->page);
 	}
 
-	ibuf_bitmap_page_set_bits<IBUF_BITMAP_FREE>(
-		ibuf_bitmap_get_map_page(block->page.id(), block->zip_size(),
-					 mtr),
-		block->page.id(), block->physical_size(), after, mtr);
+	if (buf_block_t* bitmap_page = ibuf_bitmap_get_map_page(
+		block->page.id(), block->zip_size(), mtr)) {
+
+		ibuf_bitmap_page_set_bits<IBUF_BITMAP_FREE>(
+			bitmap_page, block->page.id(),
+			block->physical_size(), after, mtr);
+	}
 }
 
 /**********************************************************************//**
@@ -1260,8 +1267,9 @@ ibuf_dummy_index_create(
 	dict_table_t*	table;
 	dict_index_t*	index;
 
-	table = dict_mem_table_create("IBUF_DUMMY", NULL, n, 0,
-				      comp ? DICT_TF_COMPACT : 0, 0);
+	table = dict_table_t::create({C_STRING_WITH_LEN("IBUF_DUMMY")},
+				     nullptr, n, 0,
+				     comp ? DICT_TF_COMPACT : 0, 0);
 
 	index = dict_mem_index_create(table, "IBUF_DUMMY", 0, n);
 
@@ -2243,9 +2251,11 @@ bool ibuf_delete_rec(const page_id_t page_id, btr_pcur_t* pcur,
 static void ibuf_read_merge_pages(const uint32_t* space_ids,
 				  const uint32_t* page_nos, ulint n_stored)
 {
+#ifndef DBUG_OFF
 	mem_heap_t* heap = mem_heap_create(512);
 	ulint dops[IBUF_OP_COUNT];
 	memset(dops, 0, sizeof(dops));
+#endif
 
 	for (ulint i = 0; i < n_stored; i++) {
 		const ulint space_id = space_ids[i];
@@ -2278,6 +2288,28 @@ tablespace_deleted:
 				goto tablespace_deleted;
 			}
 		}
+#ifndef DBUG_OFF
+		DBUG_EXECUTE_IF("ibuf_merge_corruption", goto work_around;);
+		continue;
+
+		/* The following code works around a hang when the
+		change buffer is corrupted, likely due to the race
+		condition in crash recovery that was fixed in
+		MDEV-24449. But, it also introduces corruption by
+		itself in the following scenario:
+
+		(1) We merged buffered changes in buf_page_get_gen()
+		(2) We committed the mini-transaction
+		(3) Redo log and the page with the merged changes is written
+		(4) A write completion callback thread evicts the page.
+		(5) Other threads buffer changes for that page.
+		(6) We will wrongly discard those newly buffered changes below.
+
+		This code will be available in debug builds, so that
+		users may try to fix a shutdown hang that occurs due
+		to a corrupted change buffer. */
+
+work_around:
 		/* Prevent an infinite loop, by removing entries from
 		the change buffer also in the case the bitmap bits were
 		wrongly clear even though buffered changes exist. */
@@ -2324,10 +2356,13 @@ done:
 		ibuf_mtr_commit(&mtr);
 		btr_pcur_close(&pcur);
 		mem_heap_empty(heap);
+#endif
 	}
 
+#ifndef DBUG_OFF
 	ibuf_add_ops(ibuf.n_discarded_ops, dops);
 	mem_heap_free(heap);
+#endif
 }
 
 /*********************************************************************//**
@@ -3280,10 +3315,8 @@ commit_exit:
 		ibuf_mtr_commit(&bitmap_mtr);
 		goto fail_exit;
 	} else {
-		lock_sys.mutex_lock();
-		const auto lock_exists = lock_sys.get_first(page_id);
-		lock_sys.mutex_unlock();
-		if (lock_exists) {
+		LockGuard g{lock_sys.rec_hash, page_id};
+		if (lock_sys_t::get_first(g.cell(), page_id)) {
 			goto commit_exit;
 		}
 	}
@@ -3614,14 +3647,15 @@ ibuf_insert_to_index_page_low(
 	      "InnoDB: is now probably corrupt. Please run CHECK TABLE on\n"
 	      "InnoDB: that table.\n", stderr);
 
-	ib::error() << "page " << block->page.id() << ", size "
-		    << block->physical_size() << ", bitmap bits "
-		    << ibuf_bitmap_page_get_bits(
-			    ibuf_bitmap_get_map_page(block->page.id(),
-						     block->zip_size(),
-						     mtr)->frame,
-			    block->page.id(), block->zip_size(),
-			    IBUF_BITMAP_FREE, mtr);
+	if (buf_block_t *bitmap_page =  ibuf_bitmap_get_map_page(
+			block->page.id(), block->zip_size(), mtr)) {
+
+		ib::error() << "page " << block->page.id() << ", size "
+			    << block->physical_size() << ", bitmap bits "
+			    << ibuf_bitmap_page_get_bits(bitmap_page->frame,
+					block->page.id(), block->zip_size(),
+					IBUF_BITMAP_FREE, mtr);
+	}
 
 	ib::error() << BUG_REPORT_MSG;
 
@@ -3717,7 +3751,7 @@ dump:
 		row_ins_sec_index_entry_by_modify(BTR_MODIFY_LEAF). */
 		ut_ad(rec_get_deleted_flag(rec, page_is_comp(page)));
 
-		offsets = rec_get_offsets(rec, index, NULL, true,
+		offsets = rec_get_offsets(rec, index, NULL, index->n_fields,
 					  ULINT_UNDEFINED, &heap);
 		update = row_upd_build_sec_rec_difference_binary(
 			rec, index, offsets, entry, heap);
@@ -3790,7 +3824,8 @@ dump:
 						    &page_cur);
 
 		ut_ad(!cmp_dtuple_rec(entry, rec, offsets));
-		lock_rec_restore_from_page_infimum(block, rec, block);
+		lock_rec_restore_from_page_infimum(*block, rec,
+						   block->page.id());
 	} else {
 		offsets = NULL;
 		ibuf_insert_to_index_page_low(entry, block, index,
@@ -3876,7 +3911,8 @@ ibuf_delete(
 
 	ut_ad(ibuf_inside(mtr));
 	ut_ad(dtuple_check_typed(entry));
-	ut_ad(!dict_index_is_spatial(index));
+	ut_ad(!index->is_spatial());
+	ut_ad(!index->is_clust());
 
 	low_match = page_cur_search(block, index, entry, &page_cur);
 
@@ -3895,8 +3931,8 @@ ibuf_delete(
 
 		rec_offs_init(offsets_);
 
-		offsets = rec_get_offsets(
-			rec, index, offsets, true, ULINT_UNDEFINED, &heap);
+		offsets = rec_get_offsets(rec, index, offsets, index->n_fields,
+					  ULINT_UNDEFINED, &heap);
 
 		if (page_get_n_recs(page) <= 1
 		    || !(REC_INFO_DELETED_FLAG
@@ -4144,6 +4180,10 @@ subsequently was dropped.
 void ibuf_merge_or_delete_for_page(buf_block_t *block, const page_id_t page_id,
                                    ulint zip_size)
 {
+	if (trx_sys_hdr_page(page_id)) {
+		return;
+	}
+
 	btr_pcur_t	pcur;
 #ifdef UNIV_IBUF_DEBUG
 	ulint		volume			= 0;
@@ -4158,11 +4198,8 @@ void ibuf_merge_or_delete_for_page(buf_block_t *block, const page_id_t page_id,
 	ut_ad(!block || page_id == block->page.id());
 	ut_ad(!block || block->page.state() == BUF_BLOCK_FILE_PAGE);
 	ut_ad(!block || block->page.status == buf_page_t::NORMAL);
-
-	if (trx_sys_hdr_page(page_id)
-	    || fsp_is_system_temporary(page_id.space())) {
-		return;
-	}
+	ut_ad(!trx_sys_hdr_page(page_id));
+	ut_ad(page_id < page_id_t(SRV_SPACE_ID_UPPER_BOUND, 0));
 
 	const ulint physical_size = zip_size ? zip_size : srv_page_size;
 
@@ -4196,6 +4233,7 @@ void ibuf_merge_or_delete_for_page(buf_block_t *block, const page_id_t page_id,
 		if (bitmap_bits && fseg_page_is_free(
 				space, page_id.page_no())) {
 			ibuf_mtr_start(&mtr);
+			mtr.set_named_space(space);
 			ibuf_reset_bitmap(block, page_id, zip_size, &mtr);
 			ibuf_mtr_commit(&mtr);
 			bitmap_bits = 0;

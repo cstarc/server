@@ -187,6 +187,7 @@
 
 #include "mariadb.h"
 #include "sql_select.h"
+#include "opt_trace.h"
 
 /* Info on a splitting field */
 struct SplM_field_info
@@ -204,7 +205,7 @@ struct SplM_field_info
 struct SplM_plan_info
 {
   /* The cached splitting execution plan P */
-  struct st_position *best_positions;
+  POSITION *best_positions;
   /* The cost of the above plan */
   double cost;
   /* Selectivity of splitting used in P */
@@ -236,6 +237,8 @@ public:
   SplM_field_info *spl_fields;
   /* The number of elements in the above list */
   uint spl_field_cnt;
+  /* The list of equalities injected into WHERE for split optimization */
+  List<Item> inj_cond_list;
   /* Contains the structures to generate all KEYUSEs for pushable equalities */
   List<KEY_FIELD> added_key_fields;
   /* The cache of evaluated execution plans for 'join' with pushed equalities */
@@ -955,12 +958,9 @@ SplM_plan_info * JOIN_TAB::choose_best_splitting(double record_count,
       The key for splitting was chosen, look for the plan for this key
       in the cache
     */
+    Json_writer_array spl_trace(thd, "choose_best_splitting");
     spl_plan= spl_opt_info->find_plan(best_table, best_key, best_key_parts);
-    if (!spl_plan &&
-	(spl_plan= (SplM_plan_info *) thd->alloc(sizeof(SplM_plan_info))) &&
-	(spl_plan->best_positions=
-	   (POSITION *) thd->alloc(sizeof(POSITION) * join->table_count)) &&
-	!spl_opt_info->plan_cache.push_back(spl_plan))
+    if (!spl_plan)
     {
       /*
         The plan for the chosen key has not been found in the cache.
@@ -970,6 +970,27 @@ SplM_plan_info * JOIN_TAB::choose_best_splitting(double record_count,
       reset_validity_vars_for_keyuses(best_key_keyuse_ext_start, best_table,
                                       best_key, remaining_tables, true);
       choose_plan(join, all_table_map & ~join->const_table_map);
+
+      /*
+        Check that the chosen plan is really a splitting plan.
+        If not or if there is not enough memory to save the plan in the cache
+        then just return with no splitting plan.
+      */
+      POSITION *first_non_const_pos= join->best_positions + join->const_tables;
+      TABLE *table= first_non_const_pos->table->table;
+      key_map spl_keys= table->keys_usable_for_splitting;
+      if (!(first_non_const_pos->key &&
+            spl_keys.is_set(first_non_const_pos->key->key)) ||
+          !(spl_plan= (SplM_plan_info *) thd->alloc(sizeof(SplM_plan_info))) ||
+	  !(spl_plan->best_positions=
+	     (POSITION *) thd->alloc(sizeof(POSITION) * join->table_count)) ||
+	  spl_opt_info->plan_cache.push_back(spl_plan))
+      {
+        reset_validity_vars_for_keyuses(best_key_keyuse_ext_start, best_table,
+                                        best_key, remaining_tables, false);
+        return 0;
+      }
+
       spl_plan->keyuse_ext_start= best_key_keyuse_ext_start;
       spl_plan->table= best_table;
       spl_plan->key= best_key;
@@ -986,6 +1007,16 @@ SplM_plan_info * JOIN_TAB::choose_best_splitting(double record_count,
       spl_plan->cost= join->best_positions[join->table_count-1].read_time +
                       + oper_cost;
 
+      if (unlikely(thd->trace_started()))
+      {
+        Json_writer_object wrapper(thd);
+        Json_writer_object find_trace(thd, "best_splitting");
+        find_trace.add("table", best_table->alias.c_ptr());
+        find_trace.add("key", best_table->key_info[best_key].name);
+        find_trace.add("record_count", record_count);
+        find_trace.add("cost", spl_plan->cost);
+        find_trace.add("unsplit_cost", spl_opt_info->unsplit_cost);
+      }
       memcpy((char *) spl_plan->best_positions,
              (char *) join->best_positions,
              sizeof(POSITION) * join->table_count);
@@ -994,7 +1025,7 @@ SplM_plan_info * JOIN_TAB::choose_best_splitting(double record_count,
     }
     if (spl_plan)
     {
-      if(record_count * spl_plan->cost < spl_opt_info->unsplit_cost)
+      if(record_count * spl_plan->cost < spl_opt_info->unsplit_cost - 0.01)
       {
         /*
           The best plan that employs splitting is cheaper than
@@ -1012,6 +1043,11 @@ SplM_plan_info * JOIN_TAB::choose_best_splitting(double record_count,
   {
     startup_cost= record_count * spl_plan->cost;
     records= (ha_rows) (records * spl_plan->split_sel);
+
+    Json_writer_object trace(thd, "lateral_derived");
+    trace.add("startup_cost", startup_cost);
+    trace.add("splitting_cost", spl_plan->cost);
+    trace.add("records", records);
   }
   else
     startup_cost= spl_opt_info->unsplit_cost;
@@ -1045,22 +1081,22 @@ SplM_plan_info * JOIN_TAB::choose_best_splitting(double record_count,
 bool JOIN::inject_best_splitting_cond(table_map remaining_tables)
 {
   Item *inj_cond= 0;
-  List<Item> inj_cond_list;
+  List<Item> *inj_cond_list= &spl_opt_info->inj_cond_list;
   List_iterator<KEY_FIELD> li(spl_opt_info->added_key_fields);
   KEY_FIELD *added_key_field;
   while ((added_key_field= li++))
   {
     if (remaining_tables & added_key_field->val->used_tables())
       continue;
-    if (inj_cond_list.push_back(added_key_field->cond, thd->mem_root))
+    if (inj_cond_list->push_back(added_key_field->cond, thd->mem_root))
       return true;
   }
-  DBUG_ASSERT(inj_cond_list.elements);
-  switch (inj_cond_list.elements) {
+  DBUG_ASSERT(inj_cond_list->elements);
+  switch (inj_cond_list->elements) {
   case 1:
-    inj_cond= inj_cond_list.head(); break;
+    inj_cond= inj_cond_list->head(); break;
   default:
-    inj_cond= new (thd->mem_root) Item_cond_and(thd, inj_cond_list);
+    inj_cond= new (thd->mem_root) Item_cond_and(thd, *inj_cond_list);
     if (!inj_cond)
       return true;
   }
@@ -1074,6 +1110,40 @@ bool JOIN::inject_best_splitting_cond(table_map remaining_tables)
   st_select_lex_unit *unit= select_lex->master_unit();
   unit->uncacheable|= UNCACHEABLE_DEPENDENT_INJECTED;
 
+  return false;
+}
+
+
+/**
+  @brief
+    Test if equality is injected for split optimization
+
+  @param
+    eq_item   equality to to test
+
+  @retval
+    true    eq_item is equality injected for split optimization
+    false   otherwise
+*/
+
+bool is_eq_cond_injected_for_split_opt(Item_func_eq *eq_item)
+{
+  Item *left_item= eq_item->arguments()[0]->real_item();
+  if (left_item->type() != Item::FIELD_ITEM)
+    return false;
+  Field *field= ((Item_field *) left_item)->field;
+  if (!field->table->reginfo.join_tab)
+    return false;
+  JOIN *join= field->table->reginfo.join_tab->join;
+  if (!join->spl_opt_info)
+    return false;
+  List_iterator_fast<Item> li(join->spl_opt_info->inj_cond_list);
+  Item *item;
+  while ((item= li++))
+  {
+    if (item == eq_item)
+        return true;
+  }
   return false;
 }
 

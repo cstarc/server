@@ -2291,7 +2291,7 @@ void Query_cache::invalidate_locked_for_write(THD *thd,
   for (; tables_used; tables_used= tables_used->next_local)
   {
     THD_STAGE_INFO(thd, stage_invalidating_query_cache_entries_table);
-    if (tables_used->lock_type >= TL_WRITE_ALLOW_WRITE &&
+    if (tables_used->lock_type >= TL_FIRST_WRITE &&
         tables_used->table)
     {
       invalidate_table(thd, tables_used->table);
@@ -3388,9 +3388,10 @@ Query_cache::register_tables_from_list(THD *thd, TABLE_LIST *tables_used,
        tables_used;
        tables_used= tables_used->next_global, n++, (*block_table)++)
   {
-    if (tables_used->is_anonymous_derived_table())
+    if (tables_used->is_anonymous_derived_table() ||
+        tables_used->table_function)
     {
-      DBUG_PRINT("qcache", ("derived table skipped"));
+      DBUG_PRINT("qcache", ("derived table or table function skipped"));
       n--;
       (*block_table)--;
       continue;
@@ -4093,11 +4094,13 @@ Query_cache::process_and_count_tables(THD *thd, TABLE_LIST *tables_used,
       *tables_type|= HA_CACHE_TBL_NONTRANSACT;
       continue;
     }
-    if (tables_used->derived)
+    if (tables_used->derived || tables_used->table_function)
     {
       DBUG_PRINT("qcache", ("table: %s", tables_used->alias.str));
       table_count--;
-      DBUG_PRINT("qcache", ("derived table skipped"));
+      DBUG_PRINT("qcache", (tables_used->table_function ?
+                              "table function skipped" :
+                              "derived table skipped"));
       continue;
     }
 
@@ -5128,7 +5131,7 @@ my_bool Query_cache::in_blocks(Query_cache_block * point)
     if (block->pprev->pnext != block)
     {
       DBUG_PRINT("error",
-		 ("block %p in physical list is incorrect linked, prev block %p refered as next to %p (check from %p)",
+		 ("block %p in physical list is incorrect linked, prev block %p referred as next to %p (check from %p)",
 		  block, block->pprev,
 		  block->pprev->pnext,
 		  point));
@@ -5156,7 +5159,7 @@ err1:
     if (block->pnext->pprev != block)
     {
       DBUG_PRINT("error",
-		 ("block %p in physicel list is incorrect linked, next block %p refered as prev to %p (check from %p)",
+		 ("block %p in physicel list is incorrect linked, next block %p referred as prev to %p (check from %p)",
 		  block, block->pnext,
 		  block->pnext->pprev,
 		  point));
@@ -5185,7 +5188,7 @@ my_bool Query_cache::in_list(Query_cache_block * root,
     if (block->prev->next != block)
     {
       DBUG_PRINT("error",
-		 ("block %p in list '%s' %p is incorrect linked, prev block %p refered as next to %p (check from %p)",
+		 ("block %p in list '%s' %p is incorrect linked, prev block %p referred as next to %p (check from %p)",
 		  block, name, root, block->prev,
 		  block->prev->next,
 		  point));
@@ -5214,7 +5217,7 @@ err1:
     if (block->next->prev != block)
     {
       DBUG_PRINT("error",
-		 ("block %p in list '%s' %p is incorrect linked, next block %p refered as prev to %p (check from %p)",
+		 ("block %p in list '%s' %p is incorrect linked, next block %p referred as prev to %p (check from %p)",
 		  block, name, root, block->next,
 		  block->next->prev,
 		  point));
@@ -5256,7 +5259,7 @@ my_bool Query_cache::in_table_list(Query_cache_block_table * root,
     if (table->prev->next != table)
     {
       DBUG_PRINT("error",
-		 ("table %p(%p) in list '%s' %p(%p) is incorrect linked, prev table %p(%p) refered as next to %p(%p) (check from %p(%p))",
+		 ("table %p(%p) in list '%s' %p(%p) is incorrect linked, prev table %p(%p) referred as next to %p(%p) (check from %p(%p))",
 		  table, table->block(), name, 
 		  root, root->block(),
 		  table->prev, table->prev->block(),
@@ -5291,7 +5294,7 @@ err1:
     if (table->next->prev != table)
     {
       DBUG_PRINT("error",
-		 ("table %p(%p) in list '%s' %p(%p) is incorrect linked, next table %p(%p) refered as prev to %p(%p) (check from %p(%p))",
+		 ("table %p(%p) in list '%s' %p(%p) is incorrect linked, next table %p(%p) referred as prev to %p(%p) (check from %p(%p))",
 		  table, table->block(),
 		  name, root, root->block(),
 		  table->next, table->next->block(),

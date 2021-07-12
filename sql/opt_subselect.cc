@@ -615,9 +615,9 @@ int check_and_do_in_subquery_rewrites(JOIN *join)
       // (1) - ORDER BY without LIMIT can be removed from IN/EXISTS subqueries
       // (2) - for EXISTS, can also remove "ORDER BY ... LIMIT n",
       //       but cannot remove "ORDER BY ... LIMIT n OFFSET m"
-      if (!select_lex->select_limit ||                               // (1)
+      if (!select_lex->limit_params.select_limit ||                  // (1)
           (substype == Item_subselect::EXISTS_SUBS &&                // (2)
-           !select_lex->offset_limit))                               // (2)
+           !select_lex->limit_params.offset_limit))                  // (2)
       {
         select_lex->join->order= 0;
         select_lex->join->skip_sort_order= 1;
@@ -852,7 +852,7 @@ bool subquery_types_allow_materialization(THD* thd, Item_in_subselect *in_subs)
   Item *left_exp= in_subs->left_exp();
   DBUG_ENTER("subquery_types_allow_materialization");
 
-  DBUG_ASSERT(left_exp->is_fixed());
+  DBUG_ASSERT(left_exp->fixed());
 
   List_iterator<Item> it(in_subs->unit->first_select()->item_list);
   uint elements= in_subs->unit->first_select()->item_list.elements;
@@ -955,7 +955,7 @@ bool make_in_exists_conversion(THD *thd, JOIN *join, Item_in_subselect *item)
   /* 
     We're going to finalize IN->EXISTS conversion. 
     Normally, IN->EXISTS conversion takes place inside the 
-    Item_subselect::fix_fields() call, where item_subselect->is_fixed()==FALSE (as
+    Item_subselect::fix_fields() call, where item_subselect->fixed()==FALSE (as
     fix_fields() haven't finished yet) and item_subselect->changed==FALSE (as 
     the conversion haven't been finalized)
 
@@ -966,7 +966,7 @@ bool make_in_exists_conversion(THD *thd, JOIN *join, Item_in_subselect *item)
     call.
   */
   item->changed= 0;
-  item->fixed= 0;
+  item->base_flags|= item_base_t::FIXED;
 
   SELECT_LEX *save_select_lex= thd->lex->current_select;
   thd->lex->current_select= item->unit->first_select();
@@ -979,10 +979,10 @@ bool make_in_exists_conversion(THD *thd, JOIN *join, Item_in_subselect *item)
     DBUG_RETURN(TRUE);
 
   item->changed= 1;
-  item->fixed= 1;
+  DBUG_ASSERT(item->fixed());
 
   Item *substitute= item->substitution;
-  bool do_fix_fields= !item->substitution->is_fixed();
+  bool do_fix_fields= !item->substitution->fixed();
   /*
     The Item_subselect has already been wrapped with Item_in_optimizer, so we
     should search for item->optimizer, not 'item'.
@@ -1318,7 +1318,7 @@ bool convert_join_subqueries_to_semijoins(JOIN *join)
   {
     JOIN *child_join= in_subq->unit->first_select()->join;
     in_subq->changed= 0;
-    in_subq->fixed= 0;
+    in_subq->base_flags|= item_base_t::FIXED;
 
     SELECT_LEX *save_select_lex= thd->lex->current_select;
     thd->lex->current_select= in_subq->unit->first_select();
@@ -1331,10 +1331,10 @@ bool convert_join_subqueries_to_semijoins(JOIN *join)
       DBUG_RETURN(TRUE);
 
     in_subq->changed= 1;
-    in_subq->fixed= 1;
+    DBUG_ASSERT(in_subq->fixed());
 
     Item *substitute= in_subq->substitution;
-    bool do_fix_fields= !in_subq->substitution->is_fixed();
+    bool do_fix_fields= !in_subq->substitution->fixed();
     Item **tree= (in_subq->emb_on_expr_nest == NO_JOIN_NEST)?
                    &join->conds : &(in_subq->emb_on_expr_nest->on_expr);
     Item *replace_me= in_subq->original_item();
@@ -1414,6 +1414,14 @@ void get_delayed_table_estimates(TABLE *table,
                                  double *startup_cost)
 {
   Item_in_subselect *item= table->pos_in_table_list->jtbm_subselect;
+  Table_function_json_table *table_function=
+                               table->pos_in_table_list->table_function;
+
+  if (table_function)
+  {
+    table_function->get_estimates(out_rows, scan_time, startup_cost);
+    return;
+  }
 
   DBUG_ASSERT(item->engine->engine_type() ==
               subselect_engine::HASH_SJ_ENGINE);
@@ -1768,7 +1776,7 @@ static bool convert_subq_to_sj(JOIN *parent_join, Item_in_subselect *subq_pred)
 
   // The subqueries were replaced for Item_int(1) earlier
   subq_pred->reset_strategy(SUBS_SEMI_JOIN);       // for subsequent executions
-  /*TODO: also reset the 'm_with_subquery' there. */
+  /*TODO: also reset the 'with_subquery' there. */
 
   /* n. Adjust the parent_join->table_count counter */
   uint table_no= parent_join->table_count;
@@ -1783,6 +1791,10 @@ static bool convert_subq_to_sj(JOIN *parent_join, Item_in_subselect *subq_pred)
       Item *dummy= tl->jtbm_subselect;
       tl->jtbm_subselect->fix_after_pullout(parent_lex, &dummy, true);
       DBUG_ASSERT(dummy == tl->jtbm_subselect);
+    }
+    else if (tl->table_function)
+    {
+      tl->table_function->fix_after_pullout(tl, parent_lex, true);
     }
     SELECT_LEX *old_sl= tl->select_lex;
     tl->select_lex= parent_join->select_lex; 
@@ -1873,7 +1885,7 @@ static bool convert_subq_to_sj(JOIN *parent_join, Item_in_subselect *subq_pred)
                      subq_lex->ref_pointer_array[i]);
       if (!item_eq)
         DBUG_RETURN(TRUE);
-      DBUG_ASSERT(left_exp->element_index(i)->is_fixed());
+      DBUG_ASSERT(left_exp->element_index(i)->fixed());
       if (left_exp_orig->element_index(i) !=
           left_exp->element_index(i))
         thd->change_item_tree(item_eq->arguments(),
@@ -2702,7 +2714,7 @@ bool find_eq_ref_candidate(TABLE *table, table_map sj_inner_tables)
           */
           if (!(keyuse->used_tables & sj_inner_tables) &&
               !(keyuse->optimize & KEY_OPTIMIZE_REF_OR_NULL) &&
-              (keyuse->null_rejecting || !keyuse->val->maybe_null))
+              (keyuse->null_rejecting || !keyuse->val->maybe_null()))
           {
             bound_parts |= 1 << keyuse->keypart;
           }
@@ -2901,7 +2913,7 @@ void advance_sj_state(JOIN *join, table_map remaining_tables, uint idx,
         {
           DBUG_ASSERT(pos->sj_strategy != sj_strategy);
           /*
-            If the strategy choosen first time or
+            If the strategy chosen first time or
             the strategy replace strategy which was used to exectly the same
             tables
           */
@@ -2998,7 +3010,7 @@ void advance_sj_state(JOIN *join, table_map remaining_tables, uint idx,
 }
 
 
-void Sj_materialization_picker::set_from_prev(struct st_position *prev)
+void Sj_materialization_picker::set_from_prev(POSITION *prev)
 {
   if (prev->sjmat_picker.is_used)
     set_empty();
@@ -3184,7 +3196,7 @@ bool Sj_materialization_picker::check_qep(JOIN *join,
 }
 
 
-void LooseScan_picker::set_from_prev(struct st_position *prev)
+void LooseScan_picker::set_from_prev(POSITION *prev)
 {
   if (prev->loosescan_picker.is_used)
     set_empty();
@@ -3205,7 +3217,7 @@ bool LooseScan_picker::check_qep(JOIN *join,
                                  double *read_time,
                                  table_map *handled_fanout,
                                  sj_strategy_enum *strategy,
-                                 struct st_position *loose_scan_pos)
+                                 POSITION *loose_scan_pos)
 {
   POSITION *first= join->positions + first_loosescan_table; 
   /* 
@@ -3283,7 +3295,7 @@ bool LooseScan_picker::check_qep(JOIN *join,
   return FALSE;
 }
 
-void Firstmatch_picker::set_from_prev(struct st_position *prev)
+void Firstmatch_picker::set_from_prev(POSITION *prev)
 {
   if (prev->firstmatch_picker.is_used)
     invalidate_firstmatch_prefix();
@@ -4600,7 +4612,7 @@ SJ_TMP_TABLE::create_sj_weedout_tmp_table(THD *thd)
     table->record[1]= table->record[0]+alloc_length;
     share->default_values= table->record[1]+alloc_length;
   }
-  setup_tmp_table_column_bitmaps(table, bitmaps);
+  setup_tmp_table_column_bitmaps(table, bitmaps, table->s->fields);
 
   recinfo= start_recinfo;
   null_flags=(uchar*) table->record[0];
@@ -5819,8 +5831,8 @@ Item *and_new_conditions_to_optimized_cond(THD *thd, Item *cond,
         ((Item_func *) item)->functype() == Item_func::EQ_FUNC &&
         check_simple_equality(thd,
                              Item::Context(Item::ANY_SUBST,
-                             ((Item_func_equal *)item)->compare_type_handler(),
-                             ((Item_func_equal *)item)->compare_collation()),
+                             ((Item_func_eq *)item)->compare_type_handler(),
+                             ((Item_func_eq *)item)->compare_collation()),
                              ((Item_func *)item)->arguments()[0],
                              ((Item_func *)item)->arguments()[1],
                              &new_cond_equal))
@@ -6428,8 +6440,8 @@ bool JOIN::choose_subquery_plan(table_map join_tables)
   /* A strategy must be chosen earlier. */
   DBUG_ASSERT(in_subs->has_strategy());
   DBUG_ASSERT(in_to_exists_where || in_to_exists_having);
-  DBUG_ASSERT(!in_to_exists_where || in_to_exists_where->is_fixed());
-  DBUG_ASSERT(!in_to_exists_having || in_to_exists_having->is_fixed());
+  DBUG_ASSERT(!in_to_exists_where || in_to_exists_where->fixed());
+  DBUG_ASSERT(!in_to_exists_having || in_to_exists_having->fixed());
 
   /* The original QEP of the subquery. */
   Join_plan_state save_qep(table_count);
@@ -6605,7 +6617,7 @@ bool JOIN::choose_subquery_plan(table_map join_tables)
       Item_in_subselect::test_limit). However, once we allow this, here
       we should set the correct limit if given in the query.
     */
-    in_subs->unit->global_parameters()->select_limit= NULL;
+    in_subs->unit->global_parameters()->limit_params.select_limit= NULL;
     in_subs->unit->set_limit(unit->global_parameters());
     /*
       Set the limit of this JOIN object as well, because normally its being
